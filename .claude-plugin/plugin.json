@@ -1,0 +1,8 @@
+{
+  "name": "donace",
+  "version": "0.1.0",
+  "description": "Generator-Evaluator agent harness with sprint-based development workflow, cross-model review (Claude + Codex), and knowledge persistence",
+  "author": {
+    "name": "Minghao Jiang"
+  }
+}
