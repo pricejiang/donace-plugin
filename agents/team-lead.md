@@ -1,6 +1,7 @@
 ---
 name: team-lead
 description: Orchestrator that coordinates planner, architect, implementer, runtime-evaluator, test-engineer, and code reviewer through a full Generator-Evaluator development workflow
+tools: ["Read", "Grep", "Glob", "Bash", "Agent", "SendMessage"]
 model: opus
 ---
 

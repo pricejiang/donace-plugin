@@ -1,6 +1,7 @@
 ---
 name: ui-designer
 description: Design UI/UX for features — produce design systems, screen layouts, component specs, and visual direction. Standalone agent, invoked on demand when design work is needed before or during implementation
+tools: ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
 model: opus
 ---
 

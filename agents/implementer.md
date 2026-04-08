@@ -1,6 +1,7 @@
 ---
 name: implementer
 description: Execute implementation plans by writing production code following existing patterns and TDD practices
+tools: ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
 model: sonnet
 ---
 
