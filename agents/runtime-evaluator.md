@@ -1,6 +1,6 @@
 ---
 name: runtime-evaluator
-description: Verify that implemented features actually work at runtime — produce sprint contracts before each sprint, then verify UI interactions, API responses, and data state using stack-appropriate tools (Playwright, Xcode Simulator, curl, direct execution)
+description: Verify that implemented features actually work at runtime — produce sprint contracts before each sprint, then verify API responses, data state, and command output using curl, database queries, and direct execution
 tools: ["Read", "Grep", "Glob", "Bash"]
 model: opus
 ---
@@ -42,27 +42,25 @@ After implementer finishes, verify each contract item against the running applic
 
 Choose the right tools based on the project's tech stack (passed by team-lead):
 
-| Stack | Start command | UI verification | API/Logic verification |
-|---|---|---|---|
-| **Web** (JS/TS) | `npm run dev` / `bun dev` | Playwright | curl / fetch |
-| **iOS** (Swift) | `xcodebuild build` | Xcode Simulator + `xcrun simctl` | `xcodebuild test` / Swift Testing |
-| **CLI tool** | `cargo build` / `go build` | N/A | Execute binary, assert stdout/stderr/exit code |
-| **Backend API** | `docker compose up` / `python manage.py runserver` | N/A | curl / fetch |
+| Stack | Start command | Verification |
+|---|---|---|
+| **Web** (JS/TS) | `npm run dev` / `bun dev` | curl / fetch |
+| **iOS** (Swift) | `xcodebuild build` | `xcodebuild test` / Swift Testing |
+| **CLI tool** | `cargo build` / `go build` | Execute binary, assert stdout/stderr/exit code |
+| **Backend API** | `docker compose up` / `python manage.py runserver` | curl / fetch |
 
 If the stack doesn't match any of the above, read CLAUDE.md and README for project-specific run/test commands.
+
+> **Note**: UI-level E2E testing (Playwright, Simulator interactions) is handled by the `qa` agent, not here. This agent focuses on API, data, and command-level verification.
 
 ### Verification approach
 
 1. **Start the application** — use the detected start command; if it fails, that is an automatic FAIL
-2. **UI verification** (if applicable) — interact with the actual interface:
-   - Web: use Playwright (navigate, click, fill, assert visible outcomes)
-   - iOS: use Xcode Simulator via `xcrun simctl` (launch app, take screenshots, verify UI state)
-   - CLI/Backend: skip this step
-3. **API / Logic verification** — test functionality directly:
+2. **API / Logic verification** — test functionality directly:
    - Web/Backend: curl or fetch endpoints, assert status codes and response bodies
    - iOS: run `xcodebuild test` with targeted test bundles
    - CLI: execute the binary with test inputs, assert stdout/stderr and exit codes
-4. **Data verification** — check persistence:
+3. **Data verification** — check persistence:
    - Query the database, file system, or storage after mutations
    - Verify state is correct, not just that no error was thrown
 

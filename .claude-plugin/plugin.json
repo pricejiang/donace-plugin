@@ -14,6 +14,7 @@
     "agents/runtime-evaluator.md",
     "agents/test-engineer.md",
     "agents/typescript-reviewer.md",
-    "agents/ios-reviewer.md"
+    "agents/ios-reviewer.md",
+    "agents/qa.md"
   ]
 }
