@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>donace dashboard</title>
+<style>
+/* ── Reset & Base ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0d1117;
+  --bg-card: #161b22;
+  --bg-hover: #1c2128;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --text-bright: #f0f6fc;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --purple: #bc8cff;
+  --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+}
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; }
+
+/* ── Layout ── */
+.app { display: flex; flex-direction: column; height: 100vh; }
+.header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+.header h1 { font-size: 16px; font-weight: 600; color: var(--text-bright); }
+.header .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); }
+.header .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+.header .status .dot.connected { background: var(--green); }
+
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Left Panel ── */
+.left-panel { width: 280px; min-width: 280px; border-right: 1px solid var(--border); overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 20px; }
+
+.section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 8px; }
+
+/* Pipeline tree */
+.pipeline-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+.pipeline-item.nested { padding-left: 20px; font-size: 12px; }
+.pipeline-item .icon { width: 16px; text-align: center; font-size: 12px; }
+.pipeline-item .icon.done { color: var(--green); }
+.pipeline-item .icon.active { color: var(--blue); animation: pulse 2s ease-in-out infinite; }
+.pipeline-item .icon.pending { color: var(--text-dim); }
+.pipeline-item .icon.failed { color: var(--red); }
+.pipeline-item .icon.skipped { color: var(--yellow); }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* Fix loop */
+.fix-loop { display: none; padding: 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; }
+.fix-loop.visible { display: block; }
+.fix-loop .progress { display: flex; gap: 4px; margin-top: 8px; }
+.fix-loop .progress .block { width: 20px; height: 8px; border-radius: 2px; background: var(--border); }
+.fix-loop .progress .block.done { background: var(--green); }
+.fix-loop .progress .block.active { background: var(--yellow); }
+.fix-loop .progress .block.failed { background: var(--red); }
+
+/* Checkpoint */
+.checkpoint { display: none; padding: 12px; background: var(--bg-card); border: 1px solid var(--blue); border-radius: 6px; }
+.checkpoint.visible { display: block; }
+.checkpoint .countdown { font-size: 12px; color: var(--text-dim); margin: 8px 0; }
+.checkpoint .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.checkpoint .actions button { padding: 6px 14px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); font-size: 12px; cursor: pointer; transition: background 0.15s; }
+.checkpoint .actions button:hover { background: var(--bg-hover); }
+.checkpoint .actions button.primary { background: var(--blue); color: #000; border-color: var(--blue); }
+.checkpoint .actions button.primary:hover { opacity: 0.9; }
+.checkpoint .actions button.danger { border-color: var(--red); color: var(--red); }
+
+/* ── Right Panel ── */
+.right-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+/* Agent cards */
+.agent-cards { padding: 16px; display: flex; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid var(--border); max-height: 220px; overflow-y: auto; }
+.agent-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 12px; min-width: 250px; flex: 1; }
+.agent-card .agent-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.agent-card .agent-name { font-weight: 600; font-size: 13px; color: var(--text-bright); }
+.agent-card .agent-status { font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+.agent-card .agent-status.running { background: rgba(63,185,80,0.15); color: var(--green); }
+.agent-card .agent-status.completed { background: rgba(63,185,80,0.1); color: var(--text-dim); }
+.agent-card .agent-status.failed { background: rgba(248,81,73,0.15); color: var(--red); }
+.agent-card .agent-status.skipped { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.agent-card .agent-detail { font-size: 12px; color: var(--text-dim); font-family: var(--font-mono); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Event log */
+.event-log-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.event-log-header { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.event-log { flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 12px; padding: 8px 0; }
+.event-row { display: flex; padding: 3px 16px; gap: 12px; cursor: default; }
+.event-row:hover { background: var(--bg-hover); }
+.event-row .time { color: var(--text-dim); min-width: 70px; }
+.event-row .type { min-width: 160px; }
+.event-row .type.run { color: var(--purple); }
+.event-row .type.phase { color: var(--blue); }
+.event-row .type.agent { color: var(--green); }
+.event-row .type.stage { color: var(--yellow); }
+.event-row .type.fix { color: var(--red); }
+.event-row .type.checkpoint { color: var(--blue); font-weight: 600; }
+.event-row .type.gate { color: var(--yellow); font-weight: 600; }
+.event-row .detail { color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Run tabs */
+.run-tabs { display: flex; gap: 4px; padding: 8px 16px; border-top: 1px solid var(--border); background: var(--bg-card); overflow-x: auto; }
+.run-tab { padding: 4px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; white-space: nowrap; }
+.run-tab:hover { background: var(--bg-hover); }
+.run-tab.active { background: var(--bg); border-color: var(--border); color: var(--text-bright); }
+.run-tab .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; }
+.run-tab .dot.running { background: var(--green); }
+.run-tab .dot.completed { background: var(--text-dim); }
+
+/* Empty state */
+.empty { display: flex; align-items: center; justify-content: center; flex: 1; color: var(--text-dim); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <h1>donace dashboard</h1>
+    <div class="status">
+      <span id="run-id">no active run</span>
+      <span class="dot" id="conn-dot"></span>
+      <span id="conn-label">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- Left Panel -->
+    <div class="left-panel">
+      <div>
+        <div class="section-title">Pipeline</div>
+        <div id="pipeline-tree"></div>
+      </div>
+
+      <div class="fix-loop" id="fix-loop">
+        <div class="section-title">Fix Loop</div>
+        <div id="fix-loop-text">Attempt 0/3</div>
+        <div class="progress" id="fix-loop-progress"></div>
+      </div>
+
+      <div class="checkpoint" id="checkpoint">
+        <div class="section-title">Checkpoint</div>
+        <div id="checkpoint-name"></div>
+        <div class="countdown" id="checkpoint-countdown"></div>
+        <div class="actions" id="checkpoint-actions"></div>
+      </div>
+    </div>
+
+    <!-- Right Panel -->
+    <div class="right-panel">
+      <div>
+        <div style="padding: 12px 16px; border-bottom: 1px solid var(--border);">
+          <div class="section-title">Agent Activity</div>
+        </div>
+        <div class="agent-cards" id="agent-cards">
+          <div class="empty" id="agents-empty">Waiting for agents...</div>
+        </div>
+      </div>
+
+      <div class="event-log-container">
+        <div class="event-log-header">
+          <div class="section-title">Event Log</div>
+        </div>
+        <div class="event-log" id="event-log">
+          <div class="empty" id="log-empty">Waiting for events...</div>
+        </div>
+      </div>
+
+      <div class="run-tabs" id="run-tabs">
+        <div class="empty" style="padding: 4px; font-size: 12px;">No runs yet</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // ── State ──
+  const state = {
+    ws: null,
+    connected: false,
+    events: [],           // all events for current run
+    allEvents: {},        // run_id -> events[]
+    currentRunId: null,
+    activeRunId: null,    // run that's currently live
+    agents: {},           // agent -> { status, startedAt, detail, model }
+    phases: {},           // phase -> status
+    stages: [],           // [{name, status}]
+    currentStage: null,
+    fixLoop: null,        // {attempt, max, failures} or null
+    checkpoint: null,     // {id, options, timeout, timer} or null
+  };
+
+  // ── DOM refs ──
+  const $connDot = document.getElementById('conn-dot');
+  const $connLabel = document.getElementById('conn-label');
+  const $runId = document.getElementById('run-id');
+  const $pipeline = document.getElementById('pipeline-tree');
+  const $fixLoop = document.getElementById('fix-loop');
+  const $fixText = document.getElementById('fix-loop-text');
+  const $fixProgress = document.getElementById('fix-loop-progress');
+  const $checkpoint = document.getElementById('checkpoint');
+  const $cpName = document.getElementById('checkpoint-name');
+  const $cpCountdown = document.getElementById('checkpoint-countdown');
+  const $cpActions = document.getElementById('checkpoint-actions');
+  const $agentCards = document.getElementById('agent-cards');
+  const $agentsEmpty = document.getElementById('agents-empty');
+  const $eventLog = document.getElementById('event-log');
+  const $logEmpty = document.getElementById('log-empty');
+  const $runTabs = document.getElementById('run-tabs');
+
+  // ── WebSocket ──
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws`;
+    state.ws = new WebSocket(url);
+
+    state.ws.onopen = () => {
+      state.connected = true;
+      $connDot.classList.add('connected');
+      $connLabel.textContent = 'Connected';
+    };
+
+    state.ws.onclose = () => {
+      state.connected = false;
+      $connDot.classList.remove('connected');
+      $connLabel.textContent = 'Disconnected';
+      setTimeout(connect, 2000);
+    };
+
+    state.ws.onerror = () => {
+      state.ws.close();
+    };
+
+    state.ws.onmessage = (msg) => {
+      try {
+        const event = JSON.parse(msg.data);
+        handleEvent(event);
+      } catch (e) {
+        console.error('Failed to parse event:', e);
+      }
+    };
+  }
+
+  // ── Event handlers ──
+  function handleEvent(ev) {
+    const runId = ev.run_id || 'unknown';
+
+    // Store globally
+    if (!state.allEvents[runId]) state.allEvents[runId] = [];
+    state.allEvents[runId].push(ev);
+
+    // Track active run
+    if (ev.type === 'run.started') {
+      state.activeRunId = runId;
+      if (!state.currentRunId) {
+        state.currentRunId = runId;
+      }
+    }
+
+    // Only process events for the currently viewed run
+    if (runId === state.currentRunId) {
+      state.events.push(ev);
+      processEvent(ev);
+    }
+
+    renderRunTabs();
+  }
+
+  function processEvent(ev) {
+    switch (ev.type) {
+      case 'run.started':
+        $runId.textContent = ev.run_id;
+        resetState();
+        break;
+      case 'run.completed':
+      case 'run.failed':
+        break;
+
+      case 'phase.started':
+        state.phases[ev.phase] = 'active';
+        break;
+      case 'phase.completed':
+        state.phases[ev.phase] = 'done';
+        break;
+
+      case 'agent.started':
+        state.agents[ev.agent] = {
+          status: 'running',
+          startedAt: ev.timestamp,
+          detail: ev.prompt ? ev.prompt.substring(0, 80) : '',
+          model: ev.model || '',
+          role: ev.role || '',
+        };
+        break;
+      case 'agent.completed':
+        if (state.agents[ev.agent]) {
+          state.agents[ev.agent].status = 'completed';
+          state.agents[ev.agent].duration = ev.duration_s;
+        }
+        break;
+      case 'agent.failed':
+        if (state.agents[ev.agent]) {
+          state.agents[ev.agent].status = 'failed';
+          state.agents[ev.agent].detail = ev.error || '';
+        } else {
+          state.agents[ev.agent] = { status: 'failed', detail: ev.error || '' };
+        }
+        break;
+      case 'agent.skipped':
+        state.agents[ev.agent] = {
+          status: 'skipped',
+          detail: ev.reason || '',
+        };
+        break;
+
+      case 'stage.changed':
+        state.currentStage = ev.stage_name;
+        // Ensure stages list is populated
+        while (state.stages.length < ev.total_stages) {
+          state.stages.push({ name: '', status: 'pending' });
+        }
+        if (ev.stage_index < state.stages.length) {
+          state.stages[ev.stage_index] = { name: ev.stage_name, status: 'active' };
+        }
+        break;
+      case 'stage.completed':
+        const si = state.stages.findIndex(s => s.name === ev.stage_name);
+        if (si >= 0) {
+          state.stages[si].status = ev.status === 'PASS' ? 'done' : ev.status === 'SKIPPED' ? 'skipped' : 'failed';
+        }
+        break;
+
+      case 'fix_loop.started':
+        state.fixLoop = { attempt: ev.attempt, max: ev.max_attempts || 3, failures: ev.failures || [] };
+        break;
+      case 'fix_loop.resolved':
+      case 'fix_loop.exhausted':
+        state.fixLoop = null;
+        break;
+
+      case 'checkpoint.reached':
+        state.checkpoint = {
+          id: ev.checkpoint_id,
+          options: ev.options || ['continue'],
+          timeout: ev.timeout_s || 30,
+          remaining: ev.timeout_s || 30,
+        };
+        startCheckpointTimer();
+        break;
+      case 'checkpoint.resolved':
+        state.checkpoint = null;
+        break;
+    }
+
+    renderAll();
+    addLogEntry(ev);
+  }
+
+  function resetState() {
+    state.agents = {};
+    state.phases = {};
+    state.stages = [];
+    state.currentStage = null;
+    state.fixLoop = null;
+    state.checkpoint = null;
+  }
+
+  // ── Rendering ──
+  function renderAll() {
+    renderPipeline();
+    renderAgentCards();
+    renderFixLoop();
+    renderCheckpoint();
+  }
+
+  function renderPipeline() {
+    const phases = ['boot', 'plan', 'sprint', 'wrap'];
+    let html = '';
+    for (const p of phases) {
+      const st = state.phases[p] || 'pending';
+      const icon = st === 'done' ? '&#10003;' : st === 'active' ? '&#9679;' : '&#9675;';
+      const cls = st;
+      html += `<div class="pipeline-item"><span class="icon ${cls}">${icon}</span> ${p.charAt(0).toUpperCase() + p.slice(1)}</div>`;
+
+      // Nested: agents for this phase
+      for (const [name, info] of Object.entries(state.agents)) {
+        // Only show agents relevant to current context
+        const agentIcon = info.status === 'completed' ? '&#10003;' : info.status === 'running' ? '&#9679;' : info.status === 'failed' ? '&#10007;' : info.status === 'skipped' ? '&#8722;' : '&#9675;';
+        const agentCls = info.status === 'completed' ? 'done' : info.status === 'running' ? 'active' : info.status === 'failed' ? 'failed' : info.status === 'skipped' ? 'skipped' : 'pending';
+        // Show agent under Sprint phase if it's a sprint agent
+        if (p === 'sprint' && (name === 'implementer' || name === 'test-engineer' || name === 'codex-review' || name === 'runtime-evaluator')) continue;
+      }
+
+      // Nested: stages under Sprint
+      if (p === 'sprint') {
+        for (const s of state.stages) {
+          const sIcon = s.status === 'done' ? '&#10003;' : s.status === 'active' ? '&#9679;' : s.status === 'failed' ? '&#10007;' : s.status === 'skipped' ? '&#8722;' : '&#9675;';
+          const sCls = s.status === 'done' ? 'done' : s.status === 'active' ? 'active' : s.status === 'failed' ? 'failed' : s.status === 'skipped' ? 'skipped' : 'pending';
+          html += `<div class="pipeline-item nested"><span class="icon ${sCls}">${sIcon}</span> ${s.name || 'Stage'}</div>`;
+        }
+      }
+    }
+    $pipeline.innerHTML = html;
+  }
+
+  function renderAgentCards() {
+    const entries = Object.entries(state.agents);
+    if (entries.length === 0) {
+      $agentsEmpty.style.display = 'flex';
+      $agentCards.innerHTML = '';
+      $agentCards.appendChild($agentsEmpty);
+      return;
+    }
+    $agentsEmpty.style.display = 'none';
+
+    let html = '';
+    for (const [name, info] of entries) {
+      const elapsed = info.duration ? `${info.duration}s` : info.startedAt ? `${Math.round((Date.now()/1000) - info.startedAt)}s` : '';
+      html += `<div class="agent-card">
+        <div class="agent-header">
+          <span class="agent-name">${name}</span>
+          <span class="agent-status ${info.status}">${info.status} ${elapsed}</span>
+        </div>
+        <div class="agent-detail">${info.detail || info.model || ''}</div>
+      </div>`;
+    }
+    $agentCards.innerHTML = html;
+  }
+
+  function renderFixLoop() {
+    if (!state.fixLoop) {
+      $fixLoop.classList.remove('visible');
+      return;
+    }
+    $fixLoop.classList.add('visible');
+    $fixText.textContent = `Attempt ${state.fixLoop.attempt}/${state.fixLoop.max}`;
+
+    let blocks = '';
+    for (let i = 1; i <= state.fixLoop.max; i++) {
+      const cls = i < state.fixLoop.attempt ? 'done' : i === state.fixLoop.attempt ? 'active' : '';
+      blocks += `<div class="block ${cls}"></div>`;
+    }
+    $fixProgress.innerHTML = blocks;
+  }
+
+  function renderCheckpoint() {
+    if (!state.checkpoint) {
+      $checkpoint.classList.remove('visible');
+      return;
+    }
+    $checkpoint.classList.add('visible');
+    $cpName.textContent = state.checkpoint.id;
+    $cpCountdown.textContent = `Auto-continue in ${state.checkpoint.remaining}s`;
+
+    let btns = '';
+    for (const opt of state.checkpoint.options) {
+      const label = opt.replace(/_/g, ' ');
+      const cls = opt === 'continue' ? 'primary' : opt === 'abort' || opt === 'stop_loop' ? 'danger' : '';
+      btns += `<button class="${cls}" onclick="window._resolve('${state.checkpoint.id}', '${opt}')">${label}</button>`;
+    }
+    $cpActions.innerHTML = btns;
+  }
+
+  // Checkpoint timer
+  let cpTimer = null;
+  function startCheckpointTimer() {
+    if (cpTimer) clearInterval(cpTimer);
+    cpTimer = setInterval(() => {
+      if (!state.checkpoint) { clearInterval(cpTimer); return; }
+      state.checkpoint.remaining--;
+      if (state.checkpoint.remaining <= 0) {
+        clearInterval(cpTimer);
+        state.checkpoint = null;
+        renderCheckpoint();
+      } else {
+        $cpCountdown.textContent = `Auto-continue in ${state.checkpoint.remaining}s`;
+      }
+    }, 1000);
+  }
+
+  // Global resolve function for checkpoint buttons
+  window._resolve = function(cpId, decision) {
+    if (state.ws && state.connected) {
+      state.ws.send(JSON.stringify({ action: 'resolve', checkpoint: cpId, decision: decision }));
+    }
+    state.checkpoint = null;
+    renderCheckpoint();
+  };
+
+  // ── Event log ──
+  function addLogEntry(ev) {
+    if ($logEmpty) $logEmpty.style.display = 'none';
+
+    const time = new Date(ev.timestamp * 1000).toLocaleTimeString('en-US', { hour12: false });
+    const typeClass = ev.type.startsWith('run.') ? 'run' :
+                      ev.type.startsWith('phase.') ? 'phase' :
+                      ev.type.startsWith('agent.') ? 'agent' :
+                      ev.type.startsWith('stage.') ? 'stage' :
+                      ev.type.startsWith('fix_loop.') ? 'fix' :
+                      ev.type.startsWith('checkpoint.') ? 'checkpoint' :
+                      ev.type.startsWith('gate.') ? 'gate' : '';
+
+    let detail = '';
+    if (ev.agent) detail = ev.agent + (ev.role ? ` (${ev.role})` : '');
+    if (ev.task) detail = ev.task.substring(0, 60);
+    if (ev.phase && !ev.agent) detail = ev.phase;
+    if (ev.stage_name) detail = ev.stage_name;
+    if (ev.error) detail = ev.error.substring(0, 60);
+    if (ev.reason) detail = ev.reason;
+    if (ev.recommendation) detail = ev.recommendation;
+    if (ev.decision) detail = ev.decision;
+    if (ev.result_summary && typeof ev.result_summary === 'string') detail = ev.result_summary.substring(0, 60);
+
+    const row = document.createElement('div');
+    row.className = 'event-row';
+    row.innerHTML = `<span class="time">${time}</span><span class="type ${typeClass}">${ev.type}</span><span class="detail">${detail}</span>`;
+    $eventLog.prepend(row);
+  }
+
+  // ── Run tabs ──
+  function renderRunTabs() {
+    const runIds = Object.keys(state.allEvents);
+    if (runIds.length === 0) return;
+
+    let html = '';
+    for (const rid of runIds) {
+      const active = rid === state.currentRunId ? 'active' : '';
+      const isLive = rid === state.activeRunId;
+      const dotCls = isLive ? 'running' : 'completed';
+      const short = rid.length > 12 ? rid.substring(0, 12) : rid;
+      html += `<div class="run-tab ${active}" onclick="window._switchRun('${rid}')"><span class="dot ${dotCls}"></span>${short}</div>`;
+    }
+    $runTabs.innerHTML = html;
+  }
+
+  window._switchRun = function(runId) {
+    if (runId === state.currentRunId) return;
+    state.currentRunId = runId;
+    state.events = [];
+    resetState();
+    $eventLog.innerHTML = '';
+
+    // Replay all events for this run
+    const events = state.allEvents[runId] || [];
+    for (const ev of events) {
+      state.events.push(ev);
+      processEvent(ev);
+    }
+
+    renderRunTabs();
+  };
+
+  // ── Init ──
+  connect();
+})();
+</script>
+</body>
+</html>
