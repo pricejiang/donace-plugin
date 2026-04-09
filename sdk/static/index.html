@@ -126,17 +126,21 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .event-row .type.gate { color: var(--yellow); font-weight: 600; }
 .event-row .detail { color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Run tabs */
-.run-tabs { display: flex; gap: 4px; padding: 8px 16px; border-top: 1px solid var(--border); background: var(--bg-card); overflow-x: auto; }
-.run-tab { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px 4px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; white-space: nowrap; }
-.run-tab:hover { background: var(--bg-hover); }
-.run-tab.active { background: var(--bg); border-color: var(--border); color: var(--text-bright); }
-.run-tab .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 2px; }
-.run-tab .dot.running { background: var(--green); }
-.run-tab .dot.completed { background: var(--text-dim); }
-.run-tab .close { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 3px; font-size: 11px; color: var(--text-dim); opacity: 0; transition: opacity 0.15s, background 0.15s; }
-.run-tab:hover .close { opacity: 1; }
-.run-tab .close:hover { background: var(--red); color: var(--text-bright); opacity: 1; }
+
+/* History */
+.history-list { display: flex; flex-direction: column; gap: 4px; }
+.history-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; }
+.history-item:hover { background: var(--bg-hover); }
+.history-item.active { background: var(--bg); border-color: var(--border); color: var(--text-bright); }
+.history-item .dot { flex-shrink: 0; width: 6px; height: 6px; border-radius: 50%; }
+.history-item .dot.live { background: var(--green); }
+.history-item .dot.done { background: var(--text-dim); }
+.history-item .hi-info { flex: 1; min-width: 0; }
+.history-item .hi-id { font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item .hi-meta { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
+.history-item .hi-close { flex-shrink: 0; width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; border-radius: 3px; font-size: 11px; opacity: 0; transition: opacity 0.15s; }
+.history-item:hover .hi-close { opacity: 1; }
+.history-item .hi-close:hover { background: var(--red); color: var(--text-bright); opacity: 1; }
 
 /* Empty state */
 .empty { display: flex; align-items: center; justify-content: center; flex: 1; color: var(--text-dim); font-size: 14px; }
@@ -174,6 +178,13 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         <div class="countdown" id="checkpoint-countdown"></div>
         <div class="actions" id="checkpoint-actions"></div>
       </div>
+
+      <div>
+        <div class="section-title">Run History</div>
+        <div class="history-list" id="history-list">
+          <span style="font-size: 12px; color: var(--text-dim);">Loading...</span>
+        </div>
+      </div>
     </div>
 
     <!-- Right Panel -->
@@ -200,9 +211,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         </div>
       </div>
 
-      <div class="run-tabs" id="run-tabs">
-        <div class="empty" style="padding: 4px; font-size: 12px;">No runs yet</div>
-      </div>
+
     </div>
   </div>
 </div>
@@ -243,7 +252,6 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   const $agentsEmpty = document.getElementById('agents-empty');
   const $eventLog = document.getElementById('event-log');
   const $logEmpty = document.getElementById('log-empty');
-  const $runTabs = document.getElementById('run-tabs');
 
   // ── WebSocket ──
   function connect() {
@@ -559,21 +567,58 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     }
   }
 
-  // ── Run tabs ──
-  function renderRunTabs() {
-    const runIds = Object.keys(state.allEvents);
-    if (runIds.length === 0) return;
+  // ── Run history ──
+  let historyRuns = [];  // [{run_id, started, event_count}] from /api/runs
+
+  async function fetchHistory() {
+    try {
+      const resp = await fetch('/api/runs');
+      historyRuns = await resp.json();
+    } catch (e) {
+      historyRuns = [];
+    }
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const $list = document.getElementById('history-list');
+
+    // Merge: server-side history + any live runs not yet in history
+    const known = new Set(historyRuns.map(r => r.run_id));
+    const merged = [...historyRuns];
+    for (const rid of Object.keys(state.allEvents)) {
+      if (!known.has(rid)) {
+        const evts = state.allEvents[rid];
+        merged.unshift({ run_id: rid, started: evts[0]?.timestamp || 0, event_count: evts.length });
+      }
+    }
+
+    if (merged.length === 0) {
+      $list.innerHTML = '<span style="font-size: 12px; color: var(--text-dim);">No runs yet</span>';
+      return;
+    }
 
     let html = '';
-    for (const rid of runIds) {
-      const active = rid === state.currentRunId ? 'active' : '';
-      const isLive = rid === state.activeRunId;
-      const dotCls = isLive ? 'running' : 'completed';
-      const short = rid.length > 12 ? rid.substring(0, 12) : rid;
-      html += `<div class="run-tab ${active}" onclick="window._switchRun('${rid}')"><span class="dot ${dotCls}"></span>${short}<span class="close" onclick="event.stopPropagation(); window._deleteRun('${rid}')" title="Delete run">&times;</span></div>`;
+    for (const run of merged) {
+      const active = run.run_id === state.currentRunId ? 'active' : '';
+      const isLive = run.run_id === state.activeRunId;
+      const dotCls = isLive ? 'live' : 'done';
+      const short = run.run_id.length > 16 ? run.run_id.substring(0, 16) : run.run_id;
+      const time = run.started ? new Date(run.started * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+      html += `<div class="history-item ${active}" onclick="window._switchRun('${run.run_id}')">
+        <span class="dot ${dotCls}"></span>
+        <div class="hi-info">
+          <div class="hi-id">${short}</div>
+          <div class="hi-meta">${time} · ${run.event_count} events</div>
+        </div>
+        <span class="hi-close" onclick="event.stopPropagation(); window._deleteRun('${run.run_id}')" title="Delete run">&times;</span>
+      </div>`;
     }
-    $runTabs.innerHTML = html;
+    $list.innerHTML = html;
   }
+
+  // Keep renderRunTabs as alias for compatibility
+  function renderRunTabs() { renderHistory(); }
 
   window._switchRun = function(runId) {
     if (runId === state.currentRunId) return;
@@ -622,7 +667,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       state.activeRunId = null;
     }
 
-    renderRunTabs();
+    renderHistory();
   };
 
   // ── Log tab switching ──
@@ -680,6 +725,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 
   // ── Init ──
   connect();
+  fetchHistory();
 })();
 </script>
 </body>
