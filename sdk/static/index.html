@@ -128,12 +128,15 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 
 /* Run tabs */
 .run-tabs { display: flex; gap: 4px; padding: 8px 16px; border-top: 1px solid var(--border); background: var(--bg-card); overflow-x: auto; }
-.run-tab { padding: 4px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; white-space: nowrap; }
+.run-tab { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px 4px 12px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; white-space: nowrap; }
 .run-tab:hover { background: var(--bg-hover); }
 .run-tab.active { background: var(--bg); border-color: var(--border); color: var(--text-bright); }
-.run-tab .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; }
+.run-tab .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 2px; }
 .run-tab .dot.running { background: var(--green); }
 .run-tab .dot.completed { background: var(--text-dim); }
+.run-tab .close { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 3px; font-size: 11px; color: var(--text-dim); opacity: 0; transition: opacity 0.15s, background 0.15s; }
+.run-tab:hover .close { opacity: 1; }
+.run-tab .close:hover { background: var(--red); color: var(--text-bright); opacity: 1; }
 
 /* Empty state */
 .empty { display: flex; align-items: center; justify-content: center; flex: 1; color: var(--text-dim); font-size: 14px; }
@@ -567,7 +570,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       const isLive = rid === state.activeRunId;
       const dotCls = isLive ? 'running' : 'completed';
       const short = rid.length > 12 ? rid.substring(0, 12) : rid;
-      html += `<div class="run-tab ${active}" onclick="window._switchRun('${rid}')"><span class="dot ${dotCls}"></span>${short}</div>`;
+      html += `<div class="run-tab ${active}" onclick="window._switchRun('${rid}')"><span class="dot ${dotCls}"></span>${short}<span class="close" onclick="event.stopPropagation(); window._deleteRun('${rid}')" title="Delete run">&times;</span></div>`;
     }
     $runTabs.innerHTML = html;
   }
@@ -585,6 +588,38 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     for (const ev of events) {
       state.events.push(ev);
       processEvent(ev);
+    }
+
+    renderRunTabs();
+  };
+
+  window._deleteRun = async function(runId) {
+    // Call server to delete from SQLite
+    try {
+      await fetch(`/api/runs/${runId}`, { method: 'DELETE' });
+    } catch (e) {
+      console.error('Failed to delete run:', e);
+    }
+
+    // Remove from local state
+    delete state.allEvents[runId];
+
+    // If we deleted the currently viewed run, switch to another
+    if (runId === state.currentRunId) {
+      const remaining = Object.keys(state.allEvents);
+      if (remaining.length > 0) {
+        window._switchRun(remaining[0]);
+      } else {
+        state.currentRunId = null;
+        state.events = [];
+        resetState();
+        $eventLog.innerHTML = '';
+        document.getElementById('raw-log').innerHTML = '';
+        $runId.textContent = 'no active run';
+      }
+    }
+    if (runId === state.activeRunId) {
+      state.activeRunId = null;
     }
 
     renderRunTabs();

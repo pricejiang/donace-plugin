@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,44 +28,134 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# EventStore — in-memory, grouped by run_id
+# EventStore — SQLite-backed, grouped by run_id
 # ---------------------------------------------------------------------------
 
-class EventStore:
-    """In-memory event storage, grouped by run_id."""
+MAX_RUNS = 10  # Retain at most this many runs
 
-    def __init__(self) -> None:
-        self.runs: dict[str, list[dict[str, Any]]] = {}
+
+def _default_db_path() -> str:
+    """Resolve the default SQLite database path.
+
+    Prefers $CLAUDE_PLUGIN_DATA if set (CC plugin convention),
+    falls back to ~/.claude/plugins/data/donace/.
+    """
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if plugin_data:
+        base = Path(plugin_data)
+    else:
+        base = Path.home() / ".claude" / "plugins" / "data" / "donace"
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base / "dashboard.db")
+
+
+class EventStore:
+    """SQLite-backed event storage, grouped by run_id.
+
+    Each event is stored as a JSON blob.  On startup the store
+    enforces MAX_RUNS retention — the oldest runs are deleted.
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path = db_path or _default_db_path()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._create_tables()
+        self._enforce_retention()
+
+    def _create_tables(self) -> None:
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id    TEXT    NOT NULL,
+                timestamp REAL    NOT NULL,
+                data      TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
+        """)
+
+    def _enforce_retention(self) -> None:
+        """Delete oldest runs if there are more than MAX_RUNS."""
+        rows = self._conn.execute(
+            "SELECT run_id, MIN(id) AS first_id FROM events GROUP BY run_id ORDER BY first_id DESC"
+        ).fetchall()
+        if len(rows) > MAX_RUNS:
+            old_ids = [r[0] for r in rows[MAX_RUNS:]]
+            placeholders = ",".join("?" for _ in old_ids)
+            self._conn.execute(
+                f"DELETE FROM events WHERE run_id IN ({placeholders})", old_ids
+            )
+            self._conn.commit()
 
     def append(self, event: dict[str, Any]) -> None:
         run_id = event.get("run_id", "unknown")
-        self.runs.setdefault(run_id, []).append(event)
+        ts = event.get("timestamp", 0)
+        self._conn.execute(
+            "INSERT INTO events (run_id, timestamp, data) VALUES (?, ?, ?)",
+            (run_id, ts, json.dumps(event)),
+        )
+        self._conn.commit()
 
     def get_run(self, run_id: str) -> list[dict[str, Any]]:
-        return self.runs.get(run_id, [])
+        rows = self._conn.execute(
+            "SELECT data FROM events WHERE run_id = ? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        return [json.loads(r[0]) for r in rows]
+
+    def delete_run(self, run_id: str) -> int:
+        """Delete all events for a run.  Returns number of rows deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM events WHERE run_id = ?", (run_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount
 
     def list_runs(self) -> list[dict[str, Any]]:
-        result = []
-        for rid, evts in self.runs.items():
-            result.append({
-                "run_id": rid,
-                "event_count": len(evts),
-                "started": evts[0]["timestamp"] if evts else 0,
-            })
+        rows = self._conn.execute("""
+            SELECT run_id, MIN(timestamp) AS started, COUNT(*) AS event_count
+            FROM events
+            GROUP BY run_id
+            ORDER BY MIN(id) DESC
+        """).fetchall()
+        return [
+            {"run_id": r[0], "started": r[1], "event_count": r[2]}
+            for r in rows
+        ]
+
+    @property
+    def runs(self) -> dict[str, list[dict[str, Any]]]:
+        """Compatibility property for browser replay on connect.
+
+        Returns all runs as a dict.  Only called on new browser connect,
+        so the full scan is acceptable.
+        """
+        result: dict[str, list[dict[str, Any]]] = {}
+        rows = self._conn.execute(
+            "SELECT run_id, data FROM events ORDER BY id"
+        ).fetchall()
+        for run_id, data in rows:
+            result.setdefault(run_id, []).append(json.loads(data))
         return result
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-store = EventStore()
+store: EventStore | None = None
 browser_connections: set[WebSocket] = set()
 orchestrator_control_ws: set[WebSocket] = set()
 
 
-def _create_app() -> FastAPI:
+def _create_app(db_path: str | None = None) -> FastAPI:
     """Build and return the FastAPI app with all routes."""
+    global store
+    store = EventStore(db_path)
+
     _app = FastAPI(title="donace dashboard")
 
     # --- Orchestrator -> Dashboard (event ingestion, one-way) ---
@@ -81,6 +172,10 @@ def _create_app() -> FastAPI:
                     continue
 
                 store.append(event)
+
+                # Enforce retention after a new run starts
+                if event.get("type") == "run.started":
+                    store._enforce_retention()
 
                 # Fan out to all connected browsers
                 dead: set[WebSocket] = set()
@@ -160,9 +255,17 @@ def _create_app() -> FastAPI:
     async def list_runs() -> list[dict[str, Any]]:
         return store.list_runs()
 
+    @_app.delete("/api/runs/{run_id}")
+    async def delete_run(run_id: str) -> dict[str, Any]:
+        """Delete a run and all its events."""
+        deleted = store.delete_run(run_id)
+        return {"status": "deleted", "run_id": run_id, "events_deleted": deleted}
+
     @_app.post("/api/shutdown")
     async def shutdown() -> dict[str, str]:
         """Called by team-lead when session is over."""
+        if store:
+            store.close()
         asyncio.get_running_loop().call_later(0.5, lambda: os._exit(0))
         return {"status": "shutting_down"}
 
@@ -170,7 +273,7 @@ def _create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {
             "status": "ok",
-            "runs": str(len(store.runs)),
+            "runs": str(len(store.list_runs())),
             "browsers": str(len(browser_connections)),
             "orchestrators": str(len(orchestrator_control_ws)),
         }
@@ -191,9 +294,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="donace dashboard server")
     parser.add_argument("--port", type=int, default=8741, help="Port to listen on (default: 8741)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to (default: 0.0.0.0)")
+    parser.add_argument("--db", type=str, default=None, help="SQLite database path (default: auto)")
     args = parser.parse_args()
 
-    dashboard_app = _create_app()
+    dashboard_app = _create_app(db_path=args.db)
 
     print(f"donace dashboard starting on http://localhost:{args.port}", file=sys.stderr)
     uvicorn.run(
