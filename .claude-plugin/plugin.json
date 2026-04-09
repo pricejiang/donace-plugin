@@ -15,6 +15,7 @@
     "agents/test-engineer.md",
     "agents/typescript-reviewer.md",
     "agents/ios-reviewer.md",
-    "agents/qa.md"
+    "agents/qa.md",
+    "agents/documenter.md"
   ]
 }

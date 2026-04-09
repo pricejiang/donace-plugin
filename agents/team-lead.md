@@ -14,11 +14,11 @@ You receive tasks from the user and delegate to the SDK orchestrator.
 1. Summarize the user's request into a clear task description
 2. Start the dashboard (if not already running):
    ```
-   Bash: python sdk/dashboard.py --port 8741 &
+   Bash: python ${CLAUDE_PLUGIN_ROOT}/sdk/dashboard.py --port 8741 &
    ```
 3. Run the orchestrator:
    ```
-   Bash: python sdk/orchestrator.py \
+   Bash: python ${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py \
      --task "<task description>" \
      --cwd <project root> \
      --dashboard-url ws://localhost:8741

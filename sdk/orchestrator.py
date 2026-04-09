@@ -300,61 +300,44 @@ async def run_final_review(stack: str | None, bus: EventBus, dispatcher: AgentDi
     return review
 
 
-async def write_session_log(cwd: str, sprint_result: SprintResult, final_review: str) -> str:
-    """Write session log to .ai/sessions/YYYY-MM/YYYY-MM-DD-[6-char-random-id].md"""
-    from datetime import datetime
-
-    now = datetime.now()
-    random_id = uuid.uuid4().hex[:6]
-
-    session_dir = Path(cwd) / ".ai" / "sessions" / now.strftime("%Y-%m")
-    session_dir.mkdir(parents=True, exist_ok=True)
-
-    filename = f"{now.strftime('%Y-%m-%d')}-{random_id}.md"
-    filepath = session_dir / filename
-
-    # Build completed list
-    completed = []
+async def run_documenter(
+    task: str,
+    sprint_result: SprintResult,
+    final_review: str,
+    bus: EventBus,
+    dispatcher: AgentDispatcher,
+) -> str:
+    """Dispatch documenter agent to update all project documentation."""
+    # Build context summary for the documenter
+    stage_summaries = []
     for sr in sprint_result.stages:
-        completed.append(f"- {sr.name}: {sr.status}")
+        stage_summaries.append(f"- {sr.name}: {sr.status}")
+        if sr.unresolved:
+            for issue in sr.unresolved:
+                stage_summaries.append(f"  - unresolved: {issue}")
 
-    # Build blockers
-    blockers = sprint_result.warnings or []
-    for sr in sprint_result.stages:
-        if sr.status == "BLOCKED" and sr.unresolved:
-            blockers.extend(sr.unresolved)
-    blockers_str = chr(10).join(f"- {b}" for b in blockers) if blockers else "- None"
+    warnings_str = "\n".join(f"- {w}" for w in sprint_result.warnings) if sprint_result.warnings else "None"
 
-    # Build next steps from blocked/skipped stages
-    next_steps = []
-    for sr in sprint_result.stages:
-        if sr.status == "BLOCKED":
-            next_steps.append(f"- Resolve: {sr.name} ({', '.join(sr.unresolved or ['unknown issue'])})")
-        elif sr.status == "SKIPPED":
-            next_steps.append(f"- Implement: {sr.name} (skipped)")
-    if not next_steps:
-        next_steps.append("- All stages complete")
+    prompt = (
+        f"Task completed: {task}\n\n"
+        f"## Sprint Results\n"
+        f"{chr(10).join(stage_summaries)}\n\n"
+        f"## Warnings\n{warnings_str}\n\n"
+        f"## Final Review\n{final_review[:3000]}\n\n"
+        f"Update all relevant project documentation based on the above changes. "
+        f"This includes README.md, CLAUDE.md, CHANGELOG.md, .ai/plans/current-plan.md, "
+        f"session log, and knowledge cards as needed."
+    )
 
-    content = f"""# {now.strftime('%Y-%m-%d')} Session | donace | {random_id}
-
-## Completed
-{chr(10).join(completed)}
-
-## Decisions
-- Orchestrator-driven pipeline — reason: deterministic phase execution via Python
-
-## Blockers / open questions
-{blockers_str}
-
-## Knowledge proposals
-- None
-
-## Next steps
-{chr(10).join(next_steps)}
-"""
-
-    filepath.write_text(content)
-    return str(filepath)
+    await bus.emit(AgentStarted(agent="documenter", model="sonnet"))
+    t0 = time.time()
+    try:
+        result = await dispatcher.query(agent="documenter", prompt=prompt, model="sonnet")
+    except Exception as exc:
+        await bus.emit(AgentFailed(agent="documenter", error=str(exc)))
+        return f"[documentation update failed: {exc}]"
+    await bus.emit(AgentCompleted(agent="documenter", duration_s=round(time.time() - t0, 1)))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +449,8 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         # Final stack-specific review
         final_review = await run_final_review(stack, bus, dispatcher)
 
-        # Session log + knowledge cards
-        await write_session_log(cwd, sprint_result, final_review)
+        # Documentation updates (README, CLAUDE.md, CHANGELOG, session log, knowledge cards)
+        await run_documenter(task, sprint_result, final_review, bus, dispatcher)
 
         await bus.emit(PhaseCompleted(phase="wrap", duration_s=round(time.time() - t0, 1)))
 
