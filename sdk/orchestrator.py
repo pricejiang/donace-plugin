@@ -31,6 +31,7 @@ from sdk.events import (
     RunStarted,
     SprintResult,
     Stage,
+    StageResult,
     TaskClass,
 )
 from sdk.sprint_loop import run_sprint_loop
@@ -128,6 +129,21 @@ def detect_stack(cwd: str) -> str | None:
     return None
 
 
+def is_empty_repo(cwd: str) -> bool:
+    """Check if the project directory is an empty or near-empty git repo.
+
+    Returns True if no source files exist (ignoring .git, .ai, .gitignore).
+    """
+    root = Path(cwd)
+    if not root.exists():
+        return True
+    for item in root.iterdir():
+        if item.name in (".git", ".ai", ".gitignore", ".DS_Store"):
+            continue
+        return False  # found at least one real file/dir
+    return True
+
+
 def check_for_resume(cwd: str) -> Plan | None:
     """Check if .ai/plans/current-plan.md exists with incomplete stages."""
     plan_path = Path(cwd) / ".ai" / "plans" / "current-plan.md"
@@ -223,7 +239,7 @@ async def run_architect(spec: str, bus: EventBus, dispatcher: AgentDispatcher) -
         await bus.emit(AgentFailed(agent="architect", error=str(exc)))
         # Fallback: single-stage plan
         return Plan(
-            stages=[Stage(name="Implementation", has_user_facing_changes=True)],
+            stages=[Stage(name="Implementation", has_user_facing_changes=False)],
             raw=spec,
         )
     await bus.emit(AgentCompleted(agent="architect", duration_s=round(time.time() - t0, 1)))
@@ -232,7 +248,7 @@ async def run_architect(spec: str, bus: EventBus, dispatcher: AgentDispatcher) -
     stages = _parse_plan_stages(plan_raw)
     if not stages:
         # If parsing fails, create a single-stage plan
-        stages = [Stage(name="Implementation", has_user_facing_changes=True)]
+        stages = [Stage(name="Implementation", has_user_facing_changes=False)]
 
     return Plan(stages=stages, raw=plan_raw)
 
@@ -385,7 +401,37 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         resume_plan = check_for_resume(cwd)
         stack = detect_stack(cwd)
 
+        empty_repo = is_empty_repo(cwd)
+
         await bus.emit(PhaseCompleted(phase="boot", duration_s=round(time.time() - t0, 1)))
+
+        # ── Early exit: empty repo with no resume plan ──
+        if empty_repo and not resume_plan:
+            result = OrchestrationResult(
+                sprint=SprintResult(
+                    stages=[StageResult(
+                        name="Project bootstrap",
+                        status="NEEDS_CONTEXT",
+                        contract="",
+                        test_result={"passed": 0, "failed": 0},
+                        codex_result={"status": "skipped", "p1_findings": 0, "findings": []},
+                        runtime_result=None,
+                        fix_attempts=0,
+                        unresolved=[
+                            "Empty repository — orchestrator cannot proceed without project context.",
+                            f"Detected stack: {stack or 'unknown'}",
+                            "The task description must include: language/framework, "
+                            "project type (CLI/web/library), and core acceptance criteria.",
+                        ],
+                        recommendation="NEEDS_CONTEXT",
+                    )],
+                    warnings=["Empty repo detected — returning early for team-lead to gather context"],
+                    summary={"passed": 0, "blocked": 0, "skipped": 0, "needs_context": 1, "total": 1},
+                ),
+                review="",
+            )
+            await bus.emit(RunCompleted(result_summary=result.to_json_output().get("summary")))
+            return result
 
         # ── Phase 1: Plan (skip if resuming) ──
         plan: Plan
@@ -430,6 +476,9 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         await bus.emit(PhaseStarted(phase="sprint"))
         t0 = time.time()
 
+        # Build task context for sprint loop agents (contract + implementer)
+        task_context = f"Task: {task}\n\nPlan:\n{plan.raw[:3000]}"
+
         sprint_result = await run_sprint_loop(
             stages=plan.stages,
             cwd=cwd,
@@ -438,6 +487,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             run_test_engineer=dispatcher.run_test_engineer,
             run_codex_review=dispatcher.run_codex_review,
             run_runtime_evaluator=dispatcher.run_runtime_evaluator,
+            task_context=task_context,
         )
 
         await bus.emit(PhaseCompleted(phase="sprint", duration_s=round(time.time() - t0, 1)))

@@ -108,6 +108,7 @@ async def run_sprint_loop(
     run_test_engineer: TestRunnerFn,
     run_codex_review: CodexRunnerFn,
     run_runtime_evaluator: RuntimeRunnerFn,
+    task_context: str = "",
 ) -> SprintResult:
     """Execute the Phase 2 sprint loop over all stages.
 
@@ -119,6 +120,7 @@ async def run_sprint_loop(
         run_test_engineer: Function to run test engineer for a stage.
         run_codex_review: Function to run codex review.
         run_runtime_evaluator: Function to run runtime evaluator with a contract.
+        task_context: Original task + plan text for agent prompts.
 
     Returns:
         SprintResult with per-stage results, warnings, and summary.
@@ -167,9 +169,13 @@ async def run_sprint_loop(
         await bus.emit(AgentStarted(agent="runtime-evaluator", role="contract"))
         t0 = time.time()
         try:
+            contract_prompt = (
+                    f"Write sprint contract for: {stage.name}\n\n"
+                    f"Context:\n{task_context}"
+                ) if task_context else f"Write sprint contract for: {stage.name}"
             contract = await query(
                 agent="runtime-evaluator",
-                prompt=f"Write sprint contract for: {stage.name}",
+                prompt=contract_prompt,
                 model="opus",
             )
         except Exception as exc:
@@ -201,9 +207,15 @@ async def run_sprint_loop(
         await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
         t0 = time.time()
         try:
+            impl_prompt = (
+                    f"Implement: {stage.name}\n\n"
+                    f"Contract:\n{contract}"
+                )
+            if task_context:
+                impl_prompt = f"{task_context}\n\n{impl_prompt}"
             await query(
                 agent="implementer",
-                prompt=f"Implement: {stage.name}\nContract: {contract}",
+                prompt=impl_prompt,
                 model="sonnet",
             )
         except Exception as exc:
