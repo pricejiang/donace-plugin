@@ -295,10 +295,10 @@ async def run_final_review(stack: str | None, bus: EventBus, dispatcher: AgentDi
     elif stack == "ios":
         reviewer = "ios-reviewer"
     elif stack == "python":
-        await bus.emit(AgentSkipped(agent="python-reviewer", reason="no python-reviewer agent defined"))
+        await bus.emit(AgentSkipped(agent="final-review", reason="no reviewer agent for Python projects"))
         return "[no stack-specific reviewer available for Python]"
     else:
-        await bus.emit(AgentSkipped(agent="stack-reviewer", reason=f"unknown stack: {stack}"))
+        await bus.emit(AgentSkipped(agent="final-review", reason=f"no reviewer agent for stack: {stack}"))
         return "[no stack-specific reviewer available]"
 
     await bus.emit(AgentStarted(agent=reviewer, model="opus"))
