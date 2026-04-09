@@ -178,13 +178,6 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         <div class="countdown" id="checkpoint-countdown"></div>
         <div class="actions" id="checkpoint-actions"></div>
       </div>
-
-      <div>
-        <div class="section-title">Run History</div>
-        <div class="history-list" id="history-list">
-          <span style="font-size: 12px; color: var(--text-dim);">Loading...</span>
-        </div>
-      </div>
     </div>
 
     <!-- Right Panel -->
@@ -202,12 +195,18 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         <div class="log-tabs">
           <div class="log-tab active" id="tab-events" onclick="window._switchLogTab('events')">Events</div>
           <div class="log-tab" id="tab-rawlog" onclick="window._switchLogTab('rawlog')">Raw Log</div>
+          <div class="log-tab" id="tab-history" onclick="window._switchLogTab('history')">History</div>
         </div>
         <div class="event-log" id="event-log">
           <div class="empty" id="log-empty">Waiting for events...</div>
         </div>
         <div class="raw-log" id="raw-log">
           <div class="empty" id="rawlog-empty">Waiting for agent activity...</div>
+        </div>
+        <div class="raw-log" id="history-panel" style="padding: 12px 16px;">
+          <div class="history-list" id="history-list">
+            <span style="font-size: 12px; color: var(--text-dim);">Loading...</span>
+          </div>
         </div>
       </div>
 
@@ -674,18 +673,32 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   window._switchLogTab = function(tab) {
     const $events = document.getElementById('event-log');
     const $raw = document.getElementById('raw-log');
-    const $tabEvents = document.getElementById('tab-events');
-    const $tabRaw = document.getElementById('tab-rawlog');
+    const $history = document.getElementById('history-panel');
+    const tabs = {
+      events: document.getElementById('tab-events'),
+      rawlog: document.getElementById('tab-rawlog'),
+      history: document.getElementById('tab-history'),
+    };
+
+    // Hide all panels
+    $events.style.display = 'none';
+    $raw.classList.remove('visible');
+    $history.classList.remove('visible');
+
+    // Deactivate all tabs
+    Object.values(tabs).forEach(t => t.classList.remove('active'));
+
+    // Show selected
     if (tab === 'events') {
       $events.style.display = '';
-      $raw.classList.remove('visible');
-      $tabEvents.classList.add('active');
-      $tabRaw.classList.remove('active');
-    } else {
-      $events.style.display = 'none';
+      tabs.events.classList.add('active');
+    } else if (tab === 'rawlog') {
       $raw.classList.add('visible');
-      $tabEvents.classList.remove('active');
-      $tabRaw.classList.add('active');
+      tabs.rawlog.classList.add('active');
+    } else if (tab === 'history') {
+      $history.classList.add('visible');
+      tabs.history.classList.add('active');
+      fetchHistory();  // refresh on tab switch
     }
   };
 
