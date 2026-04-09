@@ -510,18 +510,18 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 
     let detail = '';
     if (ev.agent) detail = ev.agent + (ev.role ? ` (${ev.role})` : '');
-    if (ev.task) detail = ev.task.substring(0, 60);
+    if (ev.task) detail = ev.task;
     if (ev.phase && !ev.agent) detail = ev.phase;
     if (ev.stage_name) detail = ev.stage_name;
-    if (ev.error) detail = ev.error.substring(0, 60);
+    if (ev.error) detail = ev.error;
     if (ev.reason) detail = ev.reason;
     if (ev.recommendation) detail = ev.recommendation;
     if (ev.decision) detail = ev.decision;
-    if (ev.result_summary && typeof ev.result_summary === 'string') detail = ev.result_summary.substring(0, 60);
+    if (ev.result_summary && typeof ev.result_summary === 'string') detail = ev.result_summary;
 
     const row = document.createElement('div');
     row.className = 'event-row';
-    row.innerHTML = `<span class="time">${time}</span><span class="type ${typeClass}">${ev.type}</span><span class="detail">${detail}</span>`;
+    row.innerHTML = `<span class="time">${time}</span><span class="type ${typeClass}">${ev.type}</span><span class="detail" title="${detail.replace(/"/g, '&quot;')}">${detail}</span>`;
     $eventLog.prepend(row);
   }
 
