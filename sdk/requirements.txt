@@ -1,5 +1,5 @@
 # donace SDK orchestration dependencies
-anthropic>=0.42.0
+claude-agent-sdk
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 websockets>=12.0
