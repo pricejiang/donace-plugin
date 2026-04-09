@@ -84,6 +84,18 @@ def collect_failures(
     return failures
 
 
+def _failure_fingerprint(failures: list[dict[str, Any]]) -> frozenset[tuple[str, str]]:
+    """Create a comparable fingerprint from failures to detect structural (unfixable) issues.
+
+    If the fingerprint is identical across fix loop iterations, the failures
+    are structural and further attempts will just waste tokens.
+    """
+    return frozenset(
+        (f.get("source", ""), f.get("description", "")[:200])
+        for f in failures
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sprint loop
 # ---------------------------------------------------------------------------
@@ -281,10 +293,24 @@ async def run_sprint_loop(
         # --- 4. Fix loop (max 3 attempts) ---
         failures = collect_failures(test_result, codex_result, runtime_result)
         fix_attempts = 0
+        prev_fingerprint: frozenset[tuple[str, str]] | None = None
 
         for attempt in range(1, 4):
             if not failures:
                 break
+
+            # Detect structural (unfixable) failures: if the failure fingerprint
+            # is identical to the previous iteration, the implementer cannot fix
+            # them and further attempts just waste tokens.
+            current_fingerprint = _failure_fingerprint(failures)
+            if prev_fingerprint is not None and current_fingerprint == prev_fingerprint:
+                warnings.append(
+                    f"Fix loop exited early for {stage.name}: "
+                    f"failures unchanged after attempt {attempt - 1} "
+                    f"(structural issue, not fixable by implementer)"
+                )
+                break
+            prev_fingerprint = current_fingerprint
 
             fix_attempts = attempt
             failure_descriptions = [f["description"] for f in failures]

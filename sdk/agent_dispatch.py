@@ -31,8 +31,6 @@ try:
         query as sdk_query,
         ClaudeAgentOptions,
         HookMatcher,
-        PermissionResultAllow,
-        PermissionResultDeny,
     )
     from claude_agent_sdk.types import (
         AssistantMessage,
@@ -40,7 +38,6 @@ try:
         PostToolUseHookInput,
         ResultMessage,
         TextBlock,
-        ToolPermissionContext,
     )
     HAS_SDK = True
 except ImportError:
@@ -186,50 +183,37 @@ class AgentDispatcher:
             self._agent_configs[agent_name] = load_agent_config(self.agents_dir, agent_name)
         return self._agent_configs[agent_name]
 
-    def _make_can_use_tool(self, agent_name: str) -> Any:
-        """Build a can_use_tool callback for security checks (command blocklist + path boundary)."""
-        cwd = self.cwd
-
-        async def can_use_tool(
-            tool_name: str,
-            tool_input: dict[str, Any],
-            context: ToolPermissionContext,
-        ) -> PermissionResultAllow | PermissionResultDeny:
-            # Command blocklist
-            if tool_name == "Bash":
-                command = tool_input.get("command", "")
-                blocked = _is_blocked_command(command)
-                if blocked:
-                    return PermissionResultDeny(behavior="deny", message=blocked, interrupt=False)
-
-            # Path boundary check
-            if tool_name in ("Read", "Write", "Edit"):
-                file_path = tool_input.get("file_path", "")
-                if file_path and _is_path_outside_cwd(file_path, cwd):
-                    return PermissionResultDeny(
-                        behavior="deny",
-                        message=f"path {file_path} is outside project directory {cwd}",
-                        interrupt=False,
-                    )
-
-            return PermissionResultAllow(behavior="allow", updated_input=None, updated_permissions=None)
-
-        return can_use_tool
-
     def _make_hooks(self, agent_name: str) -> dict:
-        """Build SDK hooks for EventBus integration (tool use/result streaming)."""
+        """Build SDK hooks for security checks + EventBus integration."""
         bus = self.bus
+        cwd = self.cwd
 
         async def pre_tool_hook(
             hook_input: PreToolUseHookInput,
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
-            tool_input = hook_input.tool_input or {}
+            tool_name = hook_input["tool_name"]
+            tool_input = hook_input.get("tool_input") or {}
+
+            # --- Security: command blocklist ---
+            if tool_name == "Bash":
+                command = tool_input.get("command", "")
+                blocked = _is_blocked_command(command)
+                if blocked:
+                    return {"decision": "block", "reason": blocked}
+
+            # --- Security: path boundary check ---
+            if tool_name in ("Read", "Write", "Edit"):
+                file_path = tool_input.get("file_path", "")
+                if file_path and _is_path_outside_cwd(file_path, cwd):
+                    return {"decision": "block", "reason": f"path {file_path} is outside project directory {cwd}"}
+
+            # --- EventBus: emit tool use event ---
             target = tool_input.get("file_path") or tool_input.get("command", "")
             await bus.emit(AgentToolUse(
                 agent=agent_name,
-                tool=hook_input.tool_name,
+                tool=tool_name,
                 target=str(target)[:200] if target else None,
                 input_preview=json.dumps(tool_input)[:300] if isinstance(tool_input, dict) else str(tool_input)[:300],
             ))
@@ -240,11 +224,11 @@ class AgentDispatcher:
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
-            response_str = str(hook_input.tool_response)[:300]
+            response_str = str(hook_input.get("tool_response", ""))[:300]
             status = "error" if "[error:" in response_str else "success"
             await bus.emit(AgentToolResult(
                 agent=agent_name,
-                tool=hook_input.tool_name,
+                tool=hook_input["tool_name"],
                 status=status,
                 output_preview=response_str,
             ))
@@ -277,7 +261,6 @@ class AgentDispatcher:
             max_turns=50,
             model=model_id,
             hooks=self._make_hooks(agent),
-            can_use_tool=self._make_can_use_tool(agent),
         )
 
         final_text = ""
