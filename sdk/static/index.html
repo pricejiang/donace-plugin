@@ -292,6 +292,19 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       case 'agent.skipped':
         state.agents[ev.agent] = { status: 'skipped', detail: ev.reason || '' };
         break;
+      case 'subagent.started':
+        if (!state.subagents) state.subagents = {};
+        state.subagents[ev.subagent_id] = {
+          status: 'running', type: ev.subagent_type, parent: ev.parent_agent,
+          startedAt: ev.timestamp,
+        };
+        break;
+      case 'subagent.completed':
+        if (state.subagents && state.subagents[ev.subagent_id]) {
+          state.subagents[ev.subagent_id].status = 'completed';
+          state.subagents[ev.subagent_id].duration = Math.round(ev.timestamp - state.subagents[ev.subagent_id].startedAt);
+        }
+        break;
       case 'stage.changed':
         state.currentStage = ev.stage_name;
         while (state.stages.length < ev.total_stages) state.stages.push({ name: '', status: 'pending' });
@@ -318,7 +331,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   }
 
   function resetState() {
-    state.agents = {}; state.phases = {}; state.stages = [];
+    state.agents = {}; state.subagents = {}; state.phases = {}; state.stages = [];
     state.currentStage = null; state.fixLoop = null; state.checkpoint = null;
   }
 
@@ -364,6 +377,23 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     }
   }
 
+  function renderSubagents(parentName) {
+    if (!state.subagents) return '';
+    let html = '';
+    for (const [id, sub] of Object.entries(state.subagents)) {
+      if (sub.parent !== parentName) continue;
+      const elapsed = sub.duration ? `${sub.duration}s` : sub.startedAt ? `${Math.round((Date.now()/1000) - sub.startedAt)}s` : '';
+      const cls = sub.status === 'running' ? 'running' : '';
+      html += `<div class="agent-card subagent ${cls}" style="margin-left: 16px; border-left: 2px solid var(--cyan); opacity: 0.9;">
+        <div class="agent-header">
+          <span class="agent-name" style="font-size: 11px;">${sub.type}</span>
+          <span class="agent-status ${sub.status}" style="font-size: 11px;">${sub.status} ${elapsed}</span>
+        </div>
+      </div>`;
+    }
+    return html;
+  }
+
   function renderAgentCards() {
     let html = '';
     for (const name of AGENT_ORDER) {
@@ -382,6 +412,8 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         </div>
         <div class="agent-detail">${info.model || info.detail || ''}</div>
       </div>`;
+      // Render subagents nested under this agent
+      html += renderSubagents(name);
     }
     // Any agents not in AGENT_ORDER (planner, architect, etc.)
     for (const [name, info] of Object.entries(state.agents)) {
@@ -395,6 +427,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         </div>
         <div class="agent-detail">${info.model || info.detail || ''}</div>
       </div>`;
+      html += renderSubagents(name);
     }
     $agentCards.innerHTML = html;
   }

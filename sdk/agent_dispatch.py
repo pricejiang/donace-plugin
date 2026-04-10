@@ -22,6 +22,8 @@ from sdk.events import (
     AgentToolUse,
     EventBus,
     Stage,
+    SubagentCompleted,
+    SubagentStarted,
     TaskClass,
 )
 
@@ -233,10 +235,76 @@ class AgentDispatcher:
             ))
             return {}
 
+        async def subagent_start_hook(
+            hook_input: Any,
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict:
+            agent_type = hook_input.get("agent_type", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_type", "")
+            agent_id = hook_input.get("agent_id", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_id", "")
+            await bus.emit(SubagentStarted(
+                parent_agent=agent_name,
+                subagent_type=agent_type,
+                subagent_id=agent_id,
+            ))
+            return {}
+
+        async def subagent_stop_hook(
+            hook_input: Any,
+            tool_use_id: str | None,
+            context: Any,
+        ) -> dict:
+            agent_type = hook_input.get("agent_type", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_type", "")
+            agent_id = hook_input.get("agent_id", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_id", "")
+            transcript_path = hook_input.get("agent_transcript_path", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_transcript_path", "")
+            await bus.emit(SubagentCompleted(
+                parent_agent=agent_name,
+                subagent_type=agent_type,
+                subagent_id=agent_id,
+                transcript_path=transcript_path,
+            ))
+            # Phase 2: backfill tool events from transcript
+            if transcript_path:
+                await self._backfill_from_transcript(agent_name, agent_type, transcript_path)
+            return {}
+
         return {
             "PreToolUse": [HookMatcher(matcher=".*", hooks=[pre_tool_hook])],
             "PostToolUse": [HookMatcher(matcher=".*", hooks=[post_tool_hook])],
+            "SubagentStart": [HookMatcher(matcher=".*", hooks=[subagent_start_hook])],
+            "SubagentStop": [HookMatcher(matcher=".*", hooks=[subagent_stop_hook])],
         }
+
+    async def _backfill_from_transcript(self, parent_agent: str, subagent_type: str, transcript_path: str) -> None:
+        """Read a subagent's transcript and emit tool_use events for dashboard visibility."""
+        try:
+            content = await asyncio.to_thread(Path(transcript_path).read_text, "utf-8")
+            # Transcript is JSONL — one JSON object per line
+            for line in content.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Look for tool_use entries (assistant messages with tool calls)
+                if entry.get("type") == "assistant":
+                    for block in entry.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_use":
+                            tool_name = block.get("name", "")
+                            tool_input = block.get("input", {})
+                            target = tool_input.get("file_path") or tool_input.get("command", "")
+                            await self.bus.emit(AgentToolUse(
+                                agent=f"{parent_agent}/{subagent_type}",
+                                tool=tool_name,
+                                target=str(target)[:200] if target else None,
+                                input_preview=json.dumps(tool_input, ensure_ascii=False)[:300] if isinstance(tool_input, dict) else None,
+                            ))
+        except FileNotFoundError:
+            pass  # transcript may not exist if subagent was cancelled
+        except Exception:
+            pass  # best-effort backfill, don't crash on parse errors
 
     # Per-agent timeout (seconds). Agents doing real work (implementer,
     # architect) need more time than lightweight ones (classify, codex runner).

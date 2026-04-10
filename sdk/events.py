@@ -375,7 +375,32 @@ class AgentTokens(Event):
 
 
 # ---------------------------------------------------------------------------
-# Populate registry
+# Subagent events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SubagentStarted(Event):
+    parent_agent: str = ""      # e.g. "implementer"
+    subagent_type: str = ""     # e.g. "sub-implementer"
+    subagent_id: str = ""
+
+    def __post_init__(self) -> None:
+        self.type = "subagent.started"
+
+
+@dataclass
+class SubagentCompleted(Event):
+    parent_agent: str = ""
+    subagent_type: str = ""
+    subagent_id: str = ""
+    transcript_path: str = ""
+
+    def __post_init__(self) -> None:
+        self.type = "subagent.completed"
+
+
+# ---------------------------------------------------------------------------
+# Populate registry — via _register() calls
 # ---------------------------------------------------------------------------
 
 _register("run.started", RunStarted)
@@ -399,6 +424,8 @@ _register("agent.message", AgentMessage)
 _register("agent.tool_use", AgentToolUse)
 _register("agent.tool_result", AgentToolResult)
 _register("agent.tokens", AgentTokens)
+_register("subagent.started", SubagentStarted)
+_register("subagent.completed", SubagentCompleted)
 
 
 # ---------------------------------------------------------------------------
