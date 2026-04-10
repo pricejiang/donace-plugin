@@ -101,10 +101,10 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .log-tab.active { color: var(--text-bright); border-bottom-color: var(--blue); }
 
 .event-log { flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 12px; padding: 4px 0; }
-.event-row { display: flex; padding: 2px 16px; gap: 10px; cursor: default; line-height: 1.5; }
+.event-row { display: flex; padding: 3px 16px; gap: 10px; cursor: default; line-height: 1.5; border-bottom: 1px solid transparent; }
 .event-row:hover { background: var(--bg-hover); }
-.event-row .time { color: var(--text-dim); min-width: 65px; flex-shrink: 0; }
-.event-row .type { min-width: 140px; flex-shrink: 0; }
+.event-row .time { color: var(--text-dim); min-width: 65px; flex-shrink: 0; padding-top: 1px; }
+.event-row .type { min-width: 140px; flex-shrink: 0; padding-top: 1px; }
 .event-row .type.run { color: var(--purple); }
 .event-row .type.phase { color: var(--blue); }
 .event-row .type.agent { color: var(--green); }
@@ -112,7 +112,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .event-row .type.fix { color: var(--red); }
 .event-row .type.checkpoint { color: var(--blue); font-weight: 600; }
 .event-row .type.gate { color: var(--yellow); font-weight: 600; }
-.event-row .detail { color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.event-row .detail { color: var(--text-dim); flex: 1; white-space: pre-wrap; word-break: break-word; }
 
 .raw-log { flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 12px; padding: 8px 16px; display: none; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
 .raw-log.visible { display: block; }
@@ -448,17 +448,16 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     if (ev.decision) detail = ev.decision;
     if (ev.result_summary && typeof ev.result_summary === 'string') detail = ev.result_summary;
     if (ev.type === 'agent.tool_use') {
-      const target = ev.target ? ev.target.split('/').slice(-2).join('/') : '';
-      detail = `${ev.agent || ''} → ${ev.tool || ''}${target ? ' ' + target : ''}`;
+      const target = ev.target || '';
+      const input = ev.input_preview || '';
+      detail = `${ev.agent || ''} → ${ev.tool || ''}${target ? ' ' + target : ''}\n${input}`;
     }
     if (ev.type === 'agent.tool_result') {
       const status = ev.status === 'error' ? 'ERROR' : 'ok';
-      const preview = (ev.output_preview || '').substring(0, 80).replace(/\n/g, ' ');
-      detail = `${ev.agent || ''} ← ${ev.tool || ''} [${status}] ${preview}`;
+      detail = `${ev.agent || ''} ← ${ev.tool || ''} [${status}]\n${ev.output_preview || ''}`;
     }
     if (ev.type === 'agent.message') {
-      const preview = (ev.content_preview || '').substring(0, 100).replace(/\n/g, ' ');
-      detail = `${ev.agent || ''}: ${preview}`;
+      detail = `${ev.agent || ''}:\n${ev.content_preview || ''}`;
     }
 
     const row = document.createElement('div');
@@ -560,12 +559,16 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 
   // ── Agent card elapsed time updater ──
   setInterval(() => {
-    for (const [name, info] of Object.entries(state.agents)) {
-      if (info.status === 'running' && info.startedAt) {
-        const el = document.querySelector(`.agent-card.running .agent-status.running`);
-        if (el) el.textContent = `running ${Math.round((Date.now()/1000) - info.startedAt)}s`;
+    document.querySelectorAll('.agent-card').forEach(card => {
+      const nameEl = card.querySelector('.agent-name');
+      const statusEl = card.querySelector('.agent-status');
+      if (!nameEl || !statusEl) return;
+      const name = nameEl.textContent;
+      const info = state.agents[name];
+      if (info && info.status === 'running' && info.startedAt) {
+        statusEl.textContent = `running ${Math.round((Date.now()/1000) - info.startedAt)}s`;
       }
-    }
+    });
   }, 1000);
 
   // ── Init ──

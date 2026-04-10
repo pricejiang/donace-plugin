@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -209,13 +208,13 @@ class AgentDispatcher:
                 if file_path and _is_path_outside_cwd(file_path, cwd):
                     return {"decision": "block", "reason": f"path {file_path} is outside project directory {cwd}"}
 
-            # --- EventBus: emit tool use event ---
+            # --- EventBus: emit tool use event (full content for Raw Log) ---
             target = tool_input.get("file_path") or tool_input.get("command", "")
             await bus.emit(AgentToolUse(
                 agent=agent_name,
                 tool=tool_name,
-                target=str(target)[:200] if target else None,
-                input_preview=json.dumps(tool_input)[:300] if isinstance(tool_input, dict) else str(tool_input)[:300],
+                target=str(target) if target else None,
+                input_preview=json.dumps(tool_input, ensure_ascii=False) if isinstance(tool_input, dict) else str(tool_input),
             ))
             return {}
 
@@ -224,7 +223,7 @@ class AgentDispatcher:
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
-            response_str = str(hook_input.get("tool_response", ""))[:300]
+            response_str = str(hook_input.get("tool_response", ""))
             status = "error" if "[error:" in response_str else "success"
             await bus.emit(AgentToolResult(
                 agent=agent_name,
@@ -239,6 +238,19 @@ class AgentDispatcher:
             "PostToolUse": [HookMatcher(matcher=".*", hooks=[post_tool_hook])],
         }
 
+    # Per-agent timeout (seconds). Agents doing real work (implementer,
+    # architect) need more time than lightweight ones (classify, codex runner).
+    AGENT_TIMEOUT: dict[str, int] = {
+        "planner": 300,
+        "architect": 300,
+        "implementer": 600,
+        "test-engineer": 600,
+        "runtime-evaluator": 300,
+        "typescript-reviewer": 300,
+        "ios-reviewer": 300,
+    }
+    DEFAULT_TIMEOUT = 300  # 5 minutes
+
     async def query(self, agent: str, prompt: str, model: str = "sonnet", **_: Any) -> str:
         """Run an agent query using Claude Agent SDK.
 
@@ -249,14 +261,28 @@ class AgentDispatcher:
 
         Returns:
             The agent's final text response.
+
+        Raises:
+            RuntimeError: on agent error or timeout.
         """
+        timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
+        try:
+            return await asyncio.wait_for(
+                self._run_agent(agent, prompt, model),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"agent={agent} timed out after {timeout}s")
+
+    async def _run_agent(self, agent: str, prompt: str, model: str) -> str:
+        """Inner coroutine — runs the agent, wrapped by wait_for timeout."""
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
 
         options = ClaudeAgentOptions(
             system_prompt=config.system_prompt,
             cwd=self.cwd,
-            allowed_tools=config.tools,
+            allowed_tools=config.tools + ["TodoWrite"],
             permission_mode="bypassPermissions",
             max_turns=50,
             model=model_id,
@@ -266,20 +292,20 @@ class AgentDispatcher:
         final_text = ""
         try:
             async for message in sdk_query(prompt=prompt, options=options):
-                # Stream text content for EventBus
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
                             await self.bus.emit(AgentMessage(
                                 agent=agent,
                                 role="assistant",
-                                content_preview=block.text[:500],
+                                content_preview=block.text,
                             ))
 
-                # Capture final result
                 if isinstance(message, ResultMessage):
+                    if getattr(message, "is_error", False):
+                        errors = getattr(message, "errors", []) or []
+                        raise RuntimeError(f"agent error: {'; '.join(errors) if errors else 'unknown'}")
                     final_text = getattr(message, "result", "") or ""
-                    # Emit token usage
                     usage = getattr(message, "usage", None)
                     if usage:
                         await self.bus.emit(AgentTokens(
@@ -287,8 +313,9 @@ class AgentDispatcher:
                             input_tokens=usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0),
                             output_tokens=usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0),
                         ))
+        except RuntimeError:
+            raise
         except Exception as exc:
-            # Enrich the error with agent context for better dashboard diagnostics
             raise RuntimeError(f"agent={agent} model={model_id}: {exc}") from exc
 
         return final_text
@@ -376,103 +403,129 @@ class AgentDispatcher:
         }
 
     # ------------------------------------------------------------------
-    # Codex review (CLI subprocess, not an agent)
+    # Codex review (via Agent SDK + codex plugin)
     # ------------------------------------------------------------------
 
     async def run_codex_review(self) -> dict:
-        """Run codex CLI review. Retries once on timeout/error per design doc."""
-        codex = shutil.which("codex")
-        if not codex:
+        """Run codex review via Agent SDK, using the codex companion script.
+
+        Dispatches a lightweight agent with only Bash access to run the
+        codex-companion.mjs script. The absolute path is resolved upfront
+        so the agent doesn't need to find it.
+        """
+        # Locate codex companion script
+        codex_plugin_root = self._find_codex_plugin_root()
+        if not codex_plugin_root:
             return {
                 "status": "skipped",
-                "p1_findings": 0,
-                "findings": [],
-                "reason": "codex CLI not found in PATH",
+                "has_issues": False,
+                "output": "",
+                "reason": "codex plugin not found",
             }
 
-        last_error = ""
-        for attempt in range(2):  # retry once on failure
-            try:
-                result = await self._run_codex_review_once(codex)
-                if result["status"] != "error" or attempt == 1:
-                    return result
-                last_error = result.get("reason", "unknown error")
-            except asyncio.TimeoutError:
-                last_error = "codex review timed out after 300 seconds"
-                if attempt == 1:
-                    break
-            except Exception as e:
-                last_error = f"codex review failed: {e}"
-                if attempt == 1:
-                    break
+        companion_script = Path(codex_plugin_root) / "scripts" / "codex-companion.mjs"
+        if not companion_script.exists():
+            return {
+                "status": "skipped",
+                "has_issues": False,
+                "output": "",
+                "reason": f"codex-companion.mjs not found at {companion_script}",
+            }
 
-        return {
-            "status": "skipped",
-            "p1_findings": 0,
-            "findings": [],
-            "reason": f"{last_error} (after retry)",
-        }
-
-    async def _run_codex_review_once(self, codex: str) -> dict:
-        """Single attempt at running codex review."""
-        # Get the base branch for diff
+        # Determine base ref for diff
         base = "HEAD~1"
-        proc = await asyncio.create_subprocess_exec(
-            "git", "merge-base", "HEAD", "origin/main",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
-        )
         try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "merge-base", "HEAD", "origin/main",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+            )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
                 base = stdout.decode().strip()
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+        except (asyncio.TimeoutError, Exception):
+            pass  # fall back to HEAD~1
 
-        # Run codex review
-        proc = await asyncio.create_subprocess_exec(
-            codex, "review",
-            "--base", base,
-            "-c", 'model_reasoning_effort="xhigh"',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=self.cwd,
-        )
+        cmd = f'node {companion_script} review --wait --base {base}'
+
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+            result = await asyncio.wait_for(
+                self._run_codex_agent(cmd, codex_plugin_root),
+                timeout=180,  # 3 minutes hard cap — codex should not take longer
+            )
+            return result
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise  # propagate to retry logic in run_codex_review
-        output = stdout.decode("utf-8", errors="replace")
-
-        if proc.returncode != 0:
             return {
-                "status": "error",
-                "p1_findings": 0,
-                "findings": [],
-                "reason": f"codex exited with code {proc.returncode}: {output[:500]}",
+                "status": "skipped",
+                "has_issues": False,
+                "output": "",
+                "reason": "codex review timed out after 180 seconds",
+            }
+        except Exception as e:
+            return {
+                "status": "skipped",
+                "has_issues": False,
+                "output": "",
+                "reason": f"codex review failed: {e}",
             }
 
-        # Parse codex output for findings
-        findings = []
-        p1_count = 0
-        for line in output.splitlines():
-            line_stripped = line.strip()
-            if line_stripped.startswith("[P1]") or line_stripped.startswith("[CRITICAL]"):
-                findings.append(line_stripped)
-                p1_count += 1
-            elif line_stripped.startswith("[P2]") or line_stripped.startswith("[WARNING]"):
-                findings.append(line_stripped)
+    async def _run_codex_agent(self, cmd: str, codex_plugin_root: str) -> dict:
+        """Inner coroutine for codex review — wrapped by wait_for timeout."""
+        prompt = (
+            f"Execute this command and return the output verbatim:\n\n"
+            f"```\n{cmd}\n```\n\n"
+            f"Do not fix any issues. Do not paraphrase or summarize. "
+            f"Return the raw command output exactly as-is."
+        )
 
+        options = ClaudeAgentOptions(
+            system_prompt="You execute commands and return output verbatim. Never fix issues or add commentary.",
+            cwd=self.cwd,
+            allowed_tools=["Bash"],
+            permission_mode="bypassPermissions",
+            max_turns=3,
+            model=_resolve_model("haiku"),
+            env={"CLAUDE_PLUGIN_ROOT": codex_plugin_root},
+        )
+
+        all_text: list[str] = []
+        async for message in sdk_query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        all_text.append(block.text)
+            elif isinstance(message, ResultMessage):
+                # Check for errors in the result
+                if getattr(message, "is_error", False):
+                    errors = getattr(message, "errors", []) or []
+                    raise RuntimeError(f"codex agent error: {'; '.join(errors) if errors else 'unknown'}")
+                result_text = getattr(message, "result", "") or ""
+                if result_text.strip():
+                    all_text.append(result_text)
+
+        output = max(all_text, key=len) if all_text else ""
+
+        has_issues = bool(output.strip()) and any(
+            marker in output for marker in ("[P0]", "[P1]", "[P2]", "[CRITICAL]", "[WARNING]")
+        )
         return {
             "status": "completed",
-            "p1_findings": p1_count,
-            "findings": findings,
-            "output": output[-2000:] if len(output) > 2000 else output,
+            "has_issues": has_issues,
+            "output": output,
         }
+
+    def _find_codex_plugin_root(self) -> str | None:
+        """Locate the codex plugin root directory."""
+        candidates = [
+            Path.home() / ".claude" / "plugins" / "cache" / "openai-codex" / "codex",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                versions = sorted(candidate.iterdir(), reverse=True)
+                if versions:
+                    return str(versions[0])
+        return None
 
     # ------------------------------------------------------------------
     # Runtime evaluator dispatch

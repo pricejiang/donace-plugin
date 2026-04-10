@@ -64,14 +64,13 @@ def collect_failures(
             "severity": "error",
         })
 
-    # Codex P1 findings
-    if codex_result.get("p1_findings", 0) > 0:
-        for finding in codex_result.get("findings", []):
-            failures.append({
-                "source": "codex-review",
-                "description": finding,
-                "severity": "error",
-            })
+    # Codex findings — raw output passed through, not parsed by us
+    if codex_result.get("has_issues"):
+        failures.append({
+            "source": "codex-review",
+            "description": codex_result.get("output", "codex review found issues"),
+            "severity": "error",
+        })
 
     # Runtime failures
     if runtime_result and runtime_result.get("status") == "FAIL":
@@ -258,11 +257,9 @@ async def run_sprint_loop(
             _run_with_timing(run_test_engineer, stage, bus, "test-engineer")
         ))
 
-        # Codex review (always runs)
-        await bus.emit(AgentStarted(agent="codex-review"))
-        verify_tasks.append(asyncio.create_task(
-            _run_with_timing_no_arg(run_codex_review, bus, "codex-review")
-        ))
+        # Codex review (disabled — codex-companion.mjs not available)
+        await bus.emit(AgentSkipped(agent="codex-review", reason="codex review disabled"))
+        codex_result = {"status": "skipped", "p1_findings": 0, "findings": [], "reason": "codex review disabled"}
 
         # Runtime evaluator (conditional)
         runtime_task: asyncio.Task | None = None
@@ -282,17 +279,17 @@ async def run_sprint_loop(
         raw_results = await asyncio.gather(*verify_tasks, return_exceptions=True)
 
         test_result = _extract_result(raw_results, 0, {"passed": 0, "failed": 0})
-        codex_result = _extract_result(raw_results, 1, {"status": "error", "p1_findings": 0, "findings": []})
+        # codex_result already set above (skipped)
         runtime_result = None
-        if stage.has_user_facing_changes and len(raw_results) > 2:
-            runtime_result = _extract_result(raw_results, 2, {"status": "error", "score": "0/5"})
+        if stage.has_user_facing_changes and len(raw_results) > 1:
+            runtime_result = _extract_result(raw_results, 1, {"status": "error", "score": "0/5"})
         elif not stage.has_user_facing_changes:
             runtime_result = None
 
         # Log exceptions (AgentFailed already emitted by _run_with_timing helpers)
         for i, r in enumerate(raw_results):
             if isinstance(r, Exception):
-                agent_name = ["test-engineer", "codex-review", "runtime-evaluator"][i] if i < 3 else f"verify-{i}"
+                agent_name = ["test-engineer", "runtime-evaluator"][i] if i < 2 else f"verify-{i}"
                 warnings.append(f"Verification {agent_name} failed with exception: {r}")
 
         # --- Checkpoint: post-verify ---
@@ -380,10 +377,8 @@ async def run_sprint_loop(
 
             # Re-verify (test + codex always, runtime only if it ran initially)
             await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
-            await bus.emit(AgentStarted(agent="codex-review"))
             re_verify_tasks: list[asyncio.Task] = [
                 asyncio.create_task(_run_with_timing(run_test_engineer, stage, bus, "test-engineer")),
-                asyncio.create_task(_run_with_timing_no_arg(run_codex_review, bus, "codex-review")),
             ]
             if stage.has_user_facing_changes and runtime_result is not None:
                 await bus.emit(AgentStarted(agent="runtime-evaluator", role="verification"))
@@ -393,9 +388,9 @@ async def run_sprint_loop(
             re_results = await asyncio.gather(*re_verify_tasks, return_exceptions=True)
 
             test_result = _extract_result(re_results, 0, {"passed": 0, "failed": 0})
-            codex_result = _extract_result(re_results, 1, {"status": "error", "p1_findings": 0, "findings": []})
-            if stage.has_user_facing_changes and len(re_results) > 2:
-                runtime_result = _extract_result(re_results, 2, {"status": "error", "score": "0/5"})
+            # codex_result unchanged (skipped)
+            if stage.has_user_facing_changes and len(re_results) > 1:
+                runtime_result = _extract_result(re_results, 1, {"status": "error", "score": "0/5"})
             failures = collect_failures(test_result, codex_result, runtime_result)
 
         # Emit fix loop resolution status

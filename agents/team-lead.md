@@ -26,7 +26,7 @@ Determine what kind of request this is:
 | "Implement and ship feature X" | "Run QA on the staging site" |
 | Involves writing + testing + reviewing code | Involves only one specialist's output |
 
-When in doubt, ask the user: "Do you want the full pipeline, or just [agent name]?"
+**Default to pipeline.** Unless the user explicitly names a specific agent (e.g., "use ui-designer", "ask architect", "run QA"), always use the pipeline. Do not infer ad-hoc from the task description alone.
 
 ## Pipeline Flow
 

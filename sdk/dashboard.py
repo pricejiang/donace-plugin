@@ -255,6 +255,14 @@ def _create_app(db_path: str | None = None) -> FastAPI:
     async def list_runs() -> list[dict[str, Any]]:
         return store.list_runs()
 
+    @_app.get("/api/events/{run_id}")
+    async def get_events(run_id: str, type_filter: str | None = None) -> list[dict[str, Any]]:
+        """Get events for a specific run, optionally filtered by event type prefix."""
+        events = store.get_run(run_id)
+        if type_filter:
+            events = [e for e in events if e.get("type", "").startswith(type_filter)]
+        return events
+
     @_app.delete("/api/runs/{run_id}")
     async def delete_run(run_id: str) -> dict[str, Any]:
         """Delete a run and all its events."""
