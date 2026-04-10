@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 import time
@@ -360,9 +361,125 @@ async def run_documenter(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Run state persistence (for resume)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunState:
+    """Persisted state of an in-progress run. Written after each stage completes."""
+    run_id: str
+    task: str
+    cwd: str
+    phase: str                           # "plan", "sprint", "wrap"
+    plan_raw: str = ""
+    stages_completed: list[dict] = field(default_factory=list)  # list of StageResult dicts
+    stages_remaining: list[dict] = field(default_factory=list)  # list of Stage dicts
+    warnings: list[str] = field(default_factory=list)
+
+    def save(self) -> None:
+        state_path = Path(self.cwd) / ".ai" / "runs" / f"{self.run_id}.state.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({
+            "run_id": self.run_id,
+            "task": self.task,
+            "cwd": self.cwd,
+            "phase": self.phase,
+            "plan_raw": self.plan_raw,
+            "stages_completed": self.stages_completed,
+            "stages_remaining": self.stages_remaining,
+            "warnings": self.warnings,
+        }, indent=2))
+
+    def delete(self) -> None:
+        state_path = Path(self.cwd) / ".ai" / "runs" / f"{self.run_id}.state.json"
+        try:
+            state_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _find_incomplete_run(cwd: str) -> RunState | None:
+    """Check .ai/runs/ for a state file without a matching result file (= incomplete run)."""
+    runs_dir = Path(cwd) / ".ai" / "runs"
+    if not runs_dir.exists():
+        return None
+
+    for state_file in sorted(runs_dir.glob("*.state.json"), reverse=True):
+        run_id = state_file.stem.replace(".state", "")
+        result_file = runs_dir / f"{run_id}.json"
+        if not result_file.exists():
+            # Found an incomplete run
+            try:
+                data = json.loads(state_file.read_text())
+                return RunState(
+                    run_id=data["run_id"],
+                    task=data["task"],
+                    cwd=data["cwd"],
+                    phase=data.get("phase", "sprint"),
+                    plan_raw=data.get("plan_raw", ""),
+                    stages_completed=data.get("stages_completed", []),
+                    stages_remaining=data.get("stages_remaining", []),
+                    warnings=data.get("warnings", []),
+                )
+            except (json.JSONDecodeError, KeyError):
+                continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Process lock
+# ---------------------------------------------------------------------------
+
+def _acquire_lock(cwd: str, run_id: str) -> Path:
+    """Acquire a project-level lock. Kill any stale orchestrator for this project."""
+    lock_path = Path(cwd) / ".ai" / "runs" / ".lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if lock_path.exists():
+        try:
+            lock_data = json.loads(lock_path.read_text())
+            old_pid = lock_data.get("pid")
+            old_run = lock_data.get("run_id", "unknown")
+            if old_pid:
+                # Check if process is still alive
+                os.kill(old_pid, 0)  # raises OSError if dead
+                # Still alive — kill it
+                print(f"Warning: killing stale orchestrator (pid={old_pid}, run={old_run})", file=sys.stderr)
+                os.kill(old_pid, 9)
+                import time as _time
+                _time.sleep(0.5)  # wait for process to die
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass  # process already dead or lock corrupt — clean up
+
+    lock_path.write_text(json.dumps({"pid": os.getpid(), "run_id": run_id}))
+    return lock_path
+
+
+def _release_lock(cwd: str) -> None:
+    """Release the project-level lock."""
+    lock_path = Path(cwd) / ".ai" / "runs" / ".lock"
+    try:
+        lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive: bool = False) -> OrchestrationResult:
-    """Execute the full orchestration pipeline (Phase 0-3)."""
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    """Execute the full orchestration pipeline (Phase 0-3).
+
+    Automatically resumes incomplete runs if a .state.json file exists
+    without a corresponding result .json file.
+    """
+    # ── Check for incomplete run to resume ──
+    prev_run = _find_incomplete_run(cwd)
+    if prev_run:
+        run_id = prev_run.run_id
+        print(f"Resuming incomplete run {run_id} ({len(prev_run.stages_completed)} stages done)", file=sys.stderr)
+    else:
+        run_id = f"run-{uuid.uuid4().hex[:8]}"
+
+    lock_path = _acquire_lock(cwd, run_id)
     bus = EventBus(run_id=run_id, interactive=interactive)
 
     # Connect to dashboard if URL provided
@@ -390,6 +507,9 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         print("Error: claude-agent-sdk is required. Run: pip install claude-agent-sdk", file=sys.stderr)
         sys.exit(1)
 
+    # Initialize run state for persistence
+    run_state = RunState(run_id=run_id, task=task, cwd=cwd, phase="boot")
+
     try:
         await bus.emit(RunStarted(task=task, cwd=cwd, interactive=interactive))
 
@@ -398,16 +518,15 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         t0 = time.time()
 
         session_context = await load_session_context(cwd)
-        resume_plan = check_for_resume(cwd)
         stack = detect_stack(cwd)
-
         empty_repo = is_empty_repo(cwd)
 
         await bus.emit(PhaseCompleted(phase="boot", duration_s=round(time.time() - t0, 1)))
 
-        # ── Early exit: empty repo with no resume plan ──
-        if empty_repo and not resume_plan:
+        # ── Early exit: empty repo ──
+        if empty_repo and not prev_run:
             result = OrchestrationResult(
+                run_id=run_id,
                 sprint=SprintResult(
                     stages=[StageResult(
                         name="Project bootstrap",
@@ -435,49 +554,81 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
 
         # ── Phase 1: Plan (skip if resuming) ──
         plan: Plan
-        if not resume_plan:
-            await bus.emit(PhaseStarted(phase="plan"))
-            t0 = time.time()
-
-            # Task classification
-            task_class = await classify_task(task, dispatcher)
-
-            # Planner (skip for bug fixes / refactors)
-            if task_class.needs_spec:
-                spec = await run_planner(task, bus, dispatcher)
-            else:
-                await bus.emit(AgentSkipped(agent="planner", reason=task_class.reason))
-                spec = task
-
-            # Architect (skip for trivial single-line fixes)
-            if task_class.needs_plan:
-                plan = await run_architect(spec, bus, dispatcher)
-
-                # Codex plan review (mandatory when plan exists)
-                review = await run_codex_plan_review(plan, bus)
-
-                # Revision loop if major issues
-                if review.get("has_major_issues"):
-                    await bus.emit(AgentStarted(agent="architect", prompt="Revise plan"))
-                    plan = await run_architect(
-                        f"Revise plan based on review findings: {review.get('findings', [])}",
-                        bus,
-                        dispatcher,
-                    )
-            else:
-                await bus.emit(AgentSkipped(agent="architect", reason=task_class.reason))
-                plan = make_trivial_plan(task)
-
-            await bus.emit(PhaseCompleted(phase="plan", duration_s=round(time.time() - t0, 1)))
+        if prev_run and prev_run.phase in ("sprint", "wrap"):
+            # Resuming — rebuild plan from state
+            completed_names = {s["name"] for s in prev_run.stages_completed}
+            remaining_stages = [
+                Stage(name=s["name"], has_user_facing_changes=s.get("has_user_facing_changes", False))
+                for s in prev_run.stages_remaining
+                if s["name"] not in completed_names
+            ]
+            all_stages = [
+                Stage(name=s["name"], has_user_facing_changes=s.get("has_user_facing_changes", False))
+                for s in prev_run.stages_remaining
+            ]
+            plan = Plan(stages=all_stages, raw=prev_run.plan_raw)
         else:
-            plan = resume_plan
+            resume_plan = check_for_resume(cwd)
+            if not resume_plan:
+                await bus.emit(PhaseStarted(phase="plan"))
+                t0 = time.time()
+
+                # Task classification
+                task_class = await classify_task(task, dispatcher)
+
+                # Planner (skip for bug fixes / refactors)
+                if task_class.needs_spec:
+                    spec = await run_planner(task, bus, dispatcher)
+                else:
+                    await bus.emit(AgentSkipped(agent="planner", reason=task_class.reason))
+                    spec = task
+
+                # Architect (skip for trivial single-line fixes)
+                if task_class.needs_plan:
+                    plan = await run_architect(spec, bus, dispatcher)
+
+                    # Codex plan review (mandatory when plan exists)
+                    review = await run_codex_plan_review(plan, bus)
+
+                    # Revision loop if major issues
+                    if review.get("has_major_issues"):
+                        await bus.emit(AgentStarted(agent="architect", prompt="Revise plan"))
+                        plan = await run_architect(
+                            f"Revise plan based on review findings: {review.get('findings', [])}",
+                            bus,
+                            dispatcher,
+                        )
+                else:
+                    await bus.emit(AgentSkipped(agent="architect", reason=task_class.reason))
+                    plan = make_trivial_plan(task)
+
+                await bus.emit(PhaseCompleted(phase="plan", duration_s=round(time.time() - t0, 1)))
+            else:
+                plan = resume_plan
+
+        # Save plan to run state (for resume)
+        run_state.phase = "sprint"
+        run_state.plan_raw = plan.raw
+        run_state.stages_remaining = [
+            {"name": s.name, "has_user_facing_changes": s.has_user_facing_changes}
+            for s in plan.stages
+        ]
+        if prev_run:
+            run_state.stages_completed = prev_run.stages_completed
+            run_state.warnings = prev_run.warnings
+        run_state.save()
 
         # ── Phase 2: Sprint Loop ──
         await bus.emit(PhaseStarted(phase="sprint"))
         t0 = time.time()
 
-        # Build task context for sprint loop agents (contract + implementer)
+        # Build task context for sprint loop agents
         task_context = f"Task: {task}\n\nPlan:\n{plan.raw[:3000]}"
+
+        # Build list of already-completed stage names (for resume skip)
+        completed_stage_names: set[str] = set()
+        if prev_run:
+            completed_stage_names = {s["name"] for s in prev_run.stages_completed}
 
         sprint_result = await run_sprint_loop(
             stages=plan.stages,
@@ -488,11 +639,33 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             run_codex_review=dispatcher.run_codex_review,
             run_runtime_evaluator=dispatcher.run_runtime_evaluator,
             task_context=task_context,
+            completed_stage_names=completed_stage_names,
+            on_stage_complete=lambda sr: _on_stage_complete(run_state, sr),
         )
+
+        # Merge warnings from previous run
+        if prev_run:
+            sprint_result.warnings = prev_run.warnings + sprint_result.warnings
+            # Prepend completed stages from previous run
+            prev_stage_results = [
+                StageResult(**s) for s in prev_run.stages_completed
+            ]
+            sprint_result.stages = prev_stage_results + sprint_result.stages
+            # Recalculate summary
+            passed = sum(1 for r in sprint_result.stages if r.status == "PASS")
+            blocked = sum(1 for r in sprint_result.stages if r.status == "BLOCKED")
+            skipped = sum(1 for r in sprint_result.stages if r.status == "SKIPPED")
+            sprint_result.summary = {
+                "passed": passed, "blocked": blocked,
+                "skipped": skipped, "total": len(sprint_result.stages),
+            }
 
         await bus.emit(PhaseCompleted(phase="sprint", duration_s=round(time.time() - t0, 1)))
 
         # ── Phase 3: Wrap ──
+        run_state.phase = "wrap"
+        run_state.save()
+
         await bus.emit(PhaseStarted(phase="wrap"))
         t0 = time.time()
 
@@ -504,19 +677,40 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
 
         await bus.emit(PhaseCompleted(phase="wrap", duration_s=round(time.time() - t0, 1)))
 
-        result = OrchestrationResult(sprint=sprint_result, review=final_review)
+        result = OrchestrationResult(sprint=sprint_result, review=final_review, run_id=run_id)
         await bus.emit(RunCompleted(result_summary=result.to_json_output().get("summary")))
+
+        # Clean up state file — run is complete, result file will be written by main()
+        run_state.delete()
 
         return result
 
     except Exception as exc:
         await bus.emit(RunFailed(error=str(exc)))
+        # State file is NOT deleted on failure — enables resume on next run
         raise
     finally:
+        _release_lock(cwd)
         if emitter:
             # Give events time to flush
             await asyncio.sleep(0.5)
             await emitter.disconnect()
+
+
+def _on_stage_complete(run_state: RunState, stage_result: StageResult) -> None:
+    """Callback: persist stage result to run state after each stage completes."""
+    run_state.stages_completed.append({
+        "name": stage_result.name,
+        "status": stage_result.status,
+        "contract": stage_result.contract,
+        "test_result": stage_result.test_result,
+        "codex_result": stage_result.codex_result,
+        "runtime_result": stage_result.runtime_result,
+        "fix_attempts": stage_result.fix_attempts,
+        "unresolved": stage_result.unresolved,
+        "recommendation": stage_result.recommendation,
+    })
+    run_state.save()
 
 
 # ---------------------------------------------------------------------------
@@ -540,9 +734,17 @@ def main() -> None:
         interactive=interactive,
     ))
 
-    # Output JSON to stdout for team-lead to read
+    # Write JSON result to .ai/runs/ for team-lead to read
     output = result.to_json_output()
-    print(json.dumps(output, indent=2))
+    output_json = json.dumps(output, indent=2)
+
+    runs_dir = Path(args.cwd) / ".ai" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    result_path = runs_dir / f"{result.run_id}.json"
+    result_path.write_text(output_json)
+
+    # Also print to stdout for convenience
+    print(output_json)
 
 
 if __name__ == "__main__":

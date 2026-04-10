@@ -100,6 +100,10 @@ def _failure_fingerprint(failures: list[dict[str, Any]]) -> frozenset[tuple[str,
 # Sprint loop
 # ---------------------------------------------------------------------------
 
+# Callback type for stage completion persistence
+OnStageCompleteFn = Callable[[StageResult], None] | None
+
+
 async def run_sprint_loop(
     stages: list[Stage],
     cwd: str,
@@ -109,6 +113,8 @@ async def run_sprint_loop(
     run_codex_review: CodexRunnerFn,
     run_runtime_evaluator: RuntimeRunnerFn,
     task_context: str = "",
+    completed_stage_names: set[str] | None = None,
+    on_stage_complete: OnStageCompleteFn = None,
 ) -> SprintResult:
     """Execute the Phase 2 sprint loop over all stages.
 
@@ -121,20 +127,36 @@ async def run_sprint_loop(
         run_codex_review: Function to run codex review.
         run_runtime_evaluator: Function to run runtime evaluator with a contract.
         task_context: Original task + plan text for agent prompts.
+        completed_stage_names: Stages already completed in a previous run (skip these).
+        on_stage_complete: Callback invoked after each stage completes (for state persistence).
 
     Returns:
         SprintResult with per-stage results, warnings, and summary.
+        Note: when resuming, only newly-run stages are included. The orchestrator
+        merges these with previously-completed stages from the run state.
     """
+    _completed = completed_stage_names or set()
     results: list[StageResult] = []
     warnings: list[str] = []
     must_stop = False
     skip_next = False
 
+    def _record(sr: StageResult) -> None:
+        results.append(sr)
+        if on_stage_complete:
+            on_stage_complete(sr)
+
     for idx, stage in enumerate(stages):
+        # Skip stages already completed in a previous run
+        if stage.name in _completed:
+            await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
+            warnings.append(f"Stage '{stage.name}' already completed in previous run — skipped")
+            continue
+
         if skip_next:
             skip_next = False
             await bus.emit(StageCompleted(stage_name=stage.name, status="SKIPPED"))
-            results.append(StageResult(
+            _record(StageResult(
                 name=stage.name,
                 status="SKIPPED",
                 contract="",
@@ -147,7 +169,7 @@ async def run_sprint_loop(
 
         if must_stop:
             # Record remaining stages as skipped
-            results.append(StageResult(
+            _record(StageResult(
                 name=stage.name,
                 status="SKIPPED",
                 contract="",
@@ -192,7 +214,7 @@ async def run_sprint_loop(
         decision = await bus.wait_for_decision("pre-implement")
         if decision == Decision.SKIP_STAGE:
             await bus.emit(StageCompleted(stage_name=stage.name, status="SKIPPED"))
-            results.append(StageResult(
+            _record(StageResult(
                 name=stage.name,
                 status="SKIPPED",
                 contract=contract,
@@ -277,7 +299,7 @@ async def run_sprint_loop(
         decision = await bus.wait_for_decision("post-verify")
         if decision == Decision.SKIP_FIXES:
             await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
-            results.append(StageResult(
+            _record(StageResult(
                 name=stage.name,
                 status="PASS",
                 contract=contract,
@@ -289,7 +311,7 @@ async def run_sprint_loop(
             continue
         elif decision == Decision.ABORT:
             await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
-            results.append(StageResult(
+            _record(StageResult(
                 name=stage.name,
                 status="BLOCKED",
                 contract=contract,
@@ -416,7 +438,7 @@ async def run_sprint_loop(
 
             if should_block:
                 await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
-                results.append(StageResult(
+                _record(StageResult(
                     name=stage.name,
                     status="BLOCKED",
                     contract=contract,
@@ -432,7 +454,7 @@ async def run_sprint_loop(
         # Stage passed — warnings are acceptable, gate check already handled MUST_STOP
         status = "PASS"
         await bus.emit(StageCompleted(stage_name=stage.name, status=status))
-        results.append(StageResult(
+        _record(StageResult(
             name=stage.name,
             status=status,
             contract=contract,

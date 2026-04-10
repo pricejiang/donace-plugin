@@ -516,6 +516,7 @@ class TaskClass:
 class OrchestrationResult:
     sprint: SprintResult
     review: str = ""
+    run_id: str = ""
 
     def to_json_output(self) -> dict:
         """Produce the JSON output dict for stdout (team-lead reads this)."""
@@ -538,6 +539,7 @@ class OrchestrationResult:
             stages.append(stage_dict)
 
         return {
+            "run_id": self.run_id,
             "stages": stages,
             "warnings": self.sprint.warnings,
             "summary": self.sprint.summary,
