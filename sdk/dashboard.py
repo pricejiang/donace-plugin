@@ -209,18 +209,14 @@ def _create_app(db_path: str | None = None) -> FastAPI:
 
     @_app.websocket("/ws")
     async def browser_ws_endpoint(ws: WebSocket) -> None:
-        """Browser connects here to view events and send decisions."""
+        """Browser connects here to view events and send decisions.
+
+        No replay on connect — browser fetches history via REST API
+        (/api/runs, /api/events/{run_id}) on demand. WebSocket only
+        pushes live events from active orchestrator connections.
+        """
         await ws.accept()
         browser_connections.add(ws)
-
-        # Replay all events for late-joining browsers
-        try:
-            for _run_id, events in store.runs.items():
-                for event in events:
-                    await ws.send_text(json.dumps(event))
-        except Exception:
-            browser_connections.discard(ws)
-            return
 
         # Listen for decisions from browser and relay to orchestrator
         try:

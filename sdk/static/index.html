@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>donace dashboard</title>
+<title>Donace Dashboard</title>
 <style>
 /* ── Reset & Base ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -243,12 +243,27 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = `${proto}//${location.host}/ws`;
     state.ws = new WebSocket(url);
-    state.ws.onopen = () => { state.connected = true; $connDot.classList.add('connected'); $connLabel.textContent = 'Connected'; };
+    state.ws.onopen = () => { state.connected = true; updateConnStatus(); };
     state.ws.onclose = () => { state.connected = false; $connDot.classList.remove('connected'); $connLabel.textContent = 'Disconnected'; setTimeout(connect, 2000); };
     state.ws.onerror = () => { state.ws.close(); };
     state.ws.onmessage = (msg) => {
       try { handleEvent(JSON.parse(msg.data)); } catch (e) { console.error('Parse error:', e); }
     };
+  }
+
+  // ── Connection status ──
+  function updateConnStatus() {
+    if (!state.connected) {
+      $connDot.classList.remove('connected');
+      $connLabel.textContent = 'Disconnected';
+    } else if (state.runLive) {
+      $connDot.classList.add('connected');
+      $connLabel.textContent = 'Live';
+    } else {
+      $connDot.classList.add('connected');
+      $connDot.style.background = 'var(--text-dim)';
+      $connLabel.textContent = 'Idle';
+    }
   }
 
   // ── Event handlers ──
@@ -258,7 +273,9 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     state.allEvents[runId].push(ev);
 
     if (ev.type === 'run.started') {
+      state.runLive = true;
       state.activeRunId = runId;
+      updateConnStatus();
       clearTimeout(state._replayTimer);
       state._replayTimer = setTimeout(() => {
         if (state.currentRunId !== runId) window._switchRun(runId);
@@ -276,7 +293,8 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   function processEvent(ev) {
     switch (ev.type) {
       case 'run.started': $runId.textContent = ev.run_id; resetState(); break;
-      case 'run.completed': case 'run.failed': break;
+      case 'run.completed': case 'run.failed':
+        state.runLive = false; updateConnStatus(); break;
       case 'phase.started': state.phases[ev.phase] = 'active'; break;
       case 'phase.completed': state.phases[ev.phase] = 'done'; break;
       case 'agent.started':
@@ -305,6 +323,23 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
           state.subagents[ev.subagent_id].duration = Math.round(ev.timestamp - state.subagents[ev.subagent_id].startedAt);
         }
         break;
+      case 'agent.tokens': {
+        const agent = ev.agent || 'unknown';
+        const inp = ev.input_tokens || 0;
+        const out = ev.output_tokens || 0;
+        if (!state.tokenUsage) state.tokenUsage = {};
+        if (!state.tokenUsage[agent]) state.tokenUsage[agent] = { input: 0, output: 0 };
+        state.tokenUsage[agent].input += inp;
+        state.tokenUsage[agent].output += out;
+        // Also accumulate into parent if this is a subagent (agent name contains '/')
+        if (agent.includes('/')) {
+          const parent = agent.split('/')[0];
+          if (!state.tokenUsage[parent]) state.tokenUsage[parent] = { input: 0, output: 0 };
+          state.tokenUsage[parent].input += inp;
+          state.tokenUsage[parent].output += out;
+        }
+        break;
+      }
       case 'stage.changed':
         state.currentStage = ev.stage_name;
         while (state.stages.length < ev.total_stages) state.stages.push({ name: '', status: 'pending' });
@@ -326,12 +361,16 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       case 'checkpoint.resolved':
         state.checkpoint = null; break;
     }
-    renderAll();
-    addLogEntry(ev);
+    // In batch mode (history load), skip per-event rendering — caller renders once at the end.
+    // In live mode (WebSocket), render immediately for real-time updates.
+    if (!state._batchMode) {
+      renderAll();
+      addLogEntry(ev);
+    }
   }
 
   function resetState() {
-    state.agents = {}; state.subagents = {}; state.phases = {}; state.stages = [];
+    state.agents = {}; state.subagents = {}; state.tokenUsage = {}; state.phases = {}; state.stages = [];
     state.currentStage = null; state.fixLoop = null; state.checkpoint = null;
   }
 
@@ -384,22 +423,53 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       if (sub.parent !== parentName) continue;
       const elapsed = sub.duration ? `${sub.duration}s` : sub.startedAt ? `${Math.round((Date.now()/1000) - sub.startedAt)}s` : '';
       const cls = sub.status === 'running' ? 'running' : '';
+      const subTokenKey = `${parentName}/${sub.type}`;
       html += `<div class="agent-card subagent ${cls}" style="margin-left: 16px; border-left: 2px solid var(--cyan); opacity: 0.9;">
         <div class="agent-header">
           <span class="agent-name" style="font-size: 11px;">${sub.type}</span>
           <span class="agent-status ${sub.status}" style="font-size: 11px;">${sub.status} ${elapsed}</span>
         </div>
+        ${tokenLine(subTokenKey)}
       </div>`;
     }
     return html;
   }
 
+  function formatTokens(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function tokenLine(name) {
+    const u = (state.tokenUsage || {})[name];
+    if (!u || (u.input === 0 && u.output === 0)) return '';
+    return `<div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">↳ ${formatTokens(u.input)} in · ${formatTokens(u.output)} out</div>`;
+  }
+
   function renderAgentCards() {
     let html = '';
+
+    // Run-level total at the top
+    const allUsage = state.tokenUsage || {};
+    const totalIn = Object.values(allUsage).reduce((s, u) => {
+      // Only count top-level agents (no '/') to avoid double-counting subagent rollups
+      return s;
+    }, 0);
+    let runIn = 0, runOut = 0;
+    for (const [name, u] of Object.entries(allUsage)) {
+      if (!name.includes('/')) { runIn += u.input; runOut += u.output; }
+    }
+    if (runIn > 0 || runOut > 0) {
+      html += `<div style="padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between;">
+        <span>Run total</span>
+        <span>${formatTokens(runIn)} in · ${formatTokens(runOut)} out</span>
+      </div>`;
+    }
+
     for (const name of AGENT_ORDER) {
       const info = state.agents[name];
       if (!info) {
-        // Placeholder
         html += `<div class="agent-card placeholder"><div class="agent-header"><span class="agent-name">${name}</span></div></div>`;
         continue;
       }
@@ -411,11 +481,10 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
           <span class="agent-status ${info.status}">${info.status} ${elapsed}</span>
         </div>
         <div class="agent-detail">${info.model || info.detail || ''}</div>
+        ${tokenLine(name)}
       </div>`;
-      // Render subagents nested under this agent
       html += renderSubagents(name);
     }
-    // Any agents not in AGENT_ORDER (planner, architect, etc.)
     for (const [name, info] of Object.entries(state.agents)) {
       if (AGENT_ORDER.includes(name)) continue;
       const elapsed = info.duration ? `${info.duration}s` : info.startedAt ? `${Math.round((Date.now()/1000) - info.startedAt)}s` : '';
@@ -426,6 +495,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
           <span class="agent-status ${info.status}">${info.status} ${elapsed}</span>
         </div>
         <div class="agent-detail">${info.model || info.detail || ''}</div>
+        ${tokenLine(name)}
       </div>`;
       html += renderSubagents(name);
     }
@@ -465,8 +535,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   };
 
   // ── Event log ──
-  function addLogEntry(ev) {
-    if ($logEmpty) $logEmpty.style.display = 'none';
+  function buildLogRow(ev) {
     const time = new Date(ev.timestamp * 1000).toLocaleTimeString('en-US', { hour12: false });
     const typeClass = ev.type.startsWith('run.') ? 'run' : ev.type.startsWith('phase.') ? 'phase' : ev.type.startsWith('agent.') ? 'agent' : ev.type.startsWith('stage.') ? 'stage' : ev.type.startsWith('fix_loop.') ? 'fix' : ev.type.startsWith('checkpoint.') ? 'checkpoint' : ev.type.startsWith('gate.') ? 'gate' : '';
 
@@ -496,8 +565,13 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     const row = document.createElement('div');
     row.className = 'event-row';
     row.innerHTML = `<span class="time">${time}</span><span class="type ${typeClass}">${ev.type}</span><span class="detail" title="${detail.replace(/"/g, '&quot;')}">${detail}</span>`;
-    $eventLog.prepend(row);
+    return row;
+  }
 
+  function addLogEntry(ev) {
+    if ($logEmpty) $logEmpty.style.display = 'none';
+    const row = buildLogRow(ev);
+    if (row) $eventLog.prepend(row);
     if (ev.type === 'agent.message' || ev.type === 'agent.tool_use' || ev.type === 'agent.tool_result') addRawLogEntry(ev);
   }
 
@@ -528,15 +602,46 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     $list.innerHTML = html;
   }
 
-  window._switchRun = function(runId) {
+  window._switchRun = async function(runId) {
     if (runId === state.currentRunId) return;
     state.currentRunId = runId;
     state.events = [];
     resetState();
     $eventLog.innerHTML = '';
     document.getElementById('raw-log').innerHTML = '';
-    const events = state.allEvents[runId] || [];
+
+    // Try local cache first, then fetch from API
+    let events = state.allEvents[runId];
+    if (!events || events.length === 0) {
+      try {
+        events = await (await fetch(`/api/events/${runId}`)).json();
+        state.allEvents[runId] = events;
+      } catch (e) {
+        events = [];
+      }
+    }
+    // Batch mode: update state without rendering each event, then render once
+    state._batchMode = true;
     for (const ev of events) { state.events.push(ev); processEvent(ev); }
+    state._batchMode = false;
+
+    // Single render pass + build log entries in one batch
+    renderAll();
+    // Build all log HTML at once instead of per-event DOM insertion
+    const fragment = document.createDocumentFragment();
+    for (const ev of events) {
+      const row = buildLogRow(ev);
+      if (row) fragment.appendChild(row);
+    }
+    $eventLog.innerHTML = '';
+    $eventLog.appendChild(fragment);
+    if ($logEmpty) $logEmpty.style.display = 'none';
+    // Build raw log
+    const $raw = document.getElementById('raw-log');
+    $raw.innerHTML = '';
+    for (const ev of events) {
+      if (ev.type === 'agent.message' || ev.type === 'agent.tool_use' || ev.type === 'agent.tool_result') addRawLogEntry(ev);
+    }
     renderHistory();
   };
 
@@ -605,8 +710,17 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   }, 1000);
 
   // ── Init ──
-  connect();
-  fetchHistory();
+  // Load the most recent run on startup via REST, then connect WebSocket for live events only
+  async function init() {
+    await fetchHistory();
+    // Auto-load the most recent run
+    if (historyRuns.length > 0 && !state.currentRunId) {
+      await window._switchRun(historyRuns[0].run_id);
+    }
+    state.runLive = false;  // no active orchestrator on page load
+    connect();
+  }
+  init();
 })();
 </script>
 </body>
