@@ -264,28 +264,32 @@ class AgentDispatcher:
         )
 
         final_text = ""
-        async for message in sdk_query(prompt=prompt, options=options):
-            # Stream text content for EventBus
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text.strip():
-                        await self.bus.emit(AgentMessage(
-                            agent=agent,
-                            role="assistant",
-                            content_preview=block.text[:500],
-                        ))
+        try:
+            async for message in sdk_query(prompt=prompt, options=options):
+                # Stream text content for EventBus
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text.strip():
+                            await self.bus.emit(AgentMessage(
+                                agent=agent,
+                                role="assistant",
+                                content_preview=block.text[:500],
+                            ))
 
-            # Capture final result
-            if isinstance(message, ResultMessage):
-                final_text = getattr(message, "result", "") or ""
-                # Emit token usage
-                usage = getattr(message, "usage", None)
-                if usage:
-                    await self.bus.emit(AgentTokens(
-                        agent=agent,
-                        input_tokens=usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0),
-                        output_tokens=usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0),
-                    ))
+                # Capture final result
+                if isinstance(message, ResultMessage):
+                    final_text = getattr(message, "result", "") or ""
+                    # Emit token usage
+                    usage = getattr(message, "usage", None)
+                    if usage:
+                        await self.bus.emit(AgentTokens(
+                            agent=agent,
+                            input_tokens=usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0),
+                            output_tokens=usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0),
+                        ))
+        except Exception as exc:
+            # Enrich the error with agent context for better dashboard diagnostics
+            raise RuntimeError(f"agent={agent} model={model_id}: {exc}") from exc
 
         return final_text
 
