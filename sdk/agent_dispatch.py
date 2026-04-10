@@ -438,10 +438,39 @@ class AgentDispatcher:
     # Test engineer dispatch
     # ------------------------------------------------------------------
 
+    async def _get_changed_files(self) -> str:
+        """Get list of files changed since last commit (staged + unstaged + untracked)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "diff", "--name-only", "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            diff_files = stdout.decode().strip()
+            # Also get untracked files
+            proc2 = await asyncio.create_subprocess_exec(
+                "git", "ls-files", "--others", "--exclude-standard",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+            )
+            stdout2, _ = await asyncio.wait_for(proc2.communicate(), timeout=10)
+            untracked = stdout2.decode().strip()
+            all_files = "\n".join(filter(None, [diff_files, untracked]))
+            return all_files or "(no changed files detected)"
+        except Exception:
+            return "(unable to detect changed files)"
+
     async def run_test_engineer(self, stage: Stage) -> dict:
         """Dispatch test-engineer agent and parse structured output."""
+        changed_files = await self._get_changed_files()
         prompt = (
             f"Write and run tests for this stage: {stage.name}\n\n"
+            f"Files changed by the implementer:\n```\n{changed_files}\n```\n\n"
+            f"Focus your tests on these files. Do not explore the codebase to find what changed — "
+            f"the list above is complete.\n\n"
             f"After running the tests, output a summary line in this exact format:\n"
             f"TEST_SUMMARY: passed=N failed=N\n\n"
             f"This summary must reflect the actual test run results."

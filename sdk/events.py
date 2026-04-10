@@ -73,6 +73,7 @@ CHECKPOINTS: dict[str, Checkpoint] = {
 class Stage:
     name: str
     has_user_facing_changes: bool
+    depends_on: list[str] = field(default_factory=list)  # stage names this stage depends on
 
 
 @dataclass

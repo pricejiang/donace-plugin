@@ -53,6 +53,38 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Shared context — accumulated across phases, passed to each agent
+# ---------------------------------------------------------------------------
+
+class SharedContext:
+    """Pipeline-wide context that accumulates as each phase runs.
+
+    Avoids redundant codebase exploration — each agent gets a summary
+    of what previous agents already discovered and produced.
+    Persisted to .ai/runs/{run_id}/context.md for debugging.
+    """
+
+    def __init__(self, run_id: str, cwd: str, task: str) -> None:
+        self.run_id = run_id
+        self.cwd = cwd
+        self.sections: list[str] = [f"# Run Context: {run_id}", f"\n## Task\n{task}"]
+
+    def add(self, heading: str, content: str) -> None:
+        self.sections.append(f"\n## {heading}\n{content}")
+
+    def to_prompt_prefix(self) -> str:
+        """Return the full context as a prompt prefix block."""
+        body = "\n".join(self.sections)
+        return f"<run-context>\n{body}\n</run-context>\n\n"
+
+    def save(self) -> None:
+        """Persist to .ai/runs/{run_id}/context.md for debugging."""
+        path = Path(self.cwd) / ".ai" / "runs" / f"{self.run_id}.context.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(self.sections))
+
+
+# ---------------------------------------------------------------------------
 # Phase 0: Boot
 # ---------------------------------------------------------------------------
 
@@ -96,28 +128,28 @@ async def load_session_context(cwd: str) -> SessionContext:
 
 
 def detect_stack(cwd: str) -> str | None:
-    """Detect the project's tech stack by checking characteristic files at the root.
+    """Detect the project's tech stack by checking characteristic files.
 
-    Only checks top-level marker files to avoid slow recursive scans
-    (node_modules, .git, etc. would make rglob very expensive).
+    Checks root and one level of subdirectories to handle monorepos
+    (e.g., forkbar-app/package.json). Does not recurse deeper to avoid
+    scanning node_modules, .git, etc.
     """
     root = Path(cwd)
 
-    has_ts = (
-        (root / "package.json").exists()
-        or (root / "tsconfig.json").exists()
-        or (root / "tsconfig.base.json").exists()
-    )
-    has_ios = (
-        (root / "Podfile").exists()
-        or any(root.glob("*.xcodeproj"))
-        or any(root.glob("*.xcworkspace"))
-    )
-    has_python = (
-        (root / "pyproject.toml").exists()
-        or (root / "requirements.txt").exists()
-        or (root / "setup.py").exists()
-    )
+    # Check root + immediate subdirectories
+    dirs_to_check = [root] + [d for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")]
+
+    has_ts = False
+    has_ios = False
+    has_python = False
+
+    for d in dirs_to_check:
+        if (d / "package.json").exists() or (d / "tsconfig.json").exists() or (d / "tsconfig.base.json").exists():
+            has_ts = True
+        if (d / "Podfile").exists() or any(d.glob("*.xcodeproj")) or any(d.glob("*.xcworkspace")):
+            has_ios = True
+        if (d / "pyproject.toml").exists() or (d / "requirements.txt").exists() or (d / "setup.py").exists():
+            has_python = True
 
     if has_ts and has_ios:
         return "both"
@@ -163,24 +195,46 @@ def check_for_resume(cwd: str) -> Plan | None:
 
 
 def _parse_plan_stages(content: str) -> list[Stage]:
-    """Parse Stage entries from a plan markdown file."""
+    """Parse Stage entries from a plan markdown file.
+
+    Handles dependency references in two forms:
+    - "Stage 1, Stage 2" (by number)
+    - "Auth Guard, API Routes" (by name)
+
+    Both are resolved to actual stage names for the wave scheduler.
+    """
     stages: list[Stage] = []
 
     # Match headers like "## Stage N: Name" or "### Stage N: Name"
-    stage_pattern = re.compile(r"#{2,3}\s+Stage\s+\d+:\s+(.+)")
+    stage_header_pattern = re.compile(r"#{2,3}\s+Stage\s+(\d+):\s+(.+)")
     user_facing_pattern = re.compile(r"\*\*Has user-facing changes\*\*:\s*(Yes|No|yes|no|true|false)", re.IGNORECASE)
+    deps_pattern = re.compile(r"\*\*Dependenc(?:y|ies)\*\*:\s*(.+)", re.IGNORECASE)
 
-    current_name = None
+    # First pass: collect stage number → name mapping
+    number_to_name: dict[str, str] = {}
+    for line in content.split("\n"):
+        m = stage_header_pattern.match(line.strip())
+        if m:
+            number_to_name[m.group(1)] = m.group(2).strip()
+
+    # Second pass: parse stages with dependencies
+    current_name: str | None = None
     current_user_facing = False
+    current_deps_raw: list[str] = []
 
     for line in content.split("\n"):
-        stage_match = stage_pattern.match(line.strip())
+        stage_match = stage_header_pattern.match(line.strip())
         if stage_match:
             # Save previous stage
             if current_name:
-                stages.append(Stage(name=current_name, has_user_facing_changes=current_user_facing))
-            current_name = stage_match.group(1).strip()
+                stages.append(Stage(
+                    name=current_name,
+                    has_user_facing_changes=current_user_facing,
+                    depends_on=_resolve_deps(current_deps_raw, number_to_name),
+                ))
+            current_name = stage_match.group(2).strip()
             current_user_facing = False
+            current_deps_raw = []
             continue
 
         uf_match = user_facing_pattern.search(line)
@@ -188,11 +242,42 @@ def _parse_plan_stages(content: str) -> list[Stage]:
             val = uf_match.group(1).lower()
             current_user_facing = val in ("yes", "true")
 
+        deps_match = deps_pattern.search(line)
+        if deps_match and current_name:
+            raw = deps_match.group(1).strip()
+            if raw.lower() != "none":
+                current_deps_raw = [
+                    d.strip().removeprefix("Requires").strip()
+                    for d in raw.split(",")
+                    if d.strip().lower() != "none"
+                ]
+
     # Save last stage
     if current_name:
-        stages.append(Stage(name=current_name, has_user_facing_changes=current_user_facing))
+        stages.append(Stage(
+            name=current_name,
+            has_user_facing_changes=current_user_facing,
+            depends_on=_resolve_deps(current_deps_raw, number_to_name),
+        ))
 
     return stages
+
+
+def _resolve_deps(raw_deps: list[str], number_to_name: dict[str, str]) -> list[str]:
+    """Resolve dependency references to actual stage names.
+
+    Handles: "Stage 1" → name of stage 1, "Auth Guard" → "Auth Guard" (already a name).
+    """
+    resolved = []
+    stage_ref_pattern = re.compile(r"Stage\s+(\d+)", re.IGNORECASE)
+    for dep in raw_deps:
+        m = stage_ref_pattern.match(dep)
+        if m and m.group(1) in number_to_name:
+            resolved.append(number_to_name[m.group(1)])
+        else:
+            # Assume it's already a stage name
+            resolved.append(dep)
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +374,7 @@ def make_trivial_plan(task: str) -> Plan:
 # Phase 3: Wrap
 # ---------------------------------------------------------------------------
 
-async def run_final_review(stack: str | None, bus: EventBus, dispatcher: AgentDispatcher) -> str:
+async def run_final_review(stack: str | None, shared_ctx: SharedContext, bus: EventBus, dispatcher: AgentDispatcher) -> str:
     """Dispatch stack-specific reviewer for full-codebase deep review."""
     if stack in ("typescript", "both"):
         reviewer = "typescript-reviewer"
@@ -305,9 +390,14 @@ async def run_final_review(stack: str | None, bus: EventBus, dispatcher: AgentDi
     await bus.emit(AgentStarted(agent=reviewer, model="opus"))
     t0 = time.time()
     try:
+        prompt = (
+            f"{shared_ctx.to_prompt_prefix()}"
+            f"Full codebase review of all changes made during this session. "
+            f"Context about what changed is in <run-context> above."
+        )
         review = await dispatcher.query(
             agent=reviewer,
-            prompt="Full codebase review of all changes made during this session",
+            prompt=prompt,
             model="opus",
         )
     except Exception as exc:
@@ -318,32 +408,23 @@ async def run_final_review(stack: str | None, bus: EventBus, dispatcher: AgentDi
 
 
 async def run_documenter(
-    task: str,
-    sprint_result: SprintResult,
+    shared_ctx: SharedContext,
     final_review: str,
     bus: EventBus,
     dispatcher: AgentDispatcher,
 ) -> str:
-    """Dispatch documenter agent to update all project documentation."""
-    # Build context summary for the documenter
-    stage_summaries = []
-    for sr in sprint_result.stages:
-        stage_summaries.append(f"- {sr.name}: {sr.status}")
-        if sr.unresolved:
-            for issue in sr.unresolved:
-                stage_summaries.append(f"  - unresolved: {issue}")
+    """Dispatch documenter agent to update all project documentation.
 
-    warnings_str = "\n".join(f"- {w}" for w in sprint_result.warnings) if sprint_result.warnings else "None"
+    Uses the shared context so the documenter doesn't need to explore the codebase.
+    """
+    shared_ctx.add("Final Review", final_review[:3000] if final_review else "(no review)")
 
     prompt = (
-        f"Task completed: {task}\n\n"
-        f"## Sprint Results\n"
-        f"{chr(10).join(stage_summaries)}\n\n"
-        f"## Warnings\n{warnings_str}\n\n"
-        f"## Final Review\n{final_review[:3000]}\n\n"
-        f"Update all relevant project documentation based on the above changes. "
-        f"This includes README.md, CLAUDE.md, CHANGELOG.md, .ai/plans/current-plan.md, "
-        f"session log, and knowledge cards as needed."
+        f"{shared_ctx.to_prompt_prefix()}"
+        f"All context about what changed is in <run-context> above. "
+        f"Do NOT explore the codebase to discover what changed — the context is complete.\n\n"
+        f"Update all relevant project documentation: README.md, CLAUDE.md, CHANGELOG.md, "
+        f".ai/plans/current-plan.md, session log, and knowledge cards as needed."
     )
 
     await bus.emit(AgentStarted(agent="documenter", model="sonnet"))
@@ -510,6 +591,9 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
     # Initialize run state for persistence
     run_state = RunState(run_id=run_id, task=task, cwd=cwd, phase="boot")
 
+    # Shared context — accumulated across phases
+    shared_ctx = SharedContext(run_id=run_id, cwd=cwd, task=task)
+
     try:
         await bus.emit(RunStarted(task=task, cwd=cwd, interactive=interactive))
 
@@ -521,6 +605,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         stack = detect_stack(cwd)
         empty_repo = is_empty_repo(cwd)
 
+        shared_ctx.add("Project", f"Stack: {stack or 'unknown'}\nCwd: {cwd}")
         await bus.emit(PhaseCompleted(phase="boot", duration_s=round(time.time() - t0, 1)))
 
         # ── Early exit: empty repo ──
@@ -558,12 +643,12 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             # Resuming — rebuild plan from state
             completed_names = {s["name"] for s in prev_run.stages_completed}
             remaining_stages = [
-                Stage(name=s["name"], has_user_facing_changes=s.get("has_user_facing_changes", False))
+                Stage(name=s["name"], has_user_facing_changes=s.get("has_user_facing_changes", False), depends_on=s.get("depends_on", []))
                 for s in prev_run.stages_remaining
                 if s["name"] not in completed_names
             ]
             all_stages = [
-                Stage(name=s["name"], has_user_facing_changes=s.get("has_user_facing_changes", False))
+                Stage(name=s["name"], has_user_facing_changes=s.get("has_user_facing_changes", False), depends_on=s.get("depends_on", []))
                 for s in prev_run.stages_remaining
             ]
             plan = Plan(stages=all_stages, raw=prev_run.plan_raw)
@@ -606,11 +691,19 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             else:
                 plan = resume_plan
 
+        # Add plan to shared context
+        stage_list = "\n".join(
+            f"- Stage {i+1}: {s.name} (user-facing: {s.has_user_facing_changes}, depends: {s.depends_on or 'none'})"
+            for i, s in enumerate(plan.stages)
+        )
+        shared_ctx.add("Plan", f"Stages:\n{stage_list}\n\nFull plan:\n{plan.raw[:3000]}")
+        shared_ctx.save()
+
         # Save plan to run state (for resume)
         run_state.phase = "sprint"
         run_state.plan_raw = plan.raw
         run_state.stages_remaining = [
-            {"name": s.name, "has_user_facing_changes": s.has_user_facing_changes}
+            {"name": s.name, "has_user_facing_changes": s.has_user_facing_changes, "depends_on": s.depends_on}
             for s in plan.stages
         ]
         if prev_run:
@@ -622,8 +715,8 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         await bus.emit(PhaseStarted(phase="sprint"))
         t0 = time.time()
 
-        # Build task context for sprint loop agents
-        task_context = f"Task: {task}\n\nPlan:\n{plan.raw[:3000]}"
+        # Build task context from shared context
+        task_context = shared_ctx.to_prompt_prefix()
 
         # Build list of already-completed stage names (for resume skip)
         completed_stage_names: set[str] = set()
@@ -640,7 +733,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             run_runtime_evaluator=dispatcher.run_runtime_evaluator,
             task_context=task_context,
             completed_stage_names=completed_stage_names,
-            on_stage_complete=lambda sr: _on_stage_complete(run_state, sr),
+            on_stage_complete=lambda sr: _on_stage_complete(run_state, shared_ctx, sr),
         )
 
         # Merge warnings from previous run
@@ -670,10 +763,10 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         t0 = time.time()
 
         # Final stack-specific review
-        final_review = await run_final_review(stack, bus, dispatcher)
+        final_review = await run_final_review(stack, shared_ctx, bus, dispatcher)
 
         # Documentation updates (README, CLAUDE.md, CHANGELOG, session log, knowledge cards)
-        await run_documenter(task, sprint_result, final_review, bus, dispatcher)
+        await run_documenter(shared_ctx, final_review, bus, dispatcher)
 
         await bus.emit(PhaseCompleted(phase="wrap", duration_s=round(time.time() - t0, 1)))
 
@@ -697,8 +790,8 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             await emitter.disconnect()
 
 
-def _on_stage_complete(run_state: RunState, stage_result: StageResult) -> None:
-    """Callback: persist stage result to run state after each stage completes."""
+def _on_stage_complete(run_state: RunState, shared_ctx: SharedContext, stage_result: StageResult) -> None:
+    """Callback: persist stage result + update shared context after each stage."""
     run_state.stages_completed.append({
         "name": stage_result.name,
         "status": stage_result.status,
@@ -711,6 +804,18 @@ def _on_stage_complete(run_state: RunState, stage_result: StageResult) -> None:
         "recommendation": stage_result.recommendation,
     })
     run_state.save()
+
+    # Append stage result to shared context — subsequent agents see what happened
+    test_info = stage_result.test_result
+    summary = (
+        f"Status: {stage_result.status}\n"
+        f"Tests: {test_info.get('passed', 0)} passed, {test_info.get('failed', 0)} failed\n"
+        f"Fix attempts: {stage_result.fix_attempts}"
+    )
+    if stage_result.unresolved:
+        summary += f"\nUnresolved: {', '.join(stage_result.unresolved[:3])}"
+    shared_ctx.add(f"Stage Result: {stage_result.name}", summary)
+    shared_ctx.save()
 
 
 # ---------------------------------------------------------------------------

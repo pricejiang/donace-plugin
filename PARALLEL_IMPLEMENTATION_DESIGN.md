@@ -297,36 +297,22 @@ async def run_sprint_loop(stages, cwd, bus, ...):
 |---|---|
 | Significant speedup — independent stages don't wait | Requires architect to correctly identify dependencies |
 | Deterministic — Python controls the graph, not LLM | More complex sprint_loop (wave scheduling) |
-| Dashboard can show parallel execution visually | Verification resources multiply (N stages × 3 verifiers) |
-| MUST_STOP on one stage doesn't block independent stages | Parallel git operations may conflict |
+| Dashboard can show parallel execution visually | Architect must correctly assign disjoint files per stage |
+| MUST_STOP on one stage doesn't block independent stages | Unified verify sees combined diff — harder to attribute failures to a specific stage |
 
 ### Risk: Git Conflicts
 
-Multiple implementers writing to the same repo simultaneously. Mitigations:
-- **Git worktrees**: each parallel implementer works in its own worktree, merge at wave end
-- **File-level locking**: architect ensures parallel stages touch disjoint files (add to plan format)
-- **Optimistic**: let them all commit to the same tree, detect conflicts at verification
+Multiple implementers writing to the same repo simultaneously. Mitigation:
+- **Architect ensures disjoint files**: Stage Sizing rules require different stages to touch different files. No technical enforcement — relies on architect quality.
 
-Git worktrees is the cleanest solution — Agent SDK supports `cwd` per session:
-
-```python
-# Create worktree per parallel stage
-worktree = f"/tmp/donace-stage-{stage.name}"
-subprocess.run(["git", "worktree", "add", worktree, "HEAD"])
-
-# Run implementer in isolated worktree
-options = ClaudeAgentOptions(cwd=worktree, ...)
-
-# After all parallel stages complete, merge worktrees
-for worktree in worktrees:
-    subprocess.run(["git", "merge", ...])
-```
+~~Git worktrees~~ — not needed. The actual implementation uses **parallel implement → unified verify**: all implementers finish before any verification runs, so there's no concurrent read/write on the same codebase state. Worktrees would add complexity (create, merge, conflict resolution, cleanup) for no benefit.
 
 ### Risk: Resource Exhaustion
 
-3 parallel stages × (1 implementer + 1 test-engineer + 1 codex + 1 runtime-evaluator) = 12 concurrent agent sessions. Mitigations:
-- Cap max parallel stages (e.g., 3)
-- Stagger verification (start next stage's implementation while previous stage verifies)
+The actual implementation runs N parallel implementers + 1 unified verify (not N × full pipeline). Resource usage:
+- N implementer sessions (parallel)
+- 1 test-engineer + 1 codex review + 0-1 runtime-evaluator (sequential after all implements)
+- 1 fix loop implementer (if needed)
 - Token budget tracking per run
 
 ### When It Helps
@@ -367,22 +353,13 @@ orchestrator (wave scheduler)
 
 2. **Phase 2: Approach B** — add dependency tracking to Stage, wave scheduler to sprint_loop. Requires architect prompt update and plan parser changes.
 
-3. **Phase 3: Git worktrees** — isolate parallel stages in separate worktrees. Eliminates conflict risk.
+3. ~~**Phase 3: Git worktrees**~~ — not needed. Parallel implement → unified verify means no concurrent writes.
 
-4. **Phase 4: Resource management** — token budget tracking, max parallelism caps, staggered verification.
+4. **Phase 3: Resource management** — token budget tracking, max parallelism caps.
 
-### Decision: What to Build First
+### Status
 
-| Signal | Start with A | Start with B |
-|---|---|---|
-| Stages are large (many files each) | Yes | |
-| Stages are small but numerous | | Yes |
-| Architect already marks dependencies | | Yes |
-| Want minimal code changes | Yes | |
-| Want maximum speedup | | Yes |
-| Risk tolerance is low | Yes (lower blast radius) | |
-
-**Recommendation**: Start with A (file-level). It's additive (just agent config + prompt changes), doesn't touch the sprint loop, and provides immediate value for the common case of large stages. Add B later when the serial stage bottleneck becomes the dominant cost.
+Both A and B are implemented. The wave scheduler uses parallel implement → unified verify, eliminating the need for worktrees and reducing token cost compared to full-pipeline-per-stage parallelism.
 
 ## Open Questions
 
