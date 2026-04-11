@@ -404,6 +404,15 @@ class SubagentCompleted(Event):
 # Populate registry — via _register() calls
 # ---------------------------------------------------------------------------
 
+@dataclass
+class RunValidation(Event):
+    validation: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.type = "run.validation"
+
+
+_register("run.validation", RunValidation)
 _register("run.started", RunStarted)
 _register("run.completed", RunCompleted)
 _register("run.failed", RunFailed)
@@ -443,6 +452,7 @@ class EventBus:
         self._pending: dict[str, asyncio.Future[Decision]] = {}
         self._current_phase: str | None = None
         self._current_stage: str | None = None
+        self._event_log: list[dict[str, Any]] = []
 
     def subscribe(self, handler: Callable[[Event], Awaitable[None]]) -> None:
         """Register an event handler (e.g. WebSocketEmitter.__call__)."""
@@ -466,9 +476,16 @@ class EventBus:
         if event.stage is None:
             event.stage = self._current_stage
 
+        # Log for post-run validation
+        self._event_log.append(event.to_dict())
+
         # Fan out
         for handler in self._subscribers:
             asyncio.create_task(handler(event))
+
+    def get_events(self) -> list[dict[str, Any]]:
+        """Return all events emitted during this run (for run validation)."""
+        return list(self._event_log)
 
     async def wait_for_decision(self, checkpoint: str) -> Decision:
         """
@@ -545,6 +562,7 @@ class OrchestrationResult:
     sprint: SprintResult
     review: str = ""
     run_id: str = ""
+    validation: Any = None  # RunReport from run_validator (optional to avoid circular import)
 
     def to_json_output(self) -> dict:
         """Produce the JSON output dict for stdout (team-lead reads this)."""
@@ -566,10 +584,13 @@ class OrchestrationResult:
                 stage_dict["recommendation"] = sr.recommendation
             stages.append(stage_dict)
 
-        return {
+        output: dict[str, Any] = {
             "run_id": self.run_id,
             "stages": stages,
             "warnings": self.sprint.warnings,
             "summary": self.sprint.summary,
             "review": self.review,
         }
+        if self.validation is not None:
+            output["validation"] = self.validation.to_dict()
+        return output

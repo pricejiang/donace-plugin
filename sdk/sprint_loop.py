@@ -64,12 +64,14 @@ def collect_failures(
             "severity": "error",
         })
 
-    # Codex findings — raw output passed through, not parsed by us
+    # Codex findings — review issues, not build/test failures.
+    # Severity is "warning" so they enter the fix loop but don't trigger
+    # MUST_STOP (which would halt the entire pipeline in non-interactive mode).
     if codex_result.get("has_issues"):
         failures.append({
             "source": "codex-review",
             "description": codex_result.get("output", "codex review found issues"),
-            "severity": "error",
+            "severity": "warning",
         })
 
     # Runtime failures
@@ -142,6 +144,16 @@ async def run_sprint_loop(
         results.append(sr)
         if on_stage_complete:
             on_stage_complete(sr)
+
+    # Populate dashboard with all stage names upfront (pending status)
+    for idx, stage in enumerate(stages):
+        await bus.emit(StageChanged(
+            stage_name=stage.name,
+            stage_index=idx,
+            total_stages=len(stages),
+        ))
+        if stage.name in (_completed or set()):
+            await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
 
     # --- Wave-based scheduler ---
     # Build dependency graph: stages run in parallel when their dependencies are met.

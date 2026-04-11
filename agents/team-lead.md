@@ -46,12 +46,12 @@ Determine what kind of request this is:
 
 3. Start the dashboard (if not already running):
    ```
-   Bash: python ${CLAUDE_PLUGIN_ROOT}/sdk/dashboard.py --port 8741 &
+   Bash: cd ${CLAUDE_PLUGIN_ROOT} && python3 -m sdk.dashboard --port 8741 &
    ```
 
 4. Run the orchestrator **in the background**:
    ```
-   Bash (run_in_background): python ${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py \
+   Bash (run_in_background): cd ${CLAUDE_PLUGIN_ROOT} && python3 -m sdk.orchestrator \
      --task "<qualified task description>" \
      --cwd <project root> \
      --dashboard-url ws://localhost:8741

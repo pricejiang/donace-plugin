@@ -30,6 +30,7 @@ from sdk.events import (
     RunCompleted,
     RunFailed,
     RunStarted,
+    RunValidation,
     SprintResult,
     Stage,
     StageResult,
@@ -330,10 +331,20 @@ async def run_architect(spec: str, bus: EventBus, dispatcher: AgentDispatcher) -
         )
     await bus.emit(AgentCompleted(agent="architect", duration_s=round(time.time() - t0, 1)))
 
-    # Parse plan into stages
+    # Architect writes plan to .ai/plans/current-plan.md.
+    # The agent's return value is often a summary, not the full plan.
+    # Read the actual file if it exists.
+    plan_file = Path(dispatcher.cwd) / ".ai" / "plans" / "current-plan.md"
+    if plan_file.exists():
+        plan_content = plan_file.read_text("utf-8")
+        # Use file content if it has stage headers; otherwise fall back to agent output
+        file_stages = _parse_plan_stages(plan_content)
+        if file_stages:
+            return Plan(stages=file_stages, raw=plan_content)
+
+    # Fallback: try parsing the agent's direct response
     stages = _parse_plan_stages(plan_raw)
     if not stages:
-        # If parsing fails, create a single-stage plan
         stages = [Stage(name="Implementation", has_user_facing_changes=False)]
 
     return Plan(stages=stages, raw=plan_raw)
@@ -768,9 +779,20 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         # Documentation updates (README, CLAUDE.md, CHANGELOG, session log, knowledge cards)
         await run_documenter(shared_ctx, final_review, bus, dispatcher)
 
+        # Run validation (pure Python, zero LLM cost)
+        from sdk.run_validator import validate_run
+        validation_report = validate_run(
+            events=bus.get_events(),
+            sprint_result=sprint_result,
+            stack=stack,
+        )
+
+        # Emit validation report as event for dashboard
+        await bus.emit(RunValidation(validation=validation_report.to_dict()))
+
         await bus.emit(PhaseCompleted(phase="wrap", duration_s=round(time.time() - t0, 1)))
 
-        result = OrchestrationResult(sprint=sprint_result, review=final_review, run_id=run_id)
+        result = OrchestrationResult(sprint=sprint_result, review=final_review, run_id=run_id, validation=validation_report)
         await bus.emit(RunCompleted(result_summary=result.to_json_output().get("summary")))
 
         # Clean up state file — run is complete, result file will be written by main()
