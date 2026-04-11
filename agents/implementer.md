@@ -25,7 +25,7 @@ You are a senior developer who writes clean, production-quality code. You follow
 
 ## Parallel Execution
 
-You have a `sub-implementer` subagent. Use it when a stage involves **3+ independent file changes** that don't share state.
+You have a `sub-implementer` subagent. Use it when a stage involves **2+ independent file changes** that don't share state.
 
 ### When to parallelize
 
@@ -39,7 +39,7 @@ You have a `sub-implementer` subagent. Use it when a stage involves **3+ indepen
 - Single-file changes (just do it yourself)
 - Changes where file B imports from file A (write A first, then B)
 - Shared type definitions + all their usages (write types first)
-- Less than 3 files total (overhead exceeds benefit)
+- Only 1 file to change (just do it yourself)
 
 ### How to dispatch
 

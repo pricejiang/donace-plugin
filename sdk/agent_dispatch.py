@@ -335,18 +335,24 @@ class AgentDispatcher:
         except Exception:
             pass  # best-effort backfill, don't crash on parse errors
 
-    # Per-agent timeout (seconds). Agents doing real work (implementer,
-    # architect) need more time than lightweight ones (classify, codex runner).
+    # Per-agent timeout (seconds) and max turns.
     AGENT_TIMEOUT: dict[str, int] = {
         "planner": 300,
         "architect": 300,
         "implementer": 900,
         "test-engineer": 600,
         "runtime-evaluator": 300,
+        "runtime-verifier": 300,
         "typescript-reviewer": 300,
         "ios-reviewer": 300,
     }
     DEFAULT_TIMEOUT = 300  # 5 minutes
+
+    AGENT_MAX_TURNS: dict[str, int] = {
+        "implementer": 100,
+        "test-engineer": 100,
+    }
+    DEFAULT_MAX_TURNS = 50
 
     async def query(self, agent: str, prompt: str, model: str = "sonnet", **_: Any) -> str:
         """Run an agent query using Claude Agent SDK.
@@ -368,13 +374,14 @@ class AgentDispatcher:
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
         timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
+        max_turns = self.AGENT_MAX_TURNS.get(agent, self.DEFAULT_MAX_TURNS)
 
         options = ClaudeAgentOptions(
             system_prompt=config.system_prompt,
             cwd=self.cwd,
             allowed_tools=config.tools + ["TodoWrite"],
             permission_mode="bypassPermissions",
-            max_turns=50,
+            max_turns=max_turns,
             model=model_id,
             hooks=self._make_hooks(agent),
         )
@@ -680,7 +687,7 @@ class AgentDispatcher:
     # ------------------------------------------------------------------
 
     async def run_runtime_evaluator(self, contract: str) -> dict:
-        """Dispatch runtime-evaluator agent in verification mode."""
+        """Dispatch runtime-verifier agent for black-box verification."""
         prompt = (
             f"Verify the following sprint contract against the running application:\n\n"
             f"{contract}\n\n"
@@ -688,7 +695,7 @@ class AgentDispatcher:
             f"VERIFICATION_SUMMARY: status=PASS|FAIL score=N/M\n\n"
             f"Where N is the number of criteria passed and M is total must-pass criteria."
         )
-        response = await self.query(agent="runtime-evaluator", prompt=prompt, model="opus")
+        response = await self.query(agent="runtime-verifier", prompt=prompt, model="opus")
 
         # Parse structured output
         status = "FAIL"
