@@ -430,6 +430,7 @@ class AgentDispatcher:
                             input_tokens=usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0),
                             output_tokens=usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0),
                         ))
+                    break  # ResultMessage = agent done, stop listening
         except RuntimeError:
             raise
         except Exception as exc:
