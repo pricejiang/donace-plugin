@@ -88,6 +88,23 @@ def _is_blocked_command(command: str) -> str | None:
     return None
 
 
+def _parse_allowed_subagents(tools: list[str]) -> list[str] | None:
+    """Extract allowed subagent types from tools list.
+
+    "Agent(sub-implementer)" → ["sub-implementer"]
+    "Agent(worker, researcher)" → ["worker", "researcher"]
+    "Agent" (no parens) → None (allow all)
+    No "Agent" at all → [] (allow none)
+    """
+    for tool in tools:
+        if tool.startswith("Agent(") and tool.endswith(")"):
+            inner = tool[6:-1]
+            return [t.strip() for t in inner.split(",") if t.strip()]
+        if tool == "Agent":
+            return None  # unrestricted
+    return []  # Agent not in tools list
+
+
 def _is_path_outside_cwd(file_path: str, cwd: str) -> bool:
     """Check that file_path is within cwd."""
     try:
@@ -210,6 +227,17 @@ class AgentDispatcher:
                 file_path = tool_input.get("file_path", "")
                 if file_path and _is_path_outside_cwd(file_path, cwd):
                     return {"decision": "block", "reason": f"path {file_path} is outside project directory {cwd}"}
+
+            # --- Security: restrict subagent types ---
+            # Agent(sub-implementer) in frontmatter only enforces in --agent mode.
+            # We enforce it here for SDK-dispatched agents.
+            if tool_name == "Agent":
+                config = self._get_config(agent_name)
+                allowed_subagents = _parse_allowed_subagents(config.tools)
+                if allowed_subagents is not None:
+                    subagent_type = tool_input.get("subagent_type") or tool_input.get("type") or ""
+                    if subagent_type and subagent_type not in allowed_subagents:
+                        return {"decision": "block", "reason": f"agent '{agent_name}' can only spawn {allowed_subagents}, not '{subagent_type}'"}
 
             # --- EventBus: emit tool use event (full content for Raw Log) ---
             target = tool_input.get("file_path") or tool_input.get("command", "")
