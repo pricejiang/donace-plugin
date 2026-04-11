@@ -311,7 +311,7 @@ class AgentDispatcher:
     AGENT_TIMEOUT: dict[str, int] = {
         "planner": 300,
         "architect": 300,
-        "implementer": 600,
+        "implementer": 900,
         "test-engineer": 600,
         "runtime-evaluator": 300,
         "typescript-reviewer": 300,

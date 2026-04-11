@@ -475,7 +475,12 @@ async def _implement_stage(
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
-        impl_prompt = f"Implement: {stage.name}\n\nContract:\n{contract}"
+        impl_prompt = (
+            f"Implement ONLY this stage: {stage.name}\n\n"
+            f"Contract:\n{contract}\n\n"
+            f"SCOPE: Only modify files listed in this stage's plan. "
+            f"Do not explore or read files from other stages. "
+        )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
         await query(agent="implementer", prompt=impl_prompt, model="sonnet")
@@ -588,7 +593,12 @@ async def _run_single_stage(
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
-        impl_prompt = f"Implement: {stage.name}\n\nContract:\n{contract}"
+        impl_prompt = (
+            f"Implement ONLY this stage: {stage.name}\n\n"
+            f"Contract:\n{contract}\n\n"
+            f"SCOPE: Only modify files listed in this stage's plan. "
+            f"Do not explore or read files from other stages. "
+        )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
         await query(agent="implementer", prompt=impl_prompt, model="sonnet")
