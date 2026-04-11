@@ -689,6 +689,12 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     for (const ev of events) {
       if (ev.type === 'agent.message' || ev.type === 'agent.tool_use' || ev.type === 'agent.tool_result') addRawLogEntry(ev);
     }
+
+    // Determine if this run is still live (no run.completed or run.failed event)
+    const hasEnded = events.some(e => e.type === 'run.completed' || e.type === 'run.failed');
+    state.runLive = !hasEnded;
+    updateConnStatus();
+
     renderHistory();
   };
 

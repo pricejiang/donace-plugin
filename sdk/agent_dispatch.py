@@ -338,7 +338,7 @@ class AgentDispatcher:
     # Per-agent timeout (seconds) and max turns.
     AGENT_TIMEOUT: dict[str, int] = {
         "planner": 300,
-        "architect": 300,
+        "architect": 600,
         "implementer": 900,
         "test-engineer": 600,
         "runtime-evaluator": 300,
