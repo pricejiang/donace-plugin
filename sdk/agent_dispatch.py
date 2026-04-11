@@ -430,7 +430,7 @@ class AgentDispatcher:
         "implementer": 900,
         "test-engineer": 600,
         "runtime-evaluator": 300,
-        "runtime-verifier": 300,
+        "runtime-verifier": 900,
         "typescript-reviewer": 300,
         "ios-reviewer": 300,
     }
