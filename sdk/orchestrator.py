@@ -210,6 +210,7 @@ def _parse_plan_stages(content: str) -> list[Stage]:
     stage_header_pattern = re.compile(r"#{2,3}\s+Stage\s+(\d+):\s+(.+)")
     user_facing_pattern = re.compile(r"\*\*Has user-facing changes\*\*:\s*(Yes|No|yes|no|true|false)", re.IGNORECASE)
     deps_pattern = re.compile(r"\*\*Dependenc(?:y|ies)\*\*:\s*(.+)", re.IGNORECASE)
+    turns_pattern = re.compile(r"\*\*Estimated turns\*\*:\s*(\d+)", re.IGNORECASE)
 
     # First pass: collect stage number → name mapping
     number_to_name: dict[str, str] = {}
@@ -222,6 +223,7 @@ def _parse_plan_stages(content: str) -> list[Stage]:
     current_name: str | None = None
     current_user_facing = False
     current_deps_raw: list[str] = []
+    current_estimated_turns = 0
 
     for line in content.split("\n"):
         stage_match = stage_header_pattern.match(line.strip())
@@ -232,10 +234,12 @@ def _parse_plan_stages(content: str) -> list[Stage]:
                     name=current_name,
                     has_user_facing_changes=current_user_facing,
                     depends_on=_resolve_deps(current_deps_raw, number_to_name),
+                    estimated_turns=current_estimated_turns,
                 ))
             current_name = stage_match.group(2).strip()
             current_user_facing = False
             current_deps_raw = []
+            current_estimated_turns = 0
             continue
 
         uf_match = user_facing_pattern.search(line)
@@ -253,12 +257,17 @@ def _parse_plan_stages(content: str) -> list[Stage]:
                     if d.strip().lower() != "none"
                 ]
 
+        turns_match = turns_pattern.search(line)
+        if turns_match and current_name:
+            current_estimated_turns = int(turns_match.group(1))
+
     # Save last stage
     if current_name:
         stages.append(Stage(
             name=current_name,
             has_user_facing_changes=current_user_facing,
             depends_on=_resolve_deps(current_deps_raw, number_to_name),
+            estimated_turns=current_estimated_turns,
         ))
 
     return stages

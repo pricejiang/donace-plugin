@@ -348,12 +348,19 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         while (state.stages.length < ev.total_stages) state.stages.push({ name: '', status: 'pending' });
         if (ev.stage_index < state.stages.length) {
           const existing = state.stages[ev.stage_index];
-          // If stage already has a name and is pending, keep it pending (initial plan emit).
-          // Only set 'active' when the stage actually starts executing (second emit).
           if (!existing.name) {
-            state.stages[ev.stage_index] = { name: ev.stage_name, status: 'pending' };
+            state.stages[ev.stage_index] = { name: ev.stage_name, status: 'pending', estimatedTurns: ev.estimated_turns || 0, actualTurns: 0 };
           } else {
-            state.stages[ev.stage_index] = { name: ev.stage_name, status: 'active' };
+            state.stages[ev.stage_index] = { ...existing, name: ev.stage_name, status: 'active' };
+          }
+        }
+        break;
+      case 'agent.tool_use':
+        // Count implementer turns for the current stage
+        if (ev.agent === 'implementer' && state.currentStage) {
+          const si = state.stages.findIndex(s => s.name === state.currentStage);
+          if (si >= 0 && state.stages[si].actualTurns !== undefined) {
+            state.stages[si].actualTurns++;
           }
         }
         break;
@@ -419,7 +426,16 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       for (const s of state.stages) {
         const sIcon = s.status === 'done' ? '&#10003;' : s.status === 'active' ? '&#9679;' : s.status === 'failed' ? '&#10007;' : s.status === 'skipped' ? '&#8722;' : '&#9675;';
         const activeCls = s.status === 'active' ? 'active' : '';
-        shtml += `<div class="stage-item ${activeCls}"><span class="icon ${s.status}">${sIcon}</span> ${s.name || 'Stage'}</div>`;
+        let turnInfo = '';
+        if (s.estimatedTurns > 0 && s.actualTurns > 0) {
+          const overEstimate = s.actualTurns > s.estimatedTurns;
+          const color = overEstimate ? 'var(--yellow)' : 'var(--text-dim)';
+          const warn = overEstimate ? ' ⚠' : '';
+          turnInfo = ` <span style="font-size:10px;color:${color}">${s.actualTurns}/${s.estimatedTurns}t${warn}</span>`;
+        } else if (s.actualTurns > 0) {
+          turnInfo = ` <span style="font-size:10px;color:var(--text-dim)">${s.actualTurns}t</span>`;
+        }
+        shtml += `<div class="stage-item ${activeCls}"><span class="icon ${s.status}">${sIcon}</span> ${s.name || 'Stage'}${turnInfo}</div>`;
       }
       $stageRow.innerHTML = shtml;
       $stageRow.style.display = '';

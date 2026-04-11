@@ -348,11 +348,9 @@ class AgentDispatcher:
     }
     DEFAULT_TIMEOUT = 300  # 5 minutes
 
-    AGENT_MAX_TURNS: dict[str, int] = {
-        "implementer": 100,
-        "test-engineer": 100,
-    }
-    DEFAULT_MAX_TURNS = 50
+    # No max_turns limit — timeout is the safety valve.
+    # Subscription plan doesn't charge per token, so turns are not a cost concern.
+    # Timeout (AGENT_TIMEOUT) prevents runaway agents.
 
     async def query(self, agent: str, prompt: str, model: str = "sonnet", **_: Any) -> str:
         """Run an agent query using Claude Agent SDK.
@@ -374,14 +372,12 @@ class AgentDispatcher:
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
         timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
-        max_turns = self.AGENT_MAX_TURNS.get(agent, self.DEFAULT_MAX_TURNS)
 
         options = ClaudeAgentOptions(
             system_prompt=config.system_prompt,
             cwd=self.cwd,
             allowed_tools=config.tools + ["TodoWrite"],
             permission_mode="bypassPermissions",
-            max_turns=max_turns,
             model=model_id,
             hooks=self._make_hooks(agent),
         )

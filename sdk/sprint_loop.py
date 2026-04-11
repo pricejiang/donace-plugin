@@ -151,6 +151,7 @@ async def run_sprint_loop(
             stage_name=stage.name,
             stage_index=idx,
             total_stages=len(stages),
+            estimated_turns=stage.estimated_turns,
         ))
         if stage.name in (_completed or set()):
             await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
@@ -487,6 +488,7 @@ async def _implement_stage(
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
         warnings.append(f"Implementation failed for {stage.name}: {exc}")
+        raise  # propagate to wave handler — don't verify half-finished work
     else:
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 
@@ -605,6 +607,16 @@ async def _run_single_stage(
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
         warnings.append(f"Implementation failed for {stage.name}: {exc}")
+        # Don't verify half-finished work — skip straight to BLOCKED
+        await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
+        return StageResult(
+            name=stage.name, status="BLOCKED", contract=contract,
+            test_result={"passed": 0, "failed": 0},
+            codex_result={"status": "skipped", "has_issues": False, "output": ""},
+            runtime_result=None, fix_attempts=0,
+            unresolved=[f"implementer failed: {exc}"],
+            recommendation="MUST_STOP",
+        )
     else:
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 

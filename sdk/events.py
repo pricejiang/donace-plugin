@@ -74,6 +74,7 @@ class Stage:
     name: str
     has_user_facing_changes: bool
     depends_on: list[str] = field(default_factory=list)  # stage names this stage depends on
+    estimated_turns: int = 0  # architect's estimate, 0 = not specified
 
 
 @dataclass
@@ -256,6 +257,7 @@ class StageChanged(Event):
     stage_name: str = ""
     stage_index: int = 0
     total_stages: int = 0
+    estimated_turns: int = 0
 
     def __post_init__(self) -> None:
         self.type = "stage.changed"

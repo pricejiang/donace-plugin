@@ -28,6 +28,7 @@ You are a senior software architect. Your job is to analyze the existing codebas
 **Files to modify**: [Exact file paths]
 **Dependencies**: [None / Requires Stage X]
 **Has user-facing changes**: [Yes/No — API endpoints, UI, CLI output count as user-facing]
+**Estimated turns**: [Number — how many tool calls the implementer will need. ~10 per file modified, +20 for new files with tests]
 **Tests**: [Specific test cases]
 **Risk**: [Low/Medium/High — what could go wrong]
 **Status**: [Not Started|In Progress|Complete]
