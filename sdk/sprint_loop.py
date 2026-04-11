@@ -352,11 +352,10 @@ async def run_sprint_loop(
                 else:
                     await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 
-                # Re-verify
-                test_result, codex_result, runtime_result = await _run_unified_verify(
-                    wave_stage, combined_contract, bus,
-                    run_test_engineer, run_codex_review, run_runtime_evaluator, warnings,
-                )
+                # Re-verify: only run tests in fix loop
+                await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
+                re_test_result = await _run_with_timing(run_test_engineer, wave_stage, bus, "test-engineer")
+                test_result = re_test_result
                 failures = collect_failures(test_result, codex_result, runtime_result)
 
             if not failures and fix_attempts > 0:
@@ -720,24 +719,13 @@ async def _run_single_stage(
         else:
             await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 
-        # Re-verify
+        # Re-verify: only run tests. Codex review and runtime verification
+        # don't need to rerun on every fix attempt — they check code quality
+        # and runtime behavior, which rarely changes between fix iterations.
         await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
-        await bus.emit(AgentStarted(agent="codex-review"))
-        re_verify_tasks: list[asyncio.Task] = [
-            asyncio.create_task(_run_with_timing(run_test_engineer, stage, bus, "test-engineer")),
-            asyncio.create_task(_run_with_timing_no_arg(run_codex_review, bus, "codex-review")),
-        ]
-        if stage.has_user_facing_changes and runtime_result is not None:
-            await bus.emit(AgentStarted(agent="runtime-evaluator", role="verification"))
-            re_verify_tasks.append(asyncio.create_task(
-                _run_with_timing_str_arg(run_runtime_evaluator, contract, bus, "runtime-evaluator")
-            ))
-        re_results = await asyncio.gather(*re_verify_tasks, return_exceptions=True)
-
-        test_result = _extract_result(re_results, 0, {"passed": 0, "failed": 0})
-        codex_result = _extract_result(re_results, 1, {"status": "skipped", "has_issues": False, "output": ""})
-        if stage.has_user_facing_changes and len(re_results) > 2:
-            runtime_result = _extract_result(re_results, 2, {"status": "error", "score": "0/5"})
+        re_test_result = await _run_with_timing(run_test_engineer, stage, bus, "test-engineer")
+        test_result = re_test_result
+        # Keep codex_result and runtime_result from the initial verify
         failures = collect_failures(test_result, codex_result, runtime_result)
 
     # Emit fix loop resolution
