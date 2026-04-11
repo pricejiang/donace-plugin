@@ -1,4 +1,4 @@
-# Donace
+# Donace Plugin
 
 Generator-Evaluator agent harness for Claude Code. Sprint-based development workflow with cross-model review (Claude + Codex) and knowledge persistence.
 
