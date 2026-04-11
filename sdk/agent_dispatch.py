@@ -31,6 +31,7 @@ try:
     from claude_agent_sdk import (
         query as sdk_query,
         ClaudeAgentOptions,
+        ClaudeSDKClient,
         HookMatcher,
     )
     from claude_agent_sdk.types import (
@@ -322,6 +323,9 @@ class AgentDispatcher:
     async def query(self, agent: str, prompt: str, model: str = "sonnet", **_: Any) -> str:
         """Run an agent query using Claude Agent SDK.
 
+        Uses ClaudeSDKClient (not sdk_query) so we can call disconnect()
+        on timeout to kill the underlying CLI process and its subagents.
+
         Args:
             agent: Agent name (matches agents/{name}.md)
             prompt: User prompt to send
@@ -333,19 +337,9 @@ class AgentDispatcher:
         Raises:
             RuntimeError: on agent error or timeout.
         """
-        timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
-        try:
-            return await asyncio.wait_for(
-                self._run_agent(agent, prompt, model),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"agent={agent} timed out after {timeout}s")
-
-    async def _run_agent(self, agent: str, prompt: str, model: str) -> str:
-        """Inner coroutine — runs the agent, wrapped by wait_for timeout."""
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
+        timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
 
         options = ClaudeAgentOptions(
             system_prompt=config.system_prompt,
@@ -357,9 +351,33 @@ class AgentDispatcher:
             hooks=self._make_hooks(agent),
         )
 
+        client = ClaudeSDKClient(options=options)
+        try:
+            return await asyncio.wait_for(
+                self._run_client(client, agent, prompt, model_id),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            # disconnect() kills the CLI process and all its subagents
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            raise RuntimeError(f"agent={agent} timed out after {timeout}s")
+        except Exception:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            raise
+
+    async def _run_client(self, client: Any, agent: str, prompt: str, model_id: str) -> str:
+        """Run an agent via ClaudeSDKClient. Called within wait_for timeout."""
+        await client.connect(prompt=prompt)
+
         final_text = ""
         try:
-            async for message in sdk_query(prompt=prompt, options=options):
+            async for message in client.receive_messages():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
@@ -385,6 +403,11 @@ class AgentDispatcher:
             raise
         except Exception as exc:
             raise RuntimeError(f"agent={agent} model={model_id}: {exc}") from exc
+        finally:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
         return final_text
 
