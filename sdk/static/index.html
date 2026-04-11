@@ -618,7 +618,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   function addLogEntry(ev) {
     if ($logEmpty) $logEmpty.style.display = 'none';
     const row = buildLogRow(ev);
-    if (row) $eventLog.prepend(row);
+    if (row) { $eventLog.appendChild(row); $eventLog.scrollTop = $eventLog.scrollHeight; }
     if (ev.type === 'agent.message' || ev.type === 'agent.tool_use' || ev.type === 'agent.tool_result') addRawLogEntry(ev);
   }
 
@@ -682,6 +682,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     }
     $eventLog.innerHTML = '';
     $eventLog.appendChild(fragment);
+    $eventLog.scrollTop = $eventLog.scrollHeight;
     if ($logEmpty) $logEmpty.style.display = 'none';
     // Build raw log
     const $raw = document.getElementById('raw-log');
