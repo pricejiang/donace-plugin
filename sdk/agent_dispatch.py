@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shlex
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,92 @@ MODEL_MAP = {
 
 def _resolve_model(short: str) -> str:
     return MODEL_MAP.get(short, short)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Extract the first JSON object embedded in text."""
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _build_codex_plan_review_prompt(plan_text: str) -> str:
+    """Build a structured review prompt for implementation plans."""
+    return (
+        "Review the implementation plan below before coding starts.\n\n"
+        "Only call out issues strong enough to justify revising the plan before implementation. "
+        "Focus on missing dependencies, incorrect stage ordering, hidden coupling between stages, "
+        "missing verification work, and anything likely to cause rework during the sprint loop.\n\n"
+        "Ignore minor wording edits and style nits.\n\n"
+        "Return ONLY valid JSON in this exact shape:\n"
+        "{\n"
+        '  "verdict": "approve" | "needs-attention",\n'
+        '  "summary": "short summary",\n'
+        '  "findings": [\n'
+        "    {\n"
+        '      "severity": "high" | "medium" | "low",\n'
+        '      "title": "short title",\n'
+        '      "body": "why this matters",\n'
+        '      "recommendation": "concrete fix"\n'
+        "    }\n"
+        "  ],\n"
+        '  "next_steps": ["optional follow-up"]\n'
+        "}\n\n"
+        'Use "needs-attention" only when the plan should be revised before implementation. '
+        'Use "approve" when remaining comments are optional.\n\n'
+        "Implementation plan:\n"
+        "```markdown\n"
+        f"{plan_text}\n"
+        "```"
+    )
+
+
+def _format_plan_review_findings(findings: Any) -> list[str]:
+    """Convert structured Codex findings into concise strings."""
+    if not isinstance(findings, list):
+        return []
+
+    formatted: list[str] = []
+    for item in findings:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                formatted.append(text)
+            continue
+
+        if not isinstance(item, dict):
+            text = str(item).strip()
+            if text:
+                formatted.append(text)
+            continue
+
+        severity = str(item.get("severity", "")).strip().upper()
+        title = str(item.get("title", "")).strip()
+        body = str(item.get("body", "")).strip()
+        recommendation = str(item.get("recommendation", "")).strip()
+
+        parts: list[str] = []
+        heading = " ".join(part for part in (f"[{severity}]" if severity else "", title) if part).strip()
+        if heading:
+            parts.append(heading)
+        if body:
+            parts.append(body)
+        if recommendation:
+            parts.append(f"Recommended fix: {recommendation}")
+
+        text = " ".join(parts).strip()
+        if text:
+            formatted.append(text)
+
+    return formatted
 
 
 # ---------------------------------------------------------------------------
@@ -579,23 +667,13 @@ class AgentDispatcher:
         codex-companion.mjs script. The absolute path is resolved upfront
         so the agent doesn't need to find it.
         """
-        # Locate codex companion script
-        codex_plugin_root = self._find_codex_plugin_root()
-        if not codex_plugin_root:
+        codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
+        if not codex_plugin_root or not companion_script:
             return {
                 "status": "skipped",
                 "has_issues": False,
                 "output": "",
-                "reason": "codex plugin not found",
-            }
-
-        companion_script = Path(codex_plugin_root) / "scripts" / "codex-companion.mjs"
-        if not companion_script.exists():
-            return {
-                "status": "skipped",
-                "has_issues": False,
-                "output": "",
-                "reason": f"codex-companion.mjs not found at {companion_script}",
+                "reason": reason or "codex plugin not found",
             }
 
         # Determine base ref for diff
@@ -613,14 +691,21 @@ class AgentDispatcher:
         except (asyncio.TimeoutError, Exception):
             pass  # fall back to HEAD~1
 
-        cmd = f'node {companion_script} review --wait --base {base}'
+        cmd = f"node {shlex.quote(str(companion_script))} review --wait --base {shlex.quote(base)}"
 
         try:
-            result = await asyncio.wait_for(
-                self._run_codex_agent(cmd, codex_plugin_root),
+            output = await asyncio.wait_for(
+                self._run_codex_command(cmd, codex_plugin_root),
                 timeout=180,  # 3 minutes hard cap — codex should not take longer
             )
-            return result
+            has_issues = bool(output.strip()) and any(
+                marker in output for marker in ("[P0]", "[P1]", "[P2]", "[CRITICAL]", "[WARNING]")
+            )
+            return {
+                "status": "completed",
+                "has_issues": has_issues,
+                "output": output,
+            }
         except asyncio.TimeoutError:
             return {
                 "status": "skipped",
@@ -636,8 +721,115 @@ class AgentDispatcher:
                 "reason": f"codex review failed: {e}",
             }
 
-    async def _run_codex_agent(self, cmd: str, codex_plugin_root: str) -> dict:
-        """Inner coroutine for codex review — wrapped by wait_for timeout."""
+    async def run_codex_plan_review(self, plan_text: str) -> dict:
+        """Run Codex against a staged plan and return structured findings."""
+        codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
+        if not codex_plugin_root or not companion_script:
+            return {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "output": "",
+                "reason": reason or "codex plugin not found",
+            }
+
+        prompt_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".prompt.txt",
+                prefix=".codex-plan-review-",
+                dir=self.cwd,
+                delete=False,
+            ) as handle:
+                handle.write(_build_codex_plan_review_prompt(plan_text))
+                prompt_path = handle.name
+
+            cmd = (
+                f"node {shlex.quote(str(companion_script))} task --json "
+                f"--cwd {shlex.quote(self.cwd)} "
+                f"--prompt-file {shlex.quote(prompt_path)}"
+            )
+            payload_raw = await asyncio.wait_for(
+                self._run_codex_command(cmd, codex_plugin_root),
+                timeout=240,
+            )
+            payload = _extract_json_object(payload_raw)
+            if not payload:
+                return {
+                    "status": "skipped",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "output": payload_raw,
+                    "reason": "codex plan review returned invalid JSON payload",
+                }
+
+            payload_status = payload.get("status", 0)
+            if payload_status not in (0, "0", None):
+                return {
+                    "status": "skipped",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "output": str(payload.get("rawOutput", "") or payload_raw),
+                    "reason": f"codex plan review task exited with status {payload_status}",
+                }
+
+            raw_output = str(payload.get("rawOutput", "") or "")
+            parsed = _extract_json_object(raw_output)
+            if not parsed:
+                return {
+                    "status": "skipped",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "output": raw_output or payload_raw,
+                    "reason": "codex plan review did not return structured JSON",
+                }
+
+            verdict = str(parsed.get("verdict", "")).strip().lower()
+            summary = str(parsed.get("summary", "")).strip()
+            findings = _format_plan_review_findings(parsed.get("findings", []))
+            next_steps = parsed.get("next_steps", [])
+
+            return {
+                "status": "completed",
+                "has_major_issues": verdict == "needs-attention",
+                "summary": summary,
+                "findings": findings,
+                "next_steps": next_steps if isinstance(next_steps, list) else [],
+                "output": raw_output,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "output": "",
+                "reason": "codex plan review timed out after 240 seconds",
+            }
+        except Exception as exc:
+            return {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "output": "",
+                "reason": f"codex plan review failed: {exc}",
+            }
+        finally:
+            if prompt_path:
+                try:
+                    Path(prompt_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    async def _run_codex_command(self, cmd: str, codex_plugin_root: str) -> str:
+        """Execute a codex companion command via Agent SDK and return raw output."""
         prompt = (
             f"Execute this command and return the output verbatim:\n\n"
             f"```\n{cmd}\n```\n\n"
@@ -670,16 +862,19 @@ class AgentDispatcher:
                 if result_text.strip():
                     all_text.append(result_text)
 
-        output = max(all_text, key=len) if all_text else ""
+        return max(all_text, key=len) if all_text else ""
 
-        has_issues = bool(output.strip()) and any(
-            marker in output for marker in ("[P0]", "[P1]", "[P2]", "[CRITICAL]", "[WARNING]")
-        )
-        return {
-            "status": "completed",
-            "has_issues": has_issues,
-            "output": output,
-        }
+    def _resolve_codex_companion(self) -> tuple[str | None, Path | None, str | None]:
+        """Resolve the codex plugin root and companion script path."""
+        codex_plugin_root = self._find_codex_plugin_root()
+        if not codex_plugin_root:
+            return None, None, "codex plugin not found"
+
+        companion_script = Path(codex_plugin_root) / "scripts" / "codex-companion.mjs"
+        if not companion_script.exists():
+            return codex_plugin_root, None, f"codex-companion.mjs not found at {companion_script}"
+
+        return codex_plugin_root, companion_script, None
 
     def _find_codex_plugin_root(self) -> str | None:
         """Locate the codex plugin root directory."""

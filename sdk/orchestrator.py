@@ -359,22 +359,12 @@ async def run_architect(spec: str, bus: EventBus, dispatcher: AgentDispatcher) -
     return Plan(stages=stages, raw=plan_raw)
 
 
-async def run_codex_plan_review(plan: Plan, bus: EventBus) -> dict:
-    """Dispatch codex plan review (mandatory when plan exists).
-
-    Uses codex CLI if available. This is not an LLM agent — it's a subprocess call.
-    Delegates to AgentDispatcher.run_codex_review() for the actual execution.
-    """
+async def run_codex_plan_review(plan: Plan, bus: EventBus, dispatcher: AgentDispatcher) -> dict:
+    """Dispatch Codex plan review (mandatory when plan exists)."""
     await bus.emit(AgentStarted(agent="codex-plan-review"))
     t0 = time.time()
     try:
-        # Write plan to temp file for codex to review
-        import shutil
-        codex = shutil.which("codex")
-        if not codex:
-            result = {"has_major_issues": False, "findings": [], "status": "skipped", "reason": "codex CLI not found"}
-        else:
-            result = {"has_major_issues": False, "findings": []}
+        result = await dispatcher.run_codex_plan_review(plan.raw)
     except Exception as exc:
         await bus.emit(AgentFailed(agent="codex-plan-review", error=str(exc)))
         return {"has_major_issues": False, "findings": [], "error": str(exc)}
@@ -693,7 +683,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
                     plan = await run_architect(spec, bus, dispatcher)
 
                     # Codex plan review (mandatory when plan exists)
-                    review = await run_codex_plan_review(plan, bus)
+                    review = await run_codex_plan_review(plan, bus, dispatcher)
 
                     # Revision loop if major issues
                     if review.get("has_major_issues"):
