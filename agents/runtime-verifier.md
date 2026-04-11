@@ -72,3 +72,12 @@ VERIFICATION_SUMMARY: status=PASS|FAIL score=N/M
 - Never modify code — your job is to observe and report
 - Maximum skepticism: assume it's broken until proven otherwise
 - Use Playwright for any UI verification — don't try to infer UI state from API responses
+
+## Database Safety (Critical)
+
+- **NEVER run `prisma migrate reset`, `prisma db push --force-reset`, or any command that drops/resets a database**
+- **NEVER connect to production databases** — only use test databases
+- If the project has a test database configuration (e.g., `.env.test`, `DATABASE_URL_TEST`), use that
+- If no test database is configured, **skip database verification** and mark those criteria as SKIP with reason "no test database configured"
+- When creating test data via API calls, use obviously fake data (e.g., `test-user-{timestamp}@example.com`) and clean up after verification if possible
+- Never DELETE or UPDATE existing records — only create new test records and verify against those

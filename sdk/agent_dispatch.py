@@ -164,6 +164,12 @@ _BLOCKED_COMMANDS = [
     "dd if=",
     "> /dev/sda",
     ":(){ :|:& };:",
+    "prisma migrate reset",
+    "prisma db push --force-reset",
+    "DROP DATABASE",
+    "DROP TABLE",
+    "TRUNCATE",
+    "DELETE FROM",
 ]
 
 
