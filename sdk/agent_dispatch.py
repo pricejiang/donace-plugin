@@ -520,15 +520,29 @@ class AgentDispatcher:
     async def run_test_engineer(self, stage: Stage) -> dict:
         """Dispatch test-engineer agent and parse structured output."""
         changed_files = await self._get_changed_files()
-        prompt = (
-            f"Write and run tests for this stage: {stage.name}\n\n"
-            f"Files changed by the implementer:\n```\n{changed_files}\n```\n\n"
-            f"Focus your tests on these files. Do not explore the codebase to find what changed — "
-            f"the list above is complete.\n\n"
-            f"After running the tests, output a summary line in this exact format:\n"
-            f"TEST_SUMMARY: passed=N failed=N\n\n"
-            f"This summary must reflect the actual test run results."
-        )
+        # Check if test files already exist in the changed files
+        test_files = [f for f in changed_files.splitlines() if 'test' in f.lower() or 'spec' in f.lower()]
+        if test_files:
+            prompt = (
+                f"Run the existing tests for this stage: {stage.name}\n\n"
+                f"Files changed by the implementer:\n```\n{changed_files}\n```\n\n"
+                f"Test files already written by implementer:\n```\n{chr(10).join(test_files)}\n```\n\n"
+                f"Run the test suite. If existing tests cover the changes well, do NOT write new tests. "
+                f"Only write additional tests if you find significant gaps in coverage "
+                f"(e.g., no error case tests, no edge case tests).\n\n"
+                f"After running the tests, output a summary line in this exact format:\n"
+                f"TEST_SUMMARY: passed=N failed=N\n\n"
+                f"This summary must reflect the actual test run results."
+            )
+        else:
+            prompt = (
+                f"Write and run tests for this stage: {stage.name}\n\n"
+                f"Files changed by the implementer:\n```\n{changed_files}\n```\n\n"
+                f"No test files were written by the implementer. Write tests and run them.\n\n"
+                f"After running the tests, output a summary line in this exact format:\n"
+                f"TEST_SUMMARY: passed=N failed=N\n\n"
+                f"This summary must reflect the actual test run results."
+            )
         response = await self.query(agent="test-engineer", prompt=prompt, model="sonnet")
 
         # Parse structured output

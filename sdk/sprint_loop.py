@@ -462,7 +462,12 @@ async def _implement_stage(
     t0 = time.time()
     try:
         contract_prompt = (
-            f"Write sprint contract for: {stage.name}\n\nContext:\n{task_context}"
+            f"Write sprint contract for: {stage.name}\n\n"
+            f"The architect's plan already contains Success Criteria and Tests for this stage "
+            f"(included in the context below). Use those as your starting point — expand them "
+            f"into specific, testable criteria with exact HTTP status codes, error messages, "
+            f"and data assertions. Do NOT re-explore the codebase from scratch.\n\n"
+            f"Context:\n{task_context}"
         ) if task_context else f"Write sprint contract for: {stage.name}"
         contract = await query(agent="runtime-evaluator", prompt=contract_prompt, model="opus")
     except Exception as exc:
@@ -570,7 +575,12 @@ async def _run_single_stage(
     t0 = time.time()
     try:
         contract_prompt = (
-            f"Write sprint contract for: {stage.name}\n\nContext:\n{task_context}"
+            f"Write sprint contract for: {stage.name}\n\n"
+            f"The architect's plan already contains Success Criteria and Tests for this stage "
+            f"(included in the context below). Use those as your starting point — expand them "
+            f"into specific, testable criteria with exact HTTP status codes, error messages, "
+            f"and data assertions. Do NOT re-explore the codebase from scratch.\n\n"
+            f"Context:\n{task_context}"
         ) if task_context else f"Write sprint contract for: {stage.name}"
         contract = await query(agent="runtime-evaluator", prompt=contract_prompt, model="opus")
     except Exception as exc:
