@@ -276,17 +276,40 @@ def _parse_plan_stages(content: str) -> list[Stage]:
 def _resolve_deps(raw_deps: list[str], number_to_name: dict[str, str]) -> list[str]:
     """Resolve dependency references to actual stage names.
 
-    Handles: "Stage 1" → name of stage 1, "Auth Guard" → "Auth Guard" (already a name).
+    Handles:
+    - "Stage 1" → name of stage 1
+    - "Stage 1, Stage 2" → names of stages 1 and 2
+    - "Stages 1-3" → names of stages 1, 2, 3 (range)
+    - "Stages 1-3 (some note)" → same, strips parenthetical
+    - "Auth Guard" → "Auth Guard" (already a name)
     """
     resolved = []
-    stage_ref_pattern = re.compile(r"Stage\s+(\d+)", re.IGNORECASE)
+    single_pattern = re.compile(r"Stage\s+(\d+)", re.IGNORECASE)
+    range_pattern = re.compile(r"Stages?\s+(\d+)\s*[-–]\s*(\d+)", re.IGNORECASE)
+
     for dep in raw_deps:
-        m = stage_ref_pattern.match(dep)
-        if m and m.group(1) in number_to_name:
-            resolved.append(number_to_name[m.group(1)])
-        else:
-            # Assume it's already a stage name
-            resolved.append(dep)
+        # Strip parenthetical notes like "(backend API changes must be deployed)"
+        cleaned = re.sub(r"\s*\(.*\)\s*$", "", dep).strip()
+
+        # Try range first: "Stages 1-3"
+        range_match = range_pattern.match(cleaned)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            for n in range(start, end + 1):
+                if str(n) in number_to_name:
+                    resolved.append(number_to_name[str(n)])
+            continue
+
+        # Try single: "Stage 1"
+        single_match = single_pattern.match(cleaned)
+        if single_match and single_match.group(1) in number_to_name:
+            resolved.append(number_to_name[single_match.group(1)])
+            continue
+
+        # Assume it's already a stage name
+        resolved.append(dep)
+
     return resolved
 
 
