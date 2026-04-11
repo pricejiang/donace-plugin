@@ -817,8 +817,14 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
         result = OrchestrationResult(sprint=sprint_result, review=final_review, run_id=run_id, validation=validation_report)
         await bus.emit(RunCompleted(result_summary=result.to_json_output().get("summary")))
 
-        # Clean up state file — run is complete, result file will be written by main()
-        run_state.delete()
+        # Clean up state file only if all stages passed.
+        # If any stages are BLOCKED/SKIPPED, keep the state file so the next
+        # run can resume from where we left off (skipping PASS stages).
+        has_incomplete = any(
+            s.status in ("BLOCKED", "SKIPPED") for s in sprint_result.stages
+        )
+        if not has_incomplete:
+            run_state.delete()
 
         return result
 
