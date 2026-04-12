@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sdk.change_scope import is_documentation_only_change, looks_like_trivial_doc_task, parse_changed_files
 from sdk.events import (
     AgentCompleted,
     AgentFailed,
@@ -281,12 +282,19 @@ def _resolve_deps(raw_deps: list[str], number_to_name: dict[str, str]) -> list[s
     resolved = []
     stage_ref_pattern = re.compile(r"Stage\s+(\d+)", re.IGNORECASE)
     for dep in raw_deps:
-        m = stage_ref_pattern.match(dep)
+        normalized = dep.strip()
+        normalized = re.sub(r"\([^)]*\)", "", normalized).strip()
+        normalized = re.sub(r"\s+[—-].*$", "", normalized).strip()
+        normalized = re.sub(r"^Requires\s+", "", normalized, flags=re.IGNORECASE).strip()
+        if not normalized or normalized.lower() == "none":
+            continue
+
+        m = stage_ref_pattern.match(normalized)
         if m and m.group(1) in number_to_name:
             resolved.append(number_to_name[m.group(1)])
         else:
             # Assume it's already a stage name
-            resolved.append(dep)
+            resolved.append(normalized)
     return resolved
 
 
@@ -437,6 +445,42 @@ async def run_documenter(
 
     Uses the shared context so the documenter doesn't need to explore the codebase.
     """
+    changed_files = await dispatcher._get_changed_files()
+    parsed_files = parse_changed_files(changed_files)
+
+    if looks_like_trivial_doc_task(shared_ctx.sections[1]) or is_documentation_only_change(parsed_files):
+        project_name = Path(shared_ctx.cwd).name
+        date_str = time.strftime("%Y-%m-%d")
+        month_str = time.strftime("%Y-%m")
+        session_dir = Path(shared_ctx.cwd) / ".ai" / "sessions" / month_str
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_path = session_dir / f"{date_str}-{shared_ctx.run_id}.md"
+
+        changed_lines = "\n".join(f"- {path}" for path in parsed_files[:8]) or "- (no changed files detected)"
+        blockers = "- None" if not final_review or "no stack-specific reviewer" in final_review.lower() else f"- {final_review}"
+        session_body = (
+            f"# {date_str} Session | {project_name} | {shared_ctx.run_id}\n\n"
+            f"## Completed\n"
+            f"- {shared_ctx.sections[1].splitlines()[-1]}\n\n"
+            f"## Decisions\n"
+            f"- Used local documentation fast path to avoid a redundant wrap-stage Claude call\n\n"
+            f"## Blockers / open questions\n"
+            f"{blockers}\n\n"
+            f"## Knowledge proposals\n"
+            f"- None\n\n"
+            f"## Next steps\n"
+            f"{changed_lines}\n"
+        )
+
+        await bus.emit(AgentStarted(agent="documenter", model="local-fast-path"))
+        t0 = time.time()
+        session_path.write_text(session_body)
+        await bus.emit(AgentCompleted(agent="documenter", duration_s=round(time.time() - t0, 1)))
+        return (
+            "Fast path: trivial documentation-only change detected. "
+            f"Wrote minimal session log to {session_path} without invoking Claude documenter."
+        )
+
     shared_ctx.add("Final Review", final_review[:3000] if final_review else "(no review)")
 
     prompt = (
@@ -752,6 +796,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             run_codex_review=dispatcher.run_codex_review,
             run_runtime_evaluator=dispatcher.run_runtime_evaluator,
             task_context=task_context,
+            task_context_sections=shared_ctx.sections,
             completed_stage_names=completed_stage_names,
             on_stage_complete=lambda sr: _on_stage_complete(run_state, shared_ctx, sr),
         )
@@ -795,6 +840,20 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             sprint_result=sprint_result,
             stack=stack,
         )
+
+        # Persist detailed compact-context shadow audit for per-stage inspection.
+        context_audit_events = [
+            event for event in bus.get_events()
+            if event.get("type") == "context.audit"
+        ]
+        runs_dir = Path(cwd) / ".ai" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        context_audit_path = runs_dir / f"{run_id}.context-audit.json"
+        context_audit_path.write_text(json.dumps({
+            "run_id": run_id,
+            "count": len(context_audit_events),
+            "audits": context_audit_events,
+        }, indent=2))
 
         # Emit validation report as event for dashboard
         await bus.emit(RunValidation(validation=validation_report.to_dict()))

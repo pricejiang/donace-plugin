@@ -3,3 +3,9 @@ REFERENCE.md
 __pycache__/
 *.pyc
 .DS_Store
+.pytest_cache/
+.venv/
+.pytest_output.txt
+test_results.txt
+test_run_output.txt
+unittest_results.txt

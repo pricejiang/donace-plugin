@@ -5,11 +5,13 @@ import asyncio
 import time
 from typing import Any, Callable, Awaitable
 
+from sdk.context_budget import audit_stage_context, build_stage_context
 from sdk.events import (
     AgentCompleted,
     AgentFailed,
     AgentSkipped,
     AgentStarted,
+    ContextAudit,
     Decision,
     EventBus,
     FixLoopExhausted,
@@ -114,6 +116,7 @@ async def run_sprint_loop(
     run_codex_review: CodexRunnerFn,
     run_runtime_evaluator: RuntimeRunnerFn,
     task_context: str = "",
+    task_context_sections: list[str] | None = None,
     completed_stage_names: set[str] | None = None,
     on_stage_complete: OnStageCompleteFn = None,
 ) -> SprintResult:
@@ -219,7 +222,7 @@ async def run_sprint_loop(
             result = await _run_single_stage(
                 stage, idx, len(stages), bus, query,
                 run_test_engineer, run_codex_review, run_runtime_evaluator,
-                task_context, warnings,
+                task_context, warnings, task_context_sections,
             )
             _record(result)
             remaining.remove(stage)
@@ -248,7 +251,7 @@ async def run_sprint_loop(
                 idx = stages.index(stage)
                 impl_tasks.append(
                     _implement_stage(
-                        stage, idx, len(stages), bus, query, task_context, warnings,
+                        stage, idx, len(stages), bus, query, task_context, warnings, task_context_sections,
                     )
                 )
             impl_results = await asyncio.gather(*impl_tasks, return_exceptions=True)
@@ -448,6 +451,7 @@ async def _implement_stage(
     query: AgentQueryFn,
     task_context: str,
     warnings: list[str],
+    task_context_sections: list[str] | None,
 ) -> str:
     """Run contract + implement for a single stage. Returns the contract text.
 
@@ -480,14 +484,30 @@ async def _implement_stage(
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
+        implementer_context = _select_implementer_context(task_context, task_context_sections)
+        if task_context and task_context_sections:
+            audit = audit_stage_context(
+                task_context_sections,
+                full_context=task_context,
+                consumer="implementer",
+            )
+            await bus.emit(ContextAudit(
+                consumer=audit.consumer,
+                full_tokens=audit.full_tokens,
+                compact_tokens=audit.compact_tokens,
+                reduction_tokens=audit.reduction_tokens,
+                reduction_pct=audit.reduction_pct,
+                kept_sections=audit.kept_sections,
+                dropped_sections=audit.dropped_sections,
+            ))
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
             f"Contract:\n{contract}\n\n"
             f"SCOPE: Only modify files listed in this stage's plan. "
             f"Do not explore or read files from other stages. "
         )
-        if task_context:
-            impl_prompt = f"{task_context}\n\n{impl_prompt}"
+        if implementer_context:
+            impl_prompt = f"{implementer_context}\n\n{impl_prompt}"
         await query(agent="implementer", prompt=impl_prompt, model="sonnet")
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
@@ -560,6 +580,7 @@ async def _run_single_stage(
     run_runtime_evaluator: RuntimeRunnerFn,
     task_context: str,
     warnings: list[str],
+    task_context_sections: list[str] | None,
 ) -> StageResult:
     """Execute a single stage: contract → implement → verify → fix loop → gate."""
 
@@ -604,14 +625,30 @@ async def _run_single_stage(
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
+        implementer_context = _select_implementer_context(task_context, task_context_sections)
+        if task_context and task_context_sections:
+            audit = audit_stage_context(
+                task_context_sections,
+                full_context=task_context,
+                consumer="implementer",
+            )
+            await bus.emit(ContextAudit(
+                consumer=audit.consumer,
+                full_tokens=audit.full_tokens,
+                compact_tokens=audit.compact_tokens,
+                reduction_tokens=audit.reduction_tokens,
+                reduction_pct=audit.reduction_pct,
+                kept_sections=audit.kept_sections,
+                dropped_sections=audit.dropped_sections,
+            ))
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
             f"Contract:\n{contract}\n\n"
             f"SCOPE: Only modify files listed in this stage's plan. "
             f"Do not explore or read files from other stages. "
         )
-        if task_context:
-            impl_prompt = f"{task_context}\n\n{impl_prompt}"
+        if implementer_context:
+            impl_prompt = f"{implementer_context}\n\n{impl_prompt}"
         await query(agent="implementer", prompt=impl_prompt, model="sonnet")
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
@@ -827,3 +864,14 @@ def _extract_result(results: list, idx: int, default: dict) -> dict:
             return default
         return r
     return default
+
+
+def _select_implementer_context(task_context: str, task_context_sections: list[str] | None) -> str:
+    """Use compact context for the initial implementer pass when possible.
+
+    This is a conservative live rollout: contract generation still uses the
+    original context, and fix loops still operate from failure summaries only.
+    """
+    if not task_context or not task_context_sections:
+        return task_context
+    return build_stage_context(task_context_sections)

@@ -377,6 +377,20 @@ class AgentTokens(Event):
         self.type = "agent.tokens"
 
 
+@dataclass
+class ContextAudit(Event):
+    consumer: str = ""
+    full_tokens: int = 0
+    compact_tokens: int = 0
+    reduction_tokens: int = 0
+    reduction_pct: float = 0.0
+    kept_sections: list[str] = field(default_factory=list)
+    dropped_sections: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.type = "context.audit"
+
+
 # ---------------------------------------------------------------------------
 # Subagent events
 # ---------------------------------------------------------------------------
@@ -436,6 +450,7 @@ _register("agent.message", AgentMessage)
 _register("agent.tool_use", AgentToolUse)
 _register("agent.tool_result", AgentToolResult)
 _register("agent.tokens", AgentTokens)
+_register("context.audit", ContextAudit)
 _register("subagent.started", SubagentStarted)
 _register("subagent.completed", SubagentCompleted)
 

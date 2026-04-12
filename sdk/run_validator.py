@@ -25,12 +25,20 @@ class RunReportItem:
     details: dict | None = None
 
 
+# Estimated LLM tokens saved per fast-path invocation (avoids a full Claude round-trip).
+FAST_PATH_EST_TOKENS_SAVED_PER_INVOCATION = 2_000
+
+
 @dataclass
 class RunReport:
     items: list[RunReportItem] = field(default_factory=list)
     token_summary: dict[str, dict[str, int]] = field(default_factory=dict)
     duration_summary: dict[str, float] = field(default_factory=dict)
     stage_summary: dict[str, int] = field(default_factory=dict)
+    context_audits: list[dict[str, Any]] = field(default_factory=list)
+    fast_path_summary: dict[str, Any] = field(
+        default_factory=lambda: {"total_invocations": 0, "agents": [], "total_est_tokens_saved": 0}
+    )
 
     @property
     def error_count(self) -> int:
@@ -51,6 +59,8 @@ class RunReport:
             "token_summary": self.token_summary,
             "duration_summary": self.duration_summary,
             "stage_summary": self.stage_summary,
+            "context_audits": self.context_audits,
+            "fast_path_summary": self.fast_path_summary,
         }
 
 
@@ -84,6 +94,8 @@ def validate_run(
     skill_calls: list[dict] = []
     fix_loop_exhausted: list[dict] = []
     test_runs_per_stage: dict[str, int] = defaultdict(int)
+    context_audits: list[dict] = []
+    fast_path_agents: list[dict] = []
 
     for ev in events:
         ev_type = ev.get("type", "")
@@ -101,6 +113,14 @@ def validate_run(
             if agent == "test-engineer":
                 stage = ev.get("stage", "unknown")
                 test_runs_per_stage[stage] += 1
+            if ev.get("model") == "local-fast-path":
+                entry: dict[str, Any] = {
+                    "agent": agent,
+                    "est_tokens_saved": FAST_PATH_EST_TOKENS_SAVED_PER_INVOCATION,
+                }
+                if "stage" in ev:
+                    entry["stage"] = ev["stage"]
+                fast_path_agents.append(entry)
 
         elif ev_type == "agent.skipped":
             agents_skipped[agent] = ev.get("reason", "")
@@ -121,6 +141,17 @@ def validate_run(
                 "attempt": ev.get("attempt", 0),
                 "remaining": ev.get("remaining_failures", []),
             })
+        elif ev_type == "context.audit":
+            context_audits.append({
+                "stage": ev.get("stage", ""),
+                "consumer": ev.get("consumer", ""),
+                "full_tokens": ev.get("full_tokens", 0),
+                "compact_tokens": ev.get("compact_tokens", 0),
+                "reduction_tokens": ev.get("reduction_tokens", 0),
+                "reduction_pct": ev.get("reduction_pct", 0.0),
+                "kept_sections": ev.get("kept_sections", []),
+                "dropped_sections": ev.get("dropped_sections", []),
+            })
 
     # ── Populate summaries ──
     report.token_summary = dict(tokens_by_agent)
@@ -131,6 +162,16 @@ def validate_run(
         "skipped": sum(1 for s in sprint_result.stages if s.status == "SKIPPED"),
         "total": len(sprint_result.stages),
     }
+    report.context_audits = list(context_audits)
+
+    # ── Populate fast-path summary ──
+    if fast_path_agents:
+        total_saved = sum(entry["est_tokens_saved"] for entry in fast_path_agents)
+        report.fast_path_summary = {
+            "total_invocations": len(fast_path_agents),
+            "agents": fast_path_agents,
+            "total_est_tokens_saved": total_saved,
+        }
 
     # ── Check 1: Missing required agents ──
     for required in REQUIRED_SPRINT_AGENTS:
@@ -234,5 +275,46 @@ def validate_run(
                 message=f"test-engineer ran {count} times in stage '{stage}'",
                 details={"stage": stage, "count": count},
             ))
+
+    # ── Check 12: Fast-path agent savings (informational) ──
+    if fast_path_agents:
+        total_saved = report.fast_path_summary["total_est_tokens_saved"]
+        count = report.fast_path_summary["total_invocations"]
+        report.items.append(RunReportItem(
+            severity="INFO",
+            check="fast_path_savings",
+            message=(
+                f"{count} fast-path agent invocation(s) saved an estimated "
+                f"{total_saved:,} tokens by bypassing LLM calls"
+            ),
+            details={
+                "total_invocations": count,
+                "agents": fast_path_agents,
+                "total_est_tokens_saved": total_saved,
+            },
+        ))
+
+    # ── Check 11: Shadow compact-context audit (informational) ──
+    if context_audits:
+        avg_reduction = sum(item["reduction_tokens"] for item in context_audits) / len(context_audits)
+        best = max(context_audits, key=lambda item: item["reduction_tokens"])
+        report.items.append(RunReportItem(
+            severity="INFO",
+            check="context_shadow_audit",
+            message=(
+                f"Shadow compact-context audit for {len(context_audits)} implementer prompt(s): "
+                f"average reduction {avg_reduction:.0f} tokens; largest saving {best['reduction_tokens']} "
+                f"tokens in stage '{best['stage']}'"
+            ),
+            details={
+                "sample_count": len(context_audits),
+                "average_reduction_tokens": round(avg_reduction, 1),
+                "best_stage": best["stage"],
+                "best_reduction_tokens": best["reduction_tokens"],
+                "best_reduction_pct": best["reduction_pct"],
+                "best_kept_sections": best["kept_sections"],
+                "best_dropped_sections": best["dropped_sections"][:6],
+            },
+        ))
 
     return report
