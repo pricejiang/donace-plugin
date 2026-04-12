@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Donace Dashboard</title>
+<style>
+/* ── Reset & Base ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0d1117;
+  --bg-card: #161b22;
+  --bg-hover: #1c2128;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --text-bright: #f0f6fc;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+  --blue: #58a6ff;
+  --purple: #bc8cff;
+  --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+}
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; }
+
+/* ── Layout ── */
+.app { display: flex; flex-direction: column; height: 100vh; }
+
+/* Header */
+.header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+.header h1 { font-size: 15px; font-weight: 600; color: var(--text-bright); }
+.header .status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); }
+.header .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+.header .status .dot.connected { background: var(--green); }
+
+/* Pipeline Bar (horizontal, top) */
+.pipeline-bar { display: flex; flex-direction: column; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+.phase-row { display: flex; align-items: center; gap: 0; }
+.phase-step { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 500; white-space: nowrap; }
+.phase-step .icon { font-size: 12px; }
+.phase-step .icon.done { color: var(--green); }
+.phase-step .icon.active { color: var(--blue); animation: pulse 2s ease-in-out infinite; }
+.phase-step .icon.pending { color: var(--text-dim); }
+.phase-step .icon.failed { color: var(--red); }
+.phase-connector { flex: 0 0 40px; height: 1px; background: var(--border); margin: 0 4px; }
+.phase-connector.done { background: var(--green); }
+.fix-inline { margin-left: auto; font-size: 12px; font-family: var(--font-mono); color: var(--yellow); display: flex; align-items: center; gap: 6px; }
+.fix-inline .blocks { display: flex; gap: 2px; }
+.fix-inline .blk { width: 14px; height: 6px; border-radius: 1px; background: var(--border); }
+.fix-inline .blk.done { background: var(--green); }
+.fix-inline .blk.active { background: var(--yellow); }
+.stage-row { display: flex; align-items: center; gap: 12px; padding: 4px 0 0 0; margin-left: 2px; font-size: 12px; font-family: var(--font-mono); color: var(--text-dim); flex-wrap: wrap; }
+.stage-row .stage-item { display: flex; align-items: center; gap: 4px; }
+.stage-row .stage-item.active { color: var(--text-bright); }
+.stage-row .stage-item .icon { font-size: 11px; }
+.stage-row .stage-item .icon.done { color: var(--green); }
+.stage-row .stage-item .icon.active { color: var(--blue); animation: pulse 2s ease-in-out infinite; }
+.stage-row .stage-item .icon.failed { color: var(--red); }
+.stage-row .stage-item .icon.skipped { color: var(--yellow); }
+.stage-row .stage-item .icon.pending { color: var(--text-dim); }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* Main: sidebar + log */
+.main { display: flex; flex: 1; overflow: hidden; }
+
+/* Agent Sidebar (left) */
+.agent-sidebar { width: 220px; min-width: 220px; border-right: 1px solid var(--border); overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+.section-title { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim); margin-bottom: 4px; }
+.agent-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 5px; padding: 8px 10px; border-left: 2px solid var(--border); }
+.agent-card.running { border-left-color: var(--green); }
+.agent-card.failed { border-left-color: var(--red); }
+.agent-card.placeholder { opacity: 0.4; }
+.agent-card .agent-header { display: flex; justify-content: space-between; align-items: center; }
+.agent-card .agent-name { font-weight: 600; font-size: 12px; color: var(--text-bright); }
+.agent-card .agent-status { font-size: 10px; padding: 1px 6px; border-radius: 8px; }
+.agent-card .agent-status.running { background: rgba(63,185,80,0.15); color: var(--green); }
+.agent-card .agent-status.completed { background: rgba(63,185,80,0.1); color: var(--text-dim); }
+.agent-card .agent-status.failed { background: rgba(248,81,73,0.15); color: var(--red); }
+.agent-card .agent-status.skipped { background: rgba(210,153,34,0.15); color: var(--yellow); }
+.agent-card .agent-detail { font-size: 11px; color: var(--text-dim); font-family: var(--font-mono); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Checkpoint (bottom of sidebar) */
+.checkpoint { display: none; padding: 10px; background: var(--bg-card); border: 1px solid var(--blue); border-radius: 5px; margin-top: auto; }
+.checkpoint.visible { display: block; }
+.checkpoint .cp-name { font-size: 12px; font-weight: 600; color: var(--text-bright); }
+.checkpoint .countdown { font-size: 11px; color: var(--text-dim); margin: 4px 0; }
+.checkpoint .actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.checkpoint .actions button { padding: 4px 10px; border: 1px solid var(--border); border-radius: 3px; background: var(--bg); color: var(--text); font-size: 11px; cursor: pointer; }
+.checkpoint .actions button:hover { background: var(--bg-hover); }
+.checkpoint .actions button.primary { background: var(--blue); color: #000; border-color: var(--blue); }
+.checkpoint .actions button.danger { border-color: var(--red); color: var(--red); }
+
+/* Event Log Area (right, dominant) */
+.log-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.log-tabs { display: flex; gap: 0; padding: 0 16px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
+.log-tab { padding: 6px 14px; font-size: 12px; font-weight: 500; cursor: pointer; color: var(--text-dim); border-bottom: 2px solid transparent; }
+.log-tab:hover { color: var(--text); }
+.log-tab.active { color: var(--text-bright); border-bottom-color: var(--blue); }
+
+.event-log { flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 12px; padding: 4px 0; }
+.event-row { display: flex; padding: 3px 16px; gap: 10px; cursor: default; line-height: 1.5; border-bottom: 1px solid transparent; }
+.event-row:hover { background: var(--bg-hover); }
+.event-row .time { color: var(--text-dim); min-width: 65px; flex-shrink: 0; padding-top: 1px; }
+.event-row .type { min-width: 140px; flex-shrink: 0; padding-top: 1px; }
+.event-row .type.run { color: var(--purple); }
+.event-row .type.phase { color: var(--blue); }
+.event-row .type.agent { color: var(--green); }
+.event-row .type.stage { color: var(--yellow); }
+.event-row .type.fix { color: var(--red); }
+.event-row .type.checkpoint { color: var(--blue); font-weight: 600; }
+.event-row .type.gate { color: var(--yellow); font-weight: 600; }
+.event-row .detail { color: var(--text-dim); flex: 1; white-space: pre-wrap; word-break: break-word; }
+
+.raw-log { flex: 1; overflow-y: auto; font-family: var(--font-mono); font-size: 12px; padding: 8px 16px; display: none; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+.raw-log.visible { display: block; }
+.raw-entry { margin-bottom: 2px; padding: 2px 0; border-bottom: 1px solid var(--border); }
+.raw-entry:last-child { border-bottom: none; }
+.raw-entry .raw-header { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; }
+.raw-entry .raw-agent { color: var(--blue); font-weight: 600; }
+.raw-entry .raw-time { color: var(--text-dim); font-size: 11px; }
+.raw-entry .raw-label { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 500; }
+.raw-entry .raw-label.message { background: rgba(188,140,255,0.15); color: var(--purple); }
+.raw-entry .raw-label.tool-call { background: rgba(88,166,255,0.15); color: var(--blue); }
+.raw-entry .raw-label.tool-result { background: rgba(63,185,80,0.15); color: var(--green); }
+.raw-entry .raw-label.tool-error { background: rgba(248,81,73,0.15); color: var(--red); }
+.raw-entry .raw-content { color: var(--text); margin-top: 2px; }
+.raw-entry .raw-tool-name { color: var(--yellow); }
+.raw-entry .raw-target { color: var(--text-dim); }
+
+/* History */
+.history-panel { display: none; flex: 1; overflow-y: auto; padding: 12px 16px; }
+.history-panel.visible { display: block; }
+.history-list { display: flex; flex-direction: column; gap: 4px; }
+.history-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; }
+.history-item:hover { background: var(--bg-hover); }
+.history-item.active { background: var(--bg); border-color: var(--border); color: var(--text-bright); }
+.history-item .dot { flex-shrink: 0; width: 6px; height: 6px; border-radius: 50%; }
+.history-item .dot.live { background: var(--green); }
+.history-item .dot.done { background: var(--text-dim); }
+.history-item .hi-info { flex: 1; min-width: 0; }
+.history-item .hi-id { font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-item .hi-meta { font-size: 10px; color: var(--text-dim); margin-top: 1px; }
+.history-item .hi-close { flex-shrink: 0; width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; border-radius: 3px; font-size: 11px; opacity: 0; }
+.history-item:hover .hi-close { opacity: 1; }
+.history-item .hi-close:hover { background: var(--red); color: var(--text-bright); opacity: 1; }
+
+.empty { display: flex; align-items: center; justify-content: center; flex: 1; color: var(--text-dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- Header -->
+  <div class="header">
+    <h1>donace dashboard</h1>
+    <div class="status">
+      <span id="run-id">no active run</span>
+      <span class="dot" id="conn-dot"></span>
+      <span id="conn-label">Disconnected</span>
+    </div>
+  </div>
+
+  <!-- Pipeline Bar (horizontal) -->
+  <div class="pipeline-bar">
+    <div class="phase-row" id="phase-row"></div>
+    <div class="stage-row" id="stage-row"></div>
+  </div>
+
+  <!-- Main: sidebar + log -->
+  <div class="main">
+    <!-- Agent Sidebar -->
+    <div class="agent-sidebar">
+      <div class="section-title">Agents</div>
+      <div id="agent-cards"></div>
+      <div id="validation-panel" style="display:none;"></div>
+      <div class="checkpoint" id="checkpoint">
+        <div class="cp-name" id="checkpoint-name"></div>
+        <div class="countdown" id="checkpoint-countdown"></div>
+        <div class="actions" id="checkpoint-actions"></div>
+      </div>
+    </div>
+
+    <!-- Log Area -->
+    <div class="log-area">
+      <div class="log-tabs">
+        <div class="log-tab active" id="tab-events" onclick="window._switchLogTab('events')">Events</div>
+        <div class="log-tab" id="tab-rawlog" onclick="window._switchLogTab('rawlog')">Raw Log</div>
+        <div class="log-tab" id="tab-history" onclick="window._switchLogTab('history')">History</div>
+      </div>
+      <div class="event-log" id="event-log">
+        <div class="empty" id="log-empty">Waiting for events...</div>
+      </div>
+      <div class="raw-log" id="raw-log"></div>
+      <div class="history-panel" id="history-panel">
+        <div class="history-list" id="history-list">
+          <span style="font-size: 12px; color: var(--text-dim);">Loading...</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  // Fixed agent display order
+  const AGENT_ORDER = ['implementer', 'test-engineer', 'codex-review', 'runtime-evaluator', 'final-review', 'documenter'];
+
+  // ── State ──
+  const state = {
+    ws: null,
+    connected: false,
+    events: [],
+    allEvents: {},
+    currentRunId: null,
+    activeRunId: null,
+    agents: {},
+    phases: {},
+    stages: [],
+    currentStage: null,
+    fixLoop: null,
+    checkpoint: null,
+  };
+
+  // ── DOM refs ──
+  const $connDot = document.getElementById('conn-dot');
+  const $connLabel = document.getElementById('conn-label');
+  const $runId = document.getElementById('run-id');
+  const $phaseRow = document.getElementById('phase-row');
+  const $stageRow = document.getElementById('stage-row');
+  const $agentCards = document.getElementById('agent-cards');
+  const $checkpoint = document.getElementById('checkpoint');
+  const $cpName = document.getElementById('checkpoint-name');
+  const $cpCountdown = document.getElementById('checkpoint-countdown');
+  const $cpActions = document.getElementById('checkpoint-actions');
+  const $eventLog = document.getElementById('event-log');
+  const $logEmpty = document.getElementById('log-empty');
+
+  // ── WebSocket ──
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${proto}//${location.host}/ws`;
+    state.ws = new WebSocket(url);
+    state.ws.onopen = () => { state.connected = true; updateConnStatus(); };
+    state.ws.onclose = () => { state.connected = false; $connDot.classList.remove('connected'); $connLabel.textContent = 'Disconnected'; setTimeout(connect, 2000); };
+    state.ws.onerror = () => { state.ws.close(); };
+    state.ws.onmessage = (msg) => {
+      try { handleEvent(JSON.parse(msg.data)); } catch (e) { console.error('Parse error:', e); }
+    };
+  }
+
+  // ── Connection status ──
+  function updateConnStatus() {
+    if (!state.connected) {
+      $connDot.classList.remove('connected');
+      $connLabel.textContent = 'Disconnected';
+    } else if (state.runLive) {
+      $connDot.classList.add('connected');
+      $connLabel.textContent = 'Live';
+    } else {
+      $connDot.classList.add('connected');
+      $connDot.style.background = 'var(--text-dim)';
+      $connLabel.textContent = 'Idle';
+    }
+  }
+
+  // ── Event handlers ──
+  function handleEvent(ev) {
+    const runId = ev.run_id || 'unknown';
+    if (!state.allEvents[runId]) state.allEvents[runId] = [];
+    state.allEvents[runId].push(ev);
+
+    if (ev.type === 'run.started') {
+      state.runLive = true;
+      state.activeRunId = runId;
+      updateConnStatus();
+      clearTimeout(state._replayTimer);
+      state._replayTimer = setTimeout(() => {
+        if (state.currentRunId !== runId) window._switchRun(runId);
+      }, 100);
+      if (!state.currentRunId) state.currentRunId = runId;
+    }
+
+    if (runId === state.currentRunId) {
+      state.events.push(ev);
+      processEvent(ev);
+    }
+    renderHistory();
+  }
+
+  function processEvent(ev) {
+    switch (ev.type) {
+      case 'run.started': $runId.textContent = ev.run_id; resetState(); break;
+      case 'run.completed': case 'run.failed':
+        state.runLive = false; updateConnStatus(); break;
+      case 'run.validation':
+        state.validation = ev.validation || null; break;
+      case 'phase.started': state.phases[ev.phase] = 'active'; break;
+      case 'phase.completed': state.phases[ev.phase] = 'done'; break;
+      case 'agent.started':
+        state.agents[ev.agent] = { status: 'running', startedAt: ev.timestamp, detail: ev.prompt ? ev.prompt.substring(0, 80) : '', model: ev.model || '', role: ev.role || '' };
+        break;
+      case 'agent.completed':
+        if (state.agents[ev.agent]) { state.agents[ev.agent].status = 'completed'; state.agents[ev.agent].duration = ev.duration_s; }
+        break;
+      case 'agent.failed':
+        if (state.agents[ev.agent]) { state.agents[ev.agent].status = 'failed'; state.agents[ev.agent].detail = ev.error || ''; }
+        else { state.agents[ev.agent] = { status: 'failed', detail: ev.error || '' }; }
+        break;
+      case 'agent.skipped':
+        state.agents[ev.agent] = { status: 'skipped', detail: ev.reason || '' };
+        break;
+      case 'subagent.started':
+        if (!state.subagents) state.subagents = {};
+        state.subagents[ev.subagent_id] = {
+          status: 'running', type: ev.subagent_type, parent: ev.parent_agent,
+          startedAt: ev.timestamp,
+        };
+        break;
+      case 'subagent.completed':
+        if (state.subagents && state.subagents[ev.subagent_id]) {
+          state.subagents[ev.subagent_id].status = 'completed';
+          state.subagents[ev.subagent_id].duration = Math.round(ev.timestamp - state.subagents[ev.subagent_id].startedAt);
+        }
+        break;
+      case 'agent.tokens': {
+        const agent = ev.agent || 'unknown';
+        const inp = ev.input_tokens || 0;
+        const out = ev.output_tokens || 0;
+        if (!state.tokenUsage) state.tokenUsage = {};
+        if (!state.tokenUsage[agent]) state.tokenUsage[agent] = { input: 0, output: 0 };
+        state.tokenUsage[agent].input += inp;
+        state.tokenUsage[agent].output += out;
+        // Also accumulate into parent if this is a subagent (agent name contains '/')
+        if (agent.includes('/')) {
+          const parent = agent.split('/')[0];
+          if (!state.tokenUsage[parent]) state.tokenUsage[parent] = { input: 0, output: 0 };
+          state.tokenUsage[parent].input += inp;
+          state.tokenUsage[parent].output += out;
+        }
+        break;
+      }
+      case 'stage.changed':
+        state.currentStage = ev.stage_name;
+        while (state.stages.length < ev.total_stages) state.stages.push({ name: '', status: 'pending' });
+        if (ev.stage_index < state.stages.length) {
+          const existing = state.stages[ev.stage_index];
+          if (!existing.name) {
+            state.stages[ev.stage_index] = { name: ev.stage_name, status: 'pending', estimatedTurns: ev.estimated_turns || 0, actualTurns: 0 };
+          } else {
+            state.stages[ev.stage_index] = { ...existing, name: ev.stage_name, status: 'active' };
+          }
+        }
+        break;
+      case 'agent.tool_use':
+        // Count implementer turns for the current stage
+        if (ev.agent === 'implementer' && state.currentStage) {
+          const si = state.stages.findIndex(s => s.name === state.currentStage);
+          if (si >= 0 && state.stages[si].actualTurns !== undefined) {
+            state.stages[si].actualTurns++;
+          }
+        }
+        break;
+      case 'stage.completed':
+        const si = state.stages.findIndex(s => s.name === ev.stage_name);
+        if (si >= 0) state.stages[si].status = ev.status === 'PASS' ? 'done' : ev.status === 'SKIPPED' ? 'skipped' : 'failed';
+        break;
+      case 'fix_loop.started':
+        state.fixLoop = { attempt: ev.attempt, max: ev.max_attempts || 3, failures: ev.failures || [] };
+        break;
+      case 'fix_loop.resolved': case 'fix_loop.exhausted':
+        state.fixLoop = null; break;
+      case 'checkpoint.reached':
+        state.checkpoint = { id: ev.checkpoint_id, options: ev.options || ['continue'], timeout: ev.timeout_s || 30, remaining: ev.timeout_s || 30 };
+        startCheckpointTimer();
+        break;
+      case 'checkpoint.resolved':
+        state.checkpoint = null; break;
+    }
+    // In batch mode (history load), skip per-event rendering — caller renders once at the end.
+    // In live mode (WebSocket), render immediately for real-time updates.
+    if (!state._batchMode) {
+      renderAll();
+      addLogEntry(ev);
+    }
+  }
+
+  function resetState() {
+    state.agents = {}; state.subagents = {}; state.tokenUsage = {}; state.validation = null; state.phases = {}; state.stages = [];
+    state.currentStage = null; state.fixLoop = null; state.checkpoint = null;
+  }
+
+  // ── Rendering ──
+  function renderAll() { renderPipeline(); renderAgentCards(); renderValidation(); renderCheckpoint(); }
+
+  function renderPipeline() {
+    const phases = ['boot', 'plan', 'sprint', 'wrap'];
+    let html = '';
+    for (let i = 0; i < phases.length; i++) {
+      const p = phases[i];
+      const st = state.phases[p] || 'pending';
+      const icon = st === 'done' ? '&#10003;' : st === 'active' ? '&#9679;' : '&#9675;';
+      html += `<div class="phase-step"><span class="icon ${st}">${icon}</span> ${p.charAt(0).toUpperCase() + p.slice(1)}</div>`;
+      if (i < phases.length - 1) {
+        const connDone = st === 'done' ? 'done' : '';
+        html += `<div class="phase-connector ${connDone}"></div>`;
+      }
+    }
+    // Fix loop inline
+    if (state.fixLoop) {
+      let blocks = '';
+      for (let i = 1; i <= state.fixLoop.max; i++) {
+        const cls = i < state.fixLoop.attempt ? 'done' : i === state.fixLoop.attempt ? 'active' : '';
+        blocks += `<div class="blk ${cls}"></div>`;
+      }
+      html += `<div class="fix-inline">Fix ${state.fixLoop.attempt}/${state.fixLoop.max} <div class="blocks">${blocks}</div></div>`;
+    }
+    $phaseRow.innerHTML = html;
+
+    // Stages (only when sprint is active or done)
+    if (state.stages.length > 0) {
+      let shtml = '';
+      for (const s of state.stages) {
+        const sIcon = s.status === 'done' ? '&#10003;' : s.status === 'active' ? '&#9679;' : s.status === 'failed' ? '&#10007;' : s.status === 'skipped' ? '&#8722;' : '&#9675;';
+        const activeCls = s.status === 'active' ? 'active' : '';
+        let turnInfo = '';
+        if (s.estimatedTurns > 0 && s.actualTurns > 0) {
+          const overEstimate = s.actualTurns > s.estimatedTurns;
+          const color = overEstimate ? 'var(--yellow)' : 'var(--text-dim)';
+          const warn = overEstimate ? ' ⚠' : '';
+          turnInfo = ` <span style="font-size:10px;color:${color}">${s.actualTurns}/${s.estimatedTurns}t${warn}</span>`;
+        } else if (s.actualTurns > 0) {
+          turnInfo = ` <span style="font-size:10px;color:var(--text-dim)">${s.actualTurns}t</span>`;
+        }
+        shtml += `<div class="stage-item ${activeCls}"><span class="icon ${s.status}">${sIcon}</span> ${s.name || 'Stage'}${turnInfo}</div>`;
+      }
+      $stageRow.innerHTML = shtml;
+      $stageRow.style.display = '';
+    } else {
+      $stageRow.style.display = 'none';
+    }
+  }
+
+  function renderSubagents(parentName) {
+    if (!state.subagents) return '';
+    let html = '';
+    for (const [id, sub] of Object.entries(state.subagents)) {
+      if (sub.parent !== parentName) continue;
+      const elapsed = sub.duration ? `${sub.duration}s` : sub.startedAt ? `${Math.round((Date.now()/1000) - sub.startedAt)}s` : '';
+      const cls = sub.status === 'running' ? 'running' : '';
+      const subTokenKey = `${parentName}/${sub.type}`;
+      html += `<div class="agent-card subagent ${cls}" style="margin-left: 16px; border-left: 2px solid var(--cyan); opacity: 0.9;">
+        <div class="agent-header">
+          <span class="agent-name" style="font-size: 11px;">${sub.type}</span>
+          <span class="agent-status ${sub.status}" style="font-size: 11px;">${sub.status} ${elapsed}</span>
+        </div>
+        ${tokenLine(subTokenKey)}
+      </div>`;
+    }
+    return html;
+  }
+
+  function formatTokens(n) {
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+    return String(n);
+  }
+
+  function tokenLine(name) {
+    const u = (state.tokenUsage || {})[name];
+    if (!u || (u.input === 0 && u.output === 0)) return '';
+    return `<div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">↳ ${formatTokens(u.input)} in · ${formatTokens(u.output)} out</div>`;
+  }
+
+  function renderAgentCards() {
+    let html = '';
+
+    // Run-level total at the top
+    const allUsage = state.tokenUsage || {};
+    const totalIn = Object.values(allUsage).reduce((s, u) => {
+      // Only count top-level agents (no '/') to avoid double-counting subagent rollups
+      return s;
+    }, 0);
+    let runIn = 0, runOut = 0;
+    for (const [name, u] of Object.entries(allUsage)) {
+      if (!name.includes('/')) { runIn += u.input; runOut += u.output; }
+    }
+    if (runIn > 0 || runOut > 0) {
+      html += `<div style="padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between;">
+        <span>Run total</span>
+        <span>${formatTokens(runIn)} in · ${formatTokens(runOut)} out</span>
+      </div>`;
+    }
+
+    for (const name of AGENT_ORDER) {
+      const info = state.agents[name];
+      if (!info) {
+        html += `<div class="agent-card placeholder"><div class="agent-header"><span class="agent-name">${name}</span></div></div>`;
+        continue;
+      }
+      const elapsed = info.duration ? `${info.duration}s` : info.startedAt ? `${Math.round((Date.now()/1000) - info.startedAt)}s` : '';
+      const cardCls = info.status === 'running' ? 'running' : info.status === 'failed' ? 'failed' : '';
+      html += `<div class="agent-card ${cardCls}">
+        <div class="agent-header">
+          <span class="agent-name">${name}</span>
+          <span class="agent-status ${info.status}">${info.status} ${elapsed}</span>
+        </div>
+        <div class="agent-detail">${info.model || info.detail || ''}</div>
+        ${tokenLine(name)}
+      </div>`;
+      html += renderSubagents(name);
+    }
+    for (const [name, info] of Object.entries(state.agents)) {
+      if (AGENT_ORDER.includes(name)) continue;
+      const elapsed = info.duration ? `${info.duration}s` : info.startedAt ? `${Math.round((Date.now()/1000) - info.startedAt)}s` : '';
+      const cardCls = info.status === 'running' ? 'running' : info.status === 'failed' ? 'failed' : '';
+      html += `<div class="agent-card ${cardCls}">
+        <div class="agent-header">
+          <span class="agent-name">${name}</span>
+          <span class="agent-status ${info.status}">${info.status} ${elapsed}</span>
+        </div>
+        <div class="agent-detail">${info.model || info.detail || ''}</div>
+        ${tokenLine(name)}
+      </div>`;
+      html += renderSubagents(name);
+    }
+    $agentCards.innerHTML = html;
+  }
+
+  function renderValidation() {
+    const $panel = document.getElementById('validation-panel');
+    if (!state.validation) { $panel.style.display = 'none'; return; }
+    $panel.style.display = '';
+    const v = state.validation;
+    const severityColor = { ERROR: 'var(--red)', WARNING: 'var(--yellow)', INFO: 'var(--text-dim)' };
+    let html = `<div style="padding: 8px 10px; font-size: 11px; color: var(--text-dim); border-top: 1px solid var(--border); margin-top: 4px;">
+      <div style="font-weight: 600; margin-bottom: 4px; color: var(--text-bright);">Validation
+        <span style="color: var(--red); font-weight: normal;">${v.errors} errors</span> ·
+        <span style="color: var(--yellow); font-weight: normal;">${v.warnings} warnings</span>
+      </div>`;
+    for (const item of (v.items || [])) {
+      const color = severityColor[item.severity] || 'var(--text-dim)';
+      html += `<div style="padding: 2px 0; color: ${color};">[${item.severity}] ${item.message}</div>`;
+    }
+    html += '</div>';
+    $panel.innerHTML = html;
+  }
+
+  function renderCheckpoint() {
+    if (!state.checkpoint) { $checkpoint.classList.remove('visible'); return; }
+    $checkpoint.classList.add('visible');
+    $cpName.textContent = state.checkpoint.id;
+    $cpCountdown.textContent = `Auto-continue in ${state.checkpoint.remaining}s`;
+    let btns = '';
+    for (const opt of state.checkpoint.options) {
+      const label = opt.replace(/_/g, ' ');
+      const cls = opt === 'continue' ? 'primary' : opt === 'abort' || opt === 'stop_loop' ? 'danger' : '';
+      btns += `<button class="${cls}" onclick="window._resolve('${state.checkpoint.id}', '${opt}')">${label}</button>`;
+    }
+    $cpActions.innerHTML = btns;
+  }
+
+  // Checkpoint timer
+  let cpTimer = null;
+  function startCheckpointTimer() {
+    if (cpTimer) clearInterval(cpTimer);
+    cpTimer = setInterval(() => {
+      if (!state.checkpoint) { clearInterval(cpTimer); return; }
+      state.checkpoint.remaining--;
+      if (state.checkpoint.remaining <= 0) { clearInterval(cpTimer); state.checkpoint = null; renderCheckpoint(); }
+      else { $cpCountdown.textContent = `Auto-continue in ${state.checkpoint.remaining}s`; }
+    }, 1000);
+  }
+
+  window._resolve = function(cpId, decision) {
+    if (state.ws && state.connected) state.ws.send(JSON.stringify({ action: 'resolve', checkpoint: cpId, decision }));
+    state.checkpoint = null;
+    renderCheckpoint();
+  };
+
+  // ── Event log ──
+  function buildLogRow(ev) {
+    const time = new Date(ev.timestamp * 1000).toLocaleTimeString('en-US', { hour12: false });
+    const typeClass = ev.type.startsWith('run.') ? 'run' : ev.type.startsWith('phase.') ? 'phase' : ev.type.startsWith('agent.') ? 'agent' : ev.type.startsWith('stage.') ? 'stage' : ev.type.startsWith('fix_loop.') ? 'fix' : ev.type.startsWith('checkpoint.') ? 'checkpoint' : ev.type.startsWith('gate.') ? 'gate' : '';
+
+    let detail = '';
+    if (ev.agent) detail = ev.agent + (ev.role ? ` (${ev.role})` : '');
+    if (ev.task) detail = ev.task;
+    if (ev.phase && !ev.agent) detail = ev.phase;
+    if (ev.stage_name) detail = ev.stage_name;
+    if (ev.error) detail = ev.error;
+    if (ev.reason) detail = ev.reason;
+    if (ev.recommendation) detail = ev.recommendation;
+    if (ev.decision) detail = ev.decision;
+    if (ev.result_summary && typeof ev.result_summary === 'string') detail = ev.result_summary;
+    if (ev.type === 'agent.tool_use') {
+      const target = ev.target || '';
+      const input = ev.input_preview || '';
+      detail = `${ev.agent || ''} → ${ev.tool || ''}${target ? ' ' + target : ''}\n${input}`;
+    }
+    if (ev.type === 'agent.tool_result') {
+      const status = ev.status === 'error' ? 'ERROR' : 'ok';
+      detail = `${ev.agent || ''} ← ${ev.tool || ''} [${status}]\n${ev.output_preview || ''}`;
+    }
+    if (ev.type === 'agent.message') {
+      detail = `${ev.agent || ''}:\n${ev.content_preview || ''}`;
+    }
+
+    const row = document.createElement('div');
+    row.className = 'event-row';
+    row.innerHTML = `<span class="time">${time}</span><span class="type ${typeClass}">${ev.type}</span><span class="detail" title="${detail.replace(/"/g, '&quot;')}">${detail}</span>`;
+    return row;
+  }
+
+  function addLogEntry(ev) {
+    if ($logEmpty) $logEmpty.style.display = 'none';
+    const row = buildLogRow(ev);
+    if (row) $eventLog.prepend(row);
+    if (ev.type === 'agent.message' || ev.type === 'agent.tool_use' || ev.type === 'agent.tool_result') addRawLogEntry(ev);
+  }
+
+  // ── Run history ──
+  let historyRuns = [];
+
+  async function fetchHistory() {
+    try { historyRuns = await (await fetch('/api/runs')).json(); } catch (e) { historyRuns = []; }
+    renderHistory();
+  }
+
+  function renderHistory() {
+    const $list = document.getElementById('history-list');
+    const known = new Set(historyRuns.map(r => r.run_id));
+    const merged = [...historyRuns];
+    for (const rid of Object.keys(state.allEvents)) {
+      if (!known.has(rid)) merged.unshift({ run_id: rid, started: state.allEvents[rid][0]?.timestamp || 0, event_count: state.allEvents[rid].length });
+    }
+    if (merged.length === 0) { $list.innerHTML = '<span style="font-size:12px;color:var(--text-dim);">No runs yet</span>'; return; }
+    let html = '';
+    for (const run of merged) {
+      const active = run.run_id === state.currentRunId ? 'active' : '';
+      const dotCls = run.run_id === state.activeRunId ? 'live' : 'done';
+      const short = run.run_id.length > 16 ? run.run_id.substring(0, 16) : run.run_id;
+      const time = run.started ? new Date(run.started * 1000).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+      html += `<div class="history-item ${active}" onclick="window._switchRun('${run.run_id}')"><span class="dot ${dotCls}"></span><div class="hi-info"><div class="hi-id">${short}</div><div class="hi-meta">${time} · ${run.event_count} events</div></div><span class="hi-close" onclick="event.stopPropagation(); window._deleteRun('${run.run_id}')" title="Delete run">&times;</span></div>`;
+    }
+    $list.innerHTML = html;
+  }
+
+  window._switchRun = async function(runId) {
+    if (runId === state.currentRunId) return;
+    state.currentRunId = runId;
+    state.events = [];
+    resetState();
+    $eventLog.innerHTML = '';
+    document.getElementById('raw-log').innerHTML = '';
+
+    // Try local cache first, then fetch from API
+    let events = state.allEvents[runId];
+    if (!events || events.length === 0) {
+      try {
+        events = await (await fetch(`/api/events/${runId}`)).json();
+        state.allEvents[runId] = events;
+      } catch (e) {
+        events = [];
+      }
+    }
+    // Batch mode: update state without rendering each event, then render once
+    state._batchMode = true;
+    for (const ev of events) { state.events.push(ev); processEvent(ev); }
+    state._batchMode = false;
+
+    // Single render pass + build log entries in one batch
+    renderAll();
+    // Build all log HTML at once instead of per-event DOM insertion
+    const fragment = document.createDocumentFragment();
+    for (const ev of events) {
+      const row = buildLogRow(ev);
+      if (row) fragment.appendChild(row);
+    }
+    $eventLog.innerHTML = '';
+    $eventLog.appendChild(fragment);
+    if ($logEmpty) $logEmpty.style.display = 'none';
+    // Build raw log
+    const $raw = document.getElementById('raw-log');
+    $raw.innerHTML = '';
+    for (const ev of events) {
+      if (ev.type === 'agent.message' || ev.type === 'agent.tool_use' || ev.type === 'agent.tool_result') addRawLogEntry(ev);
+    }
+    renderHistory();
+  };
+
+  window._deleteRun = async function(runId) {
+    try { await fetch(`/api/runs/${runId}`, { method: 'DELETE' }); } catch (e) {}
+    delete state.allEvents[runId];
+    if (runId === state.currentRunId) {
+      const remaining = Object.keys(state.allEvents);
+      if (remaining.length > 0) window._switchRun(remaining[0]);
+      else { state.currentRunId = null; state.events = []; resetState(); $eventLog.innerHTML = ''; document.getElementById('raw-log').innerHTML = ''; $runId.textContent = 'no active run'; }
+    }
+    if (runId === state.activeRunId) state.activeRunId = null;
+    renderHistory();
+  };
+
+  // ── Log tab switching ──
+  window._switchLogTab = function(tab) {
+    const $events = document.getElementById('event-log');
+    const $raw = document.getElementById('raw-log');
+    const $history = document.getElementById('history-panel');
+    const tabs = { events: document.getElementById('tab-events'), rawlog: document.getElementById('tab-rawlog'), history: document.getElementById('tab-history') };
+    $events.style.display = 'none'; $raw.classList.remove('visible'); $history.classList.remove('visible');
+    Object.values(tabs).forEach(t => t.classList.remove('active'));
+    if (tab === 'events') { $events.style.display = ''; tabs.events.classList.add('active'); }
+    else if (tab === 'rawlog') { $raw.classList.add('visible'); tabs.rawlog.classList.add('active'); }
+    else if (tab === 'history') { $history.classList.add('visible'); tabs.history.classList.add('active'); fetchHistory(); }
+  };
+
+  // ── Raw log ──
+  function addRawLogEntry(ev) {
+    const $raw = document.getElementById('raw-log');
+    const time = new Date(ev.timestamp * 1000).toLocaleTimeString('en-US', { hour12: false });
+    const agent = ev.agent || 'unknown';
+    const entry = document.createElement('div');
+    entry.className = 'raw-entry';
+    if (ev.type === 'agent.message') {
+      const escaped = (ev.content_preview || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      entry.innerHTML = `<div class="raw-header"><span class="raw-agent">${agent}</span><span class="raw-label message">message</span><span class="raw-time">${time}</span></div><div class="raw-content">${escaped}</div>`;
+    } else if (ev.type === 'agent.tool_use') {
+      const tool = ev.tool || '';
+      const target = ev.target ? ` → ${ev.target}` : '';
+      const input = (ev.input_preview || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      entry.innerHTML = `<div class="raw-header"><span class="raw-agent">${agent}</span><span class="raw-label tool-call">tool call</span><span class="raw-tool-name">${tool}</span><span class="raw-target">${target}</span><span class="raw-time">${time}</span></div><div class="raw-content">${input}</div>`;
+    } else if (ev.type === 'agent.tool_result') {
+      const tool = ev.tool || '';
+      const isError = ev.status === 'error';
+      const output = (ev.output_preview || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      entry.innerHTML = `<div class="raw-header"><span class="raw-agent">${agent}</span><span class="raw-label ${isError ? 'tool-error' : 'tool-result'}">${isError ? 'error' : 'result'}</span><span class="raw-tool-name">${tool}</span><span class="raw-time">${time}</span></div><div class="raw-content">${output}</div>`;
+    } else return;
+    $raw.appendChild(entry);
+    $raw.scrollTop = $raw.scrollHeight;
+  }
+
+  // ── Agent card elapsed time updater ──
+  setInterval(() => {
+    document.querySelectorAll('.agent-card').forEach(card => {
+      const nameEl = card.querySelector('.agent-name');
+      const statusEl = card.querySelector('.agent-status');
+      if (!nameEl || !statusEl) return;
+      const name = nameEl.textContent;
+      const info = state.agents[name];
+      if (info && info.status === 'running' && info.startedAt) {
+        statusEl.textContent = `running ${Math.round((Date.now()/1000) - info.startedAt)}s`;
+      }
+    });
+  }, 1000);
+
+  // ── Init ──
+  // Load the most recent run on startup via REST, then connect WebSocket for live events only
+  async function init() {
+    await fetchHistory();
+    // Auto-load the most recent run
+    if (historyRuns.length > 0 && !state.currentRunId) {
+      await window._switchRun(historyRuns[0].run_id);
+    }
+    state.runLive = false;  // no active orchestrator on page load
+    connect();
+  }
+  init();
+})();
+</script>
+</body>
+</html>

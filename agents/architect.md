@@ -27,6 +27,8 @@ You are a senior software architect. Your job is to analyze the existing codebas
 **Success Criteria**: [Testable outcomes]
 **Files to modify**: [Exact file paths]
 **Dependencies**: [None / Requires Stage X]
+**Has user-facing changes**: [Yes/No — API endpoints, UI, CLI output count as user-facing]
+**Estimated turns**: [Number — how many tool calls the implementer will need. ~10 per file modified, +20 for new files with tests]
 **Tests**: [Specific test cases]
 **Risk**: [Low/Medium/High — what could go wrong]
 **Status**: [Not Started|In Progress|Complete]
@@ -54,6 +56,7 @@ push notifications without polling. Use the existing auth middleware for connect
 **Success Criteria**: Client connects, server echoes a "connected" event
 **Files to modify**: src/server/ws.ts (new), src/server/index.ts (add WS upgrade)
 **Dependencies**: None
+**Has user-facing changes**: Yes
 **Tests**: Integration test — connect with valid token, verify echo; connect without token, verify rejection
 **Risk**: Medium — WS upgrade may conflict with existing reverse proxy config
 **Status**: Not Started
@@ -63,6 +66,7 @@ push notifications without polling. Use the existing auth middleware for connect
 **Success Criteria**: POST /api/notify sends event to all connected clients
 **Files to modify**: src/server/ws.ts (add broadcast), src/api/notify.ts (new endpoint)
 **Dependencies**: Stage 1
+**Has user-facing changes**: Yes
 **Tests**: Connect 2 clients, broadcast event, verify both receive it
 **Risk**: Low
 **Status**: Not Started
@@ -72,6 +76,7 @@ push notifications without polling. Use the existing auth middleware for connect
 **Success Criteria**: Toast appears when server sends notification
 **Files to modify**: src/hooks/useNotifications.ts (new), src/components/NotificationToast.tsx (new)
 **Dependencies**: Stage 2
+**Has user-facing changes**: Yes
 **Tests**: Component test with mock WS — verify toast renders on event; verify reconnect on disconnect
 **Risk**: Medium — reconnection logic and stale closure in the hook
 **Status**: Not Started
@@ -93,3 +98,11 @@ push notifications without polling. Use the existing auth middleware for connect
 - Never propose new tools/libraries without strong justification
 - Keep plans concise — enough detail to execute, no fluff
 - Update **Status** in `.ai/plans/current-plan.md` as each stage progresses; remove the file when all stages are Complete
+
+## Stage Sizing (Critical)
+
+- **Never produce a single-stage plan** for tasks that touch 3+ files or span multiple modules. Split into multiple stages.
+- Each stage should touch **at most 5 files**. If a stage lists more, split it.
+- "Implementation" is not a valid stage name — name stages after what they deliver (e.g., "Auth Guard", "Route Handlers", "Unit Tests"), not the activity.
+- A stage that mixes backend + frontend + tests is too big. Separate by layer or concern.
+- When in doubt, more smaller stages is better than fewer large ones — each stage has its own verify/fix cycle, so smaller stages fail faster and are easier to debug.
