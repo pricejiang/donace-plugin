@@ -186,7 +186,7 @@ def _is_blocked_command(command: str) -> str | None:
 def _parse_allowed_subagents(tools: list[str]) -> list[str] | None:
     """Extract allowed subagent types from tools list.
 
-    "Agent(sub-implementer)" → ["sub-implementer"]
+    "Agent(worker)" → ["worker"]
     "Agent(worker, researcher)" → ["worker", "researcher"]
     "Agent" (no parens) → None (allow all)
     No "Agent" at all → [] (allow none)
@@ -341,7 +341,7 @@ class AgentDispatcher:
                         }
 
             # --- Security: restrict subagent types ---
-            # Agent(sub-implementer) in frontmatter only enforces in --agent mode.
+            # Agent(X) in frontmatter only enforces in --agent mode.
             # We enforce it here for SDK-dispatched agents.
             if tool_name == "Agent":
                 config = self._get_config(agent_name)
