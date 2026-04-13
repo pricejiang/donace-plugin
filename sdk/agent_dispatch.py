@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shlex
 import tempfile
@@ -281,7 +282,7 @@ def _extract_yaml_list(text: str, key: str) -> list[str] | None:
 class AgentDispatcher:
     """Dispatches agent queries using Claude Agent SDK, with EventBus integration."""
 
-    def __init__(self, agents_dir: str, cwd: str, bus: EventBus) -> None:
+    def __init__(self, agents_dir: str, cwd: str, bus: EventBus, file_scope: list[str] | None = None) -> None:
         if not HAS_SDK:
             raise RuntimeError(
                 "claude-agent-sdk not installed. Run: pip install claude-agent-sdk"
@@ -289,6 +290,7 @@ class AgentDispatcher:
         self.agents_dir = agents_dir
         self.cwd = cwd
         self.bus = bus
+        self.file_scope = file_scope  # If set, Write/Edit restricted to these paths
         self._agent_configs: dict[str, AgentConfig] = {}
 
     def _get_config(self, agent_name: str) -> AgentConfig:
@@ -321,6 +323,22 @@ class AgentDispatcher:
                 file_path = tool_input.get("file_path", "")
                 if file_path and _is_path_outside_cwd(file_path, cwd):
                     return {"decision": "block", "reason": f"path {file_path} is outside project directory {cwd}"}
+
+            # --- File scope: restrict Write/Edit to stage files (for parallel jobs) ---
+            if tool_name in ("Write", "Edit") and self.file_scope:
+                file_path = tool_input.get("file_path", "")
+                if file_path:
+                    # Normalize to relative path for comparison
+                    rel_path = os.path.relpath(file_path, cwd) if os.path.isabs(file_path) else file_path
+                    scope_match = any(
+                        rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
+                        for s in self.file_scope
+                    )
+                    if not scope_match:
+                        return {
+                            "decision": "block",
+                            "reason": f"file '{rel_path}' is outside this stage's file scope: {self.file_scope}",
+                        }
 
             # --- Security: restrict subagent types ---
             # Agent(sub-implementer) in frontmatter only enforces in --agent mode.

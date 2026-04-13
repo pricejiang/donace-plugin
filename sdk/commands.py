@@ -290,11 +290,12 @@ async def cmd_run_job(
             for ctx_file in sorted(context_dir.glob("*.md")):
                 task_context += ctx_file.read_text() + "\n\n"
 
-        # Dispatch
+        # Dispatch — file_scope limits Write/Edit to stage files (for parallel safety)
         from sdk.agent_dispatch import AgentDispatcher
         from sdk.job_runner import run_job
 
-        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
+        file_scope = stage_def.get("files") or None
+        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus, file_scope=file_scope)
         result = await run_job(
             stage=stage,
             cwd=cwd,
