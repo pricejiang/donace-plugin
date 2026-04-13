@@ -166,6 +166,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   <div class="pipeline-bar">
     <div class="phase-row" id="phase-row"></div>
     <div class="stage-row" id="stage-row"></div>
+    <div class="stage-row" id="job-row" style="display:none"></div>
   </div>
 
   <!-- Main: sidebar + log -->
@@ -220,6 +221,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     agents: {},
     phases: {},
     stages: [],
+    jobs: {},         // job_id -> {command, status, stage_id, startedAt}
     currentStage: null,
     fixLoop: null,
     checkpoint: null,
@@ -300,6 +302,19 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         state.validation = ev.validation || null; break;
       case 'phase.started': state.phases[ev.phase] = 'active'; break;
       case 'phase.completed': state.phases[ev.phase] = 'done'; break;
+      case 'job.registered':
+        state.jobs[ev.job_id] = { command: ev.command, status: 'registered', stage_id: ev.stage_id || '', startedAt: ev.timestamp };
+        break;
+      case 'job.started':
+        if (state.jobs[ev.job_id]) state.jobs[ev.job_id].status = 'running';
+        else state.jobs[ev.job_id] = { command: ev.command, status: 'running', stage_id: '', startedAt: ev.timestamp };
+        break;
+      case 'job.completed':
+        if (state.jobs[ev.job_id]) { state.jobs[ev.job_id].status = ev.status || 'completed'; state.jobs[ev.job_id].result = ev.result_summary || ''; }
+        break;
+      case 'job.interrupted':
+        if (state.jobs[ev.job_id]) { state.jobs[ev.job_id].status = 'interrupted'; state.jobs[ev.job_id].reason = ev.reason || ''; }
+        break;
       case 'agent.started':
         state.agents[ev.agent] = { status: 'running', startedAt: ev.timestamp, detail: ev.prompt ? ev.prompt.substring(0, 80) : '', model: ev.model || '', role: ev.role || '' };
         break;
@@ -389,7 +404,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   }
 
   function resetState() {
-    state.agents = {}; state.subagents = {}; state.tokenUsage = {}; state.validation = null; state.phases = {}; state.stages = [];
+    state.agents = {}; state.subagents = {}; state.tokenUsage = {}; state.validation = null; state.phases = {}; state.stages = []; state.jobs = {};
     state.currentStage = null; state.fixLoop = null; state.checkpoint = null;
   }
 
@@ -441,6 +456,28 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       $stageRow.style.display = '';
     } else {
       $stageRow.style.display = 'none';
+    }
+
+    // Jobs (hybrid mode) — shown alongside or instead of stages
+    const $jobRow = document.getElementById('job-row');
+    const jobIds = Object.keys(state.jobs);
+    if (jobIds.length > 0) {
+      let jhtml = '<span style="color:var(--text-dim);font-size:11px;margin-right:6px">Jobs:</span>';
+      for (const jid of jobIds) {
+        const j = state.jobs[jid];
+        const label = j.stage_id ? `${j.command}:${j.stage_id}` : j.command;
+        let icon = '&#9675;';  // pending
+        let cls = 'pending';
+        if (j.status === 'running') { icon = '&#9679;'; cls = 'active'; }
+        else if (j.status === 'PASS' || j.status === 'completed') { icon = '&#10003;'; cls = 'done'; }
+        else if (j.status === 'BLOCKED' || j.status === 'ERROR') { icon = '&#10007;'; cls = 'failed'; }
+        else if (j.status === 'interrupted') { icon = '&#9632;'; cls = 'skipped'; }
+        jhtml += `<div class="stage-item ${j.status === 'running' ? 'active' : ''}"><span class="icon ${cls}">${icon}</span> ${label}</div>`;
+      }
+      $jobRow.innerHTML = jhtml;
+      $jobRow.style.display = '';
+    } else {
+      $jobRow.style.display = 'none';
     }
   }
 
