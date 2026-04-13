@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, HTMLResponse
     import uvicorn
     HAS_FASTAPI = True
@@ -149,6 +149,10 @@ class EventStore:
 store: EventStore | None = None
 browser_connections: set[WebSocket] = set()
 orchestrator_control_ws: set[WebSocket] = set()
+# job_id -> control WebSocket (for targeted interrupt routing)
+job_control_ws: dict[str, WebSocket] = {}
+# job_id -> metadata (populated from job.registered events, cleared on job.completed/interrupted)
+job_registry: dict[str, dict] = {}
 
 
 def _create_app(db_path: str | None = None) -> FastAPI:
@@ -177,6 +181,20 @@ def _create_app(db_path: str | None = None) -> FastAPI:
                 if event.get("type") == "run.started":
                     store._enforce_retention()
 
+                # Maintain job registry
+                evt_type = event.get("type", "")
+                if evt_type == "job.registered":
+                    job_registry[event.get("job_id", "")] = {
+                        "job_id": event.get("job_id"),
+                        "command": event.get("command"),
+                        "stage_id": event.get("stage_id", ""),
+                        "pid": event.get("pid"),
+                        "run_id": event.get("run_id"),
+                        "started_at": event.get("timestamp"),
+                    }
+                elif evt_type in ("job.completed", "job.interrupted"):
+                    job_registry.pop(event.get("job_id", ""), None)
+
                 # Fan out to all connected browsers
                 dead: set[WebSocket] = set()
                 for browser_ws in browser_connections.copy():
@@ -194,9 +212,12 @@ def _create_app(db_path: str | None = None) -> FastAPI:
     async def control(ws: WebSocket) -> None:
         """Orchestrator listens here for user decisions relayed from browser."""
         await ws.accept()
+        # Track job_id for targeted interrupt routing
+        job_id = ws.query_params.get("job_id", "")
+        if job_id:
+            job_control_ws[job_id] = ws
         orchestrator_control_ws.add(ws)
         try:
-            # Keep connection alive — orchestrator reads, dashboard writes
             while True:
                 try:
                     await ws.receive_text()
@@ -204,6 +225,8 @@ def _create_app(db_path: str | None = None) -> FastAPI:
                     break
         finally:
             orchestrator_control_ws.discard(ws)
+            if job_id:
+                job_control_ws.pop(job_id, None)
 
     # --- Browser <-> Dashboard ---
 
@@ -264,6 +287,42 @@ def _create_app(db_path: str | None = None) -> FastAPI:
         """Delete a run and all its events."""
         deleted = store.delete_run(run_id)
         return {"status": "deleted", "run_id": run_id, "events_deleted": deleted}
+
+    @_app.get("/api/jobs/active")
+    async def list_active_jobs() -> list[dict[str, Any]]:
+        """List currently running jobs."""
+        return list(job_registry.values())
+
+    @_app.post("/api/interrupt")
+    async def interrupt_job(request: Request) -> dict[str, Any]:
+        """Send interrupt signal to a specific job."""
+        data = await request.json()
+        job_id = data.get("job_id", "")
+        reason = data.get("reason", "user requested")
+
+        if job_id not in job_registry:
+            return {"error": "job_not_found", "job_id": job_id}
+
+        # Route to specific job's control WebSocket
+        ws = job_control_ws.get(job_id)
+        if ws:
+            try:
+                msg = json.dumps({"action": "interrupt", "job_id": job_id, "reason": reason})
+                await ws.send_text(msg)
+                return {"status": "sent", "job_id": job_id}
+            except Exception as exc:
+                return {"error": str(exc), "job_id": job_id}
+
+        # Fallback: broadcast to all orchestrator connections
+        msg = json.dumps({"action": "interrupt", "job_id": job_id, "reason": reason})
+        dead: set[WebSocket] = set()
+        for orch_ws in orchestrator_control_ws.copy():
+            try:
+                await orch_ws.send_text(msg)
+            except Exception:
+                dead.add(orch_ws)
+        orchestrator_control_ws.difference_update(dead)
+        return {"status": "broadcast", "job_id": job_id}
 
     @_app.post("/api/shutdown")
     async def shutdown() -> dict[str, str]:
