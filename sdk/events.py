@@ -414,6 +414,57 @@ class RunValidation(Event):
         self.type = "run.validation"
 
 
+@dataclass
+class JobRegistered(Event):
+    """Emitted when an orchestrator process registers with dashboard."""
+    job_id: str = ""
+    command: str = ""
+    stage_id: str = ""
+    pid: int = 0
+
+    def __post_init__(self) -> None:
+        self.type = "job.registered"
+
+
+@dataclass
+class JobStarted(Event):
+    """Emitted when a job begins execution."""
+    job_id: str = ""
+    command: str = ""
+
+    def __post_init__(self) -> None:
+        self.type = "job.started"
+
+
+@dataclass
+class JobCompleted(Event):
+    """Emitted when a job finishes (pass, block, or error)."""
+    job_id: str = ""
+    command: str = ""
+    status: str = ""
+    result_summary: str = ""
+
+    def __post_init__(self) -> None:
+        self.type = "job.completed"
+
+
+@dataclass
+class JobInterrupted(Event):
+    """Emitted when a job is interrupted by user."""
+    job_id: str = ""
+    command: str = ""
+    reason: str = ""
+    completed_steps: list = field(default_factory=list)
+    interrupted_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.type = "job.interrupted"
+
+
+_register("job.registered", JobRegistered)
+_register("job.started", JobStarted)
+_register("job.completed", JobCompleted)
+_register("job.interrupted", JobInterrupted)
 _register("run.validation", RunValidation)
 _register("run.started", RunStarted)
 _register("run.completed", RunCompleted)
@@ -455,6 +506,8 @@ class EventBus:
         self._current_phase: str | None = None
         self._current_stage: str | None = None
         self._event_log: list[dict[str, Any]] = []
+        self._cancelled = False
+        self._cancel_reason = ""
 
     def subscribe(self, handler: Callable[[Event], Awaitable[None]]) -> None:
         """Register an event handler (e.g. WebSocketEmitter.__call__)."""
@@ -496,6 +549,9 @@ class EventBus:
         - interactive=False → returns CONTINUE immediately (zero overhead)
         - interactive=True  → emits checkpoint.reached, waits with timeout
         """
+        if self._cancelled:
+            return Decision.ABORT
+
         if not self.interactive:
             return Decision.CONTINUE
 
@@ -525,6 +581,22 @@ class EventBus:
             source=source,
         ))
         return decision
+
+    def cancel(self, reason: str) -> None:
+        """Mark this bus as cancelled. Irreversible. Unblocks any pending checkpoint."""
+        self._cancelled = True
+        self._cancel_reason = reason
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_result(Decision.ABORT)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    @property
+    def cancel_reason(self) -> str:
+        return self._cancel_reason
 
     def resolve(self, checkpoint: str, decision: Decision) -> None:
         """Called when dashboard relays a user action."""

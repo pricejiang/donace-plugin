@@ -25,9 +25,10 @@ class WebSocketEmitter:
       - /api/control: dashboard -> orchestrator (decisions, one-way receive)
     """
 
-    def __init__(self, dashboard_url: str, bus: EventBus) -> None:
+    def __init__(self, dashboard_url: str, bus: EventBus, job_id: str = "") -> None:
         self.dashboard_url = dashboard_url.rstrip("/")
         self.bus = bus
+        self._job_id = job_id
         self._ingest_ws: WebSocketClientProtocol | None = None
         self._control_ws: WebSocketClientProtocol | None = None
         self._control_task: asyncio.Task | None = None
@@ -46,8 +47,11 @@ class WebSocketEmitter:
                 ping_interval=20,
                 ping_timeout=20,
             )
+            control_url = f"{self.dashboard_url}/api/control"
+            if self._job_id:
+                control_url += f"?job_id={self._job_id}"
             self._control_ws = await websockets.connect(
-                f"{self.dashboard_url}/api/control",
+                control_url,
                 ping_interval=20,
                 ping_timeout=20,
             )
@@ -102,10 +106,17 @@ class WebSocketEmitter:
             async for msg in self._control_ws:
                 try:
                     data = json.loads(msg)
-                    if data.get("action") == "resolve":
+                    action = data.get("action")
+
+                    if action == "resolve":
                         checkpoint = data["checkpoint"]
                         decision = Decision(data["decision"])
                         self.bus.resolve(checkpoint, decision)
+
+                    elif action == "interrupt":
+                        reason = data.get("reason", "user requested")
+                        self.bus.cancel(reason)
+
                 except (json.JSONDecodeError, KeyError, ValueError) as exc:
                     print(f"Warning: Invalid control message: {exc}", file=sys.stderr)
         except asyncio.CancelledError:
