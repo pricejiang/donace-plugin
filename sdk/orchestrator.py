@@ -873,33 +873,133 @@ def _on_stage_complete(run_state: RunState, shared_ctx: SharedContext, stage_res
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """CLI entry point. Supports both legacy --task and new subcommands."""
     parser = argparse.ArgumentParser(description="donace orchestrator")
-    parser.add_argument("--task", required=True, help="Task description")
-    parser.add_argument("--cwd", required=True, help="Project working directory")
-    parser.add_argument("--dashboard-url", default=None, help="Dashboard WebSocket URL (e.g. ws://localhost:8741)")
-    parser.add_argument("--no-interactive", action="store_true", help="Disable interactive checkpoints")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Legacy args (used when no subcommand given)
+    parser.add_argument("--task", type=str, help="(Legacy) Task description — runs full pipeline")
+    parser.add_argument("--cwd", type=str, default=os.getcwd())
+    parser.add_argument("--dashboard-url", default=None)
+    parser.add_argument("--no-interactive", action="store_true")
+
+    # --- run_start ---
+    p = subparsers.add_parser("run_start", help="Start a new run")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--dashboard-url", default=None)
+
+    # --- run_complete ---
+    p = subparsers.add_parser("run_complete", help="Complete a run")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--dashboard-url", default=None)
+
+    # --- plan ---
+    p = subparsers.add_parser("plan", help="Run planning pipeline")
+    p.add_argument("--task", required=True)
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--skip-planner", action="store_true")
+    p.add_argument("--skip-codex", action="store_true")
+
+    # --- run_job ---
+    p = subparsers.add_parser("run_job", help="Execute a single stage")
+    p.add_argument("--stage-id", required=True)
+    p.add_argument("--plan", required=True, dest="plan_path")
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--skip-agents", type=str, default="",
+                   help="Comma-separated: contract,test,codex,runtime")
+    p.add_argument("--max-fix-attempts", type=int, default=3)
+
+    # --- verify ---
+    p = subparsers.add_parser("verify", help="Run verification (read-only)")
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--agents", type=str, default="test,codex",
+                   help="Comma-separated: test,codex,runtime")
+    p.add_argument("--scope", type=str, default="")
+
+    # --- review ---
+    p = subparsers.add_parser("review", help="Run code review")
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--reviewer", type=str, default="typescript")
+
+    # --- document ---
+    p = subparsers.add_parser("document", help="Update documentation")
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+
     args = parser.parse_args()
 
-    interactive = not args.no_interactive and args.dashboard_url is not None
+    # --- Legacy mode: --task without subcommand ---
+    if args.command is None and args.task:
+        interactive = not args.no_interactive and args.dashboard_url is not None
+        result = asyncio.run(run(
+            task=args.task,
+            cwd=args.cwd,
+            dashboard_url=args.dashboard_url,
+            interactive=interactive,
+        ))
+        output = result.to_json_output()
+        runs_dir = Path(args.cwd) / ".ai" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        result_path = runs_dir / f"{result.run_id}.json"
+        result_path.write_text(json.dumps(output, indent=2))
+        print(json.dumps(output, indent=2))
+        return
 
-    result = asyncio.run(run(
-        task=args.task,
-        cwd=args.cwd,
-        dashboard_url=args.dashboard_url,
-        interactive=interactive,
-    ))
+    # --- Subcommand dispatch ---
+    from sdk.commands import (
+        cmd_run_start, cmd_run_complete, cmd_plan, cmd_run_job,
+        cmd_verify, cmd_review, cmd_document,
+    )
 
-    # Write JSON result to .ai/runs/ for team-lead to read
-    output = result.to_json_output()
-    output_json = json.dumps(output, indent=2)
-
-    runs_dir = Path(args.cwd) / ".ai" / "runs"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    result_path = runs_dir / f"{result.run_id}.json"
-    result_path.write_text(output_json)
-
-    # Also print to stdout for convenience
-    print(output_json)
+    if args.command == "run_start":
+        asyncio.run(cmd_run_start(args.run_id, args.cwd, args.dashboard_url))
+    elif args.command == "run_complete":
+        asyncio.run(cmd_run_complete(args.run_id, args.cwd, args.dashboard_url))
+    elif args.command == "plan":
+        asyncio.run(cmd_plan(
+            task=args.task, cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+            skip_planner=args.skip_planner, skip_codex=args.skip_codex,
+        ))
+    elif args.command == "run_job":
+        skip = set(s for s in args.skip_agents.split(",") if s)
+        asyncio.run(cmd_run_job(
+            stage_id=args.stage_id, plan_path=args.plan_path,
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+            skip_agents=skip, max_fix_attempts=args.max_fix_attempts,
+        ))
+    elif args.command == "verify":
+        agents = set(s for s in args.agents.split(",") if s)
+        asyncio.run(cmd_verify(
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+            agents=agents, scope=args.scope,
+        ))
+    elif args.command == "review":
+        asyncio.run(cmd_review(
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url, reviewer=args.reviewer,
+        ))
+    elif args.command == "document":
+        asyncio.run(cmd_document(
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+        ))
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
