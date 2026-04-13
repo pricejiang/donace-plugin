@@ -37,12 +37,18 @@ async def _setup_bus(
     dashboard_url: str | None,
     job_id: str = "",
     interactive: bool = False,
+    cwd: str = "",
 ) -> tuple[EventBus, WebSocketEmitter | None]:
-    """Create EventBus and optionally connect to dashboard."""
+    """Create EventBus and optionally connect to dashboard.
+
+    If dashboard_url is None and cwd is provided, auto-discovers the URL
+    from .ai/runs/{run_id}/dashboard_url (written by run_start).
+    """
+    url = _resolve_dashboard_url(cwd, run_id, dashboard_url) if cwd else dashboard_url
     bus = EventBus(run_id=run_id, interactive=interactive)
     emitter = None
-    if dashboard_url:
-        emitter = WebSocketEmitter(dashboard_url, bus, job_id=job_id)
+    if url:
+        emitter = WebSocketEmitter(url, bus, job_id=job_id)
         await emitter.connect()
         if emitter.is_connected:
             bus.subscribe(emitter)
@@ -83,6 +89,16 @@ def _unregister_job(lock_path: Path) -> None:
 
 def _agents_dir() -> str:
     return str(Path(__file__).parent.parent / "agents")
+
+
+def _resolve_dashboard_url(cwd: str, run_id: str, explicit_url: str | None) -> str | None:
+    """Resolve dashboard URL: explicit arg > persisted from run_start."""
+    if explicit_url:
+        return explicit_url
+    url_file = Path(cwd) / ".ai" / "runs" / run_id / "dashboard_url"
+    if url_file.exists():
+        return url_file.read_text().strip()
+    return None
 
 
 def _load_context(cwd: str, run_id: str, level: str = "full") -> str:
@@ -133,11 +149,18 @@ def _load_context(cwd: str, run_id: str, level: str = "full") -> str:
 # ---------------------------------------------------------------------------
 
 async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dict:
-    """Start a new run. Creates directory structure, emits run.started."""
+    """Start a new run. Creates directory structure, emits run.started.
+
+    Persists dashboard_url so subsequent commands auto-discover it.
+    """
     run_dir = Path(cwd) / ".ai" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "jobs").mkdir(exist_ok=True)
     (run_dir / "context").mkdir(exist_ok=True)
+
+    # Persist dashboard URL for auto-discovery by subsequent commands
+    if dashboard_url:
+        (run_dir / "dashboard_url").write_text(dashboard_url)
 
     bus, emitter = await _setup_bus(run_id, dashboard_url)
     try:
@@ -209,7 +232,7 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
     except Exception:
         pass  # Non-critical — don't fail run_complete for hints
 
-    bus, emitter = await _setup_bus(run_id, dashboard_url)
+    bus, emitter = await _setup_bus(run_id, dashboard_url, cwd=cwd)
     try:
         await bus.emit(RunCompleted(result_summary=json.dumps(summary)))
         print(json.dumps(result, indent=2))
@@ -235,7 +258,7 @@ async def cmd_plan(
     Writes Markdown plan + JSON sidecar. Returns plan JSON.
     """
     job_id = f"job-plan-{uuid.uuid4().hex[:8]}"
-    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id)
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
     lock_path = _register_job(cwd, run_id, job_id)
 
     try:
@@ -332,7 +355,7 @@ async def cmd_run_job(
 ) -> dict:
     """Execute a single stage: contract -> implement -> verify -> fix loop."""
     job_id = f"job-{stage_id}-{uuid.uuid4().hex[:8]}"
-    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id)
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
     lock_path = _register_job(cwd, run_id, job_id)
     skip = skip_agents or set()
 
@@ -442,7 +465,7 @@ async def cmd_verify(
 ) -> dict:
     """Run verification on existing code. Read-only."""
     job_id = f"job-verify-{uuid.uuid4().hex[:8]}"
-    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id)
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
     lock_path = _register_job(cwd, run_id, job_id)
     active_agents = agents or {"test", "codex"}
 
@@ -518,7 +541,7 @@ async def cmd_review(
 ) -> dict:
     """Run code review. Dispatches reviewer agent."""
     job_id = f"job-review-{uuid.uuid4().hex[:8]}"
-    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id)
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
     lock_path = _register_job(cwd, run_id, job_id)
 
     try:
@@ -564,7 +587,7 @@ async def cmd_document(
 ) -> dict:
     """Update documentation. Dispatches documenter agent."""
     job_id = f"job-document-{uuid.uuid4().hex[:8]}"
-    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id)
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
     lock_path = _register_job(cwd, run_id, job_id)
 
     try:
