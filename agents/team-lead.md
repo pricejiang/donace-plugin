@@ -33,7 +33,18 @@ All commands: `python3 -m sdk.orchestrator <command> [args]`
 
 - `--skip-agents "contract,test,codex,runtime"` — Skip specific agents
 - `--max-fix-attempts N` — Control fix loop iterations (default: 3)
-- `--dashboard-url ws://localhost:8741` — Connect to dashboard
+- `--dashboard-url ws://localhost:8741` — Connect to dashboard (auto-discovered from run_start if omitted)
+
+### Foreground vs Background
+
+**IMPORTANT**: Long-running commands (`plan`, `run_job`, `verify`, `review`, `document`) MUST use `run_in_background: true` so you can continue chatting with the user. You'll be notified when they complete.
+
+Only `run_start` and `run_complete` are instant — run those in foreground.
+
+```
+Foreground (instant):  run_start, run_complete
+Background (minutes):  plan, run_job, verify, review, document
+```
 
 ## Step 1: Start Dashboard and Run
 
@@ -66,29 +77,31 @@ Determine what the user needs:
 ### Complex Task Flow
 
 ```
-1. Plan
-   → python3 -m sdk.orchestrator plan --task "..." --cwd <dir> --run-id <id>
-   → Read the returned JSON: stages, files, dependencies
+1. Plan (run in background — takes minutes)
+   → Bash(run_in_background): python3 -m sdk.orchestrator plan --task "..." --cwd <dir> --run-id <id>
+   → Chat with user while waiting
+   → When notified: read the returned JSON: stages, files, dependencies
 
 2. Analyze plan
    → Which stages have no dependencies? → Can run in parallel
    → Do parallel stages have overlapping files? → Must run serially
    → Present plan to user, get confirmation
 
-3. Execute stages
-   → Independent stages: start as parallel background jobs
+3. Execute stages (all run_job in background)
+   → Independent stages: start multiple Bash(run_in_background) in parallel
    → Dependent stages: wait for dependencies to complete first
-   → Each: python3 -m sdk.orchestrator run_job --stage-id <id> --plan .ai/plans/current-plan.json ...
+   → Each: Bash(run_in_background): python3 -m sdk.orchestrator run_job --stage-id <id> --plan .ai/plans/current-plan.json ...
+   → Chat with user while jobs run
 
-4. Handle results
+4. Handle results (when notified of completion)
    → PASS: continue to next stage
    → BLOCKED: analyze failure details, decide retry or escalate to user
    → INTERRUPTED: check what was completed, decide next step
 
-5. After all stages
-   → python3 -m sdk.orchestrator verify --agents "test,codex" (full verification)
-   → python3 -m sdk.orchestrator review (if significant changes)
-   → python3 -m sdk.orchestrator document (if user-facing changes)
+5. After all stages (in background)
+   → Bash(run_in_background): python3 -m sdk.orchestrator verify --agents "test,codex"
+   → Bash(run_in_background): python3 -m sdk.orchestrator review (if significant changes)
+   → Bash(run_in_background): python3 -m sdk.orchestrator document (if user-facing changes)
 
 6. Complete
    → python3 -m sdk.orchestrator run_complete --run-id <id> --cwd <dir>
