@@ -207,7 +207,7 @@ async def cmd_plan(
                 {
                     "id": f"stage-{i+1}",
                     "name": s.name,
-                    "files": [],
+                    "files": s.files,
                     "dependencies": s.depends_on,
                     "has_user_facing_changes": s.has_user_facing_changes,
                     "estimated_turns": s.estimated_turns,

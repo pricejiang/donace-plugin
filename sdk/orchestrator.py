@@ -211,6 +211,7 @@ def _parse_plan_stages(content: str) -> list[Stage]:
     user_facing_pattern = re.compile(r"\*\*Has user-facing changes\*\*:\s*(Yes|No|yes|no|true|false)", re.IGNORECASE)
     deps_pattern = re.compile(r"\*\*Dependenc(?:y|ies)\*\*:\s*(.+)", re.IGNORECASE)
     turns_pattern = re.compile(r"\*\*Estimated turns\*\*:\s*(\d+)", re.IGNORECASE)
+    files_pattern = re.compile(r"\*\*Files(?:\s+to\s+modify)?\*\*:\s*(.+)", re.IGNORECASE)
 
     # First pass: collect stage number → name mapping
     number_to_name: dict[str, str] = {}
@@ -224,6 +225,7 @@ def _parse_plan_stages(content: str) -> list[Stage]:
     current_user_facing = False
     current_deps_raw: list[str] = []
     current_estimated_turns = 0
+    current_files: list[str] = []
 
     for line in content.split("\n"):
         stage_match = stage_header_pattern.match(line.strip())
@@ -235,11 +237,13 @@ def _parse_plan_stages(content: str) -> list[Stage]:
                     has_user_facing_changes=current_user_facing,
                     depends_on=_resolve_deps(current_deps_raw, number_to_name),
                     estimated_turns=current_estimated_turns,
+                    files=current_files,
                 ))
             current_name = stage_match.group(2).strip()
             current_user_facing = False
             current_deps_raw = []
             current_estimated_turns = 0
+            current_files = []
             continue
 
         uf_match = user_facing_pattern.search(line)
@@ -261,6 +265,16 @@ def _parse_plan_stages(content: str) -> list[Stage]:
         if turns_match and current_name:
             current_estimated_turns = int(turns_match.group(1))
 
+        files_match = files_pattern.search(line)
+        if files_match and current_name:
+            raw_files = files_match.group(1).strip()
+            # Parse "path/a.ts (new), path/b.ts (modify)" or "path/a.ts, path/b.ts"
+            for part in raw_files.split(","):
+                # Strip annotations like "(new)", "(add WS upgrade)"
+                path = re.sub(r"\s*\([^)]*\)\s*", "", part).strip()
+                if path and path.lower() != "none":
+                    current_files.append(path)
+
     # Save last stage
     if current_name:
         stages.append(Stage(
@@ -268,6 +282,7 @@ def _parse_plan_stages(content: str) -> list[Stage]:
             has_user_facing_changes=current_user_facing,
             depends_on=_resolve_deps(current_deps_raw, number_to_name),
             estimated_turns=current_estimated_turns,
+            files=current_files,
         ))
 
     return stages

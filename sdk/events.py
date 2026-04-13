@@ -75,6 +75,7 @@ class Stage:
     has_user_facing_changes: bool
     depends_on: list[str] = field(default_factory=list)  # stage names this stage depends on
     estimated_turns: int = 0  # architect's estimate, 0 = not specified
+    files: list[str] = field(default_factory=list)  # file paths from architect plan
 
 
 @dataclass
