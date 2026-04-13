@@ -114,8 +114,10 @@ class WebSocketEmitter:
                         self.bus.resolve(checkpoint, decision)
 
                     elif action == "interrupt":
-                        reason = data.get("reason", "user requested")
-                        self.bus.cancel(reason)
+                        target_job = data.get("job_id", "")
+                        if not target_job or target_job == self._job_id:
+                            reason = data.get("reason", "user requested")
+                            self.bus.cancel(reason)
 
                 except (json.JSONDecodeError, KeyError, ValueError) as exc:
                     print(f"Warning: Invalid control message: {exc}", file=sys.stderr)

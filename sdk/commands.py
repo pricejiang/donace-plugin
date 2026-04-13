@@ -356,6 +356,7 @@ async def cmd_run_job(
             has_user_facing_changes=stage_def.get("has_user_facing_changes", False),
             depends_on=stage_def.get("dependencies", []),
             estimated_turns=stage_def.get("estimated_turns", 0),
+            files=stage_def.get("files", []),
         )
 
         # Load accumulated context — full detail for implementer
@@ -366,6 +367,8 @@ async def cmd_run_job(
         from sdk.job_runner import run_job
 
         file_scope = stage_def.get("files") or None
+        if not file_scope:
+            print(f"Warning: stage '{stage_id}' has no files list — file-scope restriction disabled", file=sys.stderr)
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus, file_scope=file_scope)
         result = await run_job(
             stage=stage,
@@ -398,6 +401,7 @@ async def cmd_run_job(
 
         # Write context for subsequent jobs
         if result.status in ("PASS", "BLOCKED"):
+            context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
             context_dir.mkdir(parents=True, exist_ok=True)
             ctx_path = context_dir / f"job-{stage_id}.md"
             ctx_content = f"## {stage.name}\n\nStatus: {result.status}\n"
