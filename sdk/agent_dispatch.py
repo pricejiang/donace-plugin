@@ -483,18 +483,8 @@ class AgentDispatcher:
     }
     DEFAULT_TIMEOUT = 300  # 5 minutes
 
-    # Per-agent max_turns as soft cap. Prevents agents from exploring
-    # endlessly. Implementer has no cap (timeout is the safety valve).
-    AGENT_MAX_TURNS: dict[str, int] = {
-        "test-engineer": 30,
-        "runtime-evaluator": 15,
-        "runtime-verifier": 20,
-        "documenter": 20,
-        "typescript-reviewer": 20,
-        "ios-reviewer": 20,
-        "planner": 15,
-    }
-    # None = no limit (for implementer, architect — they need variable turns)
+    # No max_turns limit — timeout is the safety valve.
+    # Subscription plan doesn't charge per token, so turns are not a cost concern.
 
     # Token budget hint per agent (injected into prompt). Not enforced — just guidance.
     AGENT_TOKEN_BUDGET: dict[str, str] = {
@@ -523,7 +513,6 @@ class AgentDispatcher:
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
         timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
-        max_turns = self.AGENT_MAX_TURNS.get(agent)  # None = unlimited
 
         # Inject token budget hint into prompt (not enforced, just guidance)
         budget = self.AGENT_TOKEN_BUDGET.get(agent)
@@ -540,8 +529,6 @@ class AgentDispatcher:
         }
         if config.mcp_servers:
             opts["mcp_servers"] = config.mcp_servers
-        if max_turns is not None:
-            opts["max_turns"] = max_turns
 
         options = ClaudeAgentOptions(**opts)
 
