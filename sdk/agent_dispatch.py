@@ -201,10 +201,16 @@ def _parse_allowed_subagents(tools: list[str]) -> list[str] | None:
 
 
 def _is_path_outside_cwd(file_path: str, cwd: str) -> bool:
-    """Check that file_path is within cwd."""
+    """Check that file_path is within cwd.
+
+    Relative paths are resolved against cwd (not the orchestrator process cwd).
+    """
     try:
-        resolved = Path(file_path).resolve()
         cwd_resolved = Path(cwd).resolve()
+        if Path(file_path).is_absolute():
+            resolved = Path(file_path).resolve()
+        else:
+            resolved = (cwd_resolved / file_path).resolve()
         return not (str(resolved).startswith(str(cwd_resolved) + "/") or resolved == cwd_resolved)
     except Exception:
         return True
@@ -221,6 +227,7 @@ class AgentConfig:
     tools: list[str]
     model: str
     system_prompt: str
+    mcp_servers: list[str] | None = None  # e.g. ["playwright"]
 
 
 def load_agent_config(agents_dir: str, agent_name: str) -> AgentConfig:
@@ -251,12 +258,23 @@ def load_agent_config(agents_dir: str, agent_name: str) -> AgentConfig:
     model = _extract_yaml_str(frontmatter, "model") or "sonnet"
     tools = _extract_yaml_list(frontmatter, "tools") or ["Read", "Bash", "Grep", "Glob"]
 
+    # Parse mcpServers (YAML list with "- item" syntax)
+    mcp_servers = None
+    mcp_match = re.search(r'^mcpServers:\s*\n((?:\s+-\s+.+\n?)*)', frontmatter, re.MULTILINE)
+    if mcp_match:
+        mcp_servers = [
+            line.strip().lstrip("- ").strip()
+            for line in mcp_match.group(1).strip().split("\n")
+            if line.strip().startswith("-")
+        ]
+
     return AgentConfig(
         name=name,
         description=description,
         tools=tools,
         model=model,
         system_prompt=body.strip(),
+        mcp_servers=mcp_servers,
     )
 
 
@@ -328,8 +346,13 @@ class AgentDispatcher:
             if tool_name in ("Write", "Edit") and self.file_scope:
                 file_path = tool_input.get("file_path", "")
                 if file_path:
-                    # Normalize to relative path for comparison
-                    rel_path = os.path.relpath(file_path, cwd) if os.path.isabs(file_path) else file_path
+                    # Normalize to relative path against cwd for comparison
+                    if os.path.isabs(file_path):
+                        rel_path = os.path.relpath(file_path, cwd)
+                    else:
+                        # Resolve relative path against cwd, then back to relative
+                        abs_path = os.path.normpath(os.path.join(cwd, file_path))
+                        rel_path = os.path.relpath(abs_path, cwd)
                     scope_match = any(
                         rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
                         for s in self.file_scope
@@ -515,6 +538,8 @@ class AgentDispatcher:
             "model": model_id,
             "hooks": self._make_hooks(agent),
         }
+        if config.mcp_servers:
+            opts["mcp_servers"] = config.mcp_servers
         if max_turns is not None:
             opts["max_turns"] = max_turns
 

@@ -177,7 +177,8 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
         "blocked": blocked,
         "interrupted": interrupted,
         "total": total,
-        "overall": "PASS" if blocked == 0 and interrupted == 0 and total > 0 else "INCOMPLETE",
+        "failed": sum(1 for j in job_results if j.get("status") in ("FAIL", "ERROR")),
+        "overall": "PASS" if blocked == 0 and interrupted == 0 and total > 0 and all(j.get("status") not in ("FAIL", "ERROR") for j in job_results) else "INCOMPLETE",
     }
 
     result = {"run_id": run_id, "jobs": job_results, "summary": summary}
@@ -341,8 +342,9 @@ async def cmd_run_job(
         ))
         await bus.emit(JobStarted(job_id=job_id, command="run_job"))
 
-        # Load plan and find stage
-        plan_data = json.loads(Path(plan_path).read_text())
+        # Load plan and find stage (resolve relative paths against cwd)
+        resolved_plan = Path(plan_path) if Path(plan_path).is_absolute() else Path(cwd) / plan_path
+        plan_data = json.loads(resolved_plan.read_text())
         stage_def = None
         for s in plan_data.get("stages", []):
             if s["id"] == stage_id:
