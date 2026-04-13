@@ -85,6 +85,49 @@ def _agents_dir() -> str:
     return str(Path(__file__).parent.parent / "agents")
 
 
+def _load_context(cwd: str, run_id: str, level: str = "full") -> str:
+    """Load accumulated SharedContext at different detail levels.
+
+    Levels:
+      - "full": All context files — for implementer
+      - "changed_files": Only plan + job results (no verbose output) — for test-engineer
+      - "summary": One-line status per job — for documenter, reviewer
+    """
+    context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
+    if not context_dir.exists():
+        return ""
+
+    if level == "full":
+        parts = []
+        for f in sorted(context_dir.glob("*.md")):
+            parts.append(f.read_text())
+        return "\n\n".join(parts)
+
+    if level == "changed_files":
+        parts = []
+        plan_file = context_dir / "plan.md"
+        if plan_file.exists():
+            parts.append(plan_file.read_text())
+        # Include job results but only status + file info, not verbose output
+        for f in sorted(context_dir.glob("job-*.md")):
+            content = f.read_text()
+            # Take only the first few lines (status + test summary)
+            lines = content.strip().split("\n")[:5]
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    if level == "summary":
+        parts = []
+        for f in sorted(context_dir.glob("*.md")):
+            content = f.read_text()
+            # Take only the header line from each file
+            first_line = content.strip().split("\n")[0] if content.strip() else ""
+            parts.append(first_line)
+        return "\n".join(parts)
+
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # run_start
 # ---------------------------------------------------------------------------
@@ -293,12 +336,8 @@ async def cmd_run_job(
             estimated_turns=stage_def.get("estimated_turns", 0),
         )
 
-        # Load accumulated context from prior jobs
-        context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
-        task_context = ""
-        if context_dir.exists():
-            for ctx_file in sorted(context_dir.glob("*.md")):
-                task_context += ctx_file.read_text() + "\n\n"
+        # Load accumulated context — full detail for implementer
+        task_context = _load_context(cwd, run_id, level="full")
 
         # Dispatch — file_scope limits Write/Edit to stage files (for parallel safety)
         from sdk.agent_dispatch import AgentDispatcher
@@ -507,12 +546,8 @@ async def cmd_document(
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
 
-        # Load context for documenter
-        context = ""
-        context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
-        if context_dir.exists():
-            for ctx_file in sorted(context_dir.glob("*.md")):
-                context += ctx_file.read_text() + "\n\n"
+        # Summary-level context for documenter (doesn't need verbose details)
+        context = _load_context(cwd, run_id, level="summary")
 
         prompt = (
             f"{context}\n\n"
