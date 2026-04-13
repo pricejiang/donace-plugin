@@ -227,6 +227,16 @@ async def cmd_plan(
         ))
         _write_job_result(cwd, run_id, job_id, {"command": "plan", "status": "PASS", "plan": plan_json})
 
+        # Write plan context for subsequent jobs
+        context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        plan_ctx = f"# Plan: {task}\n\n"
+        for s in plan_json["stages"]:
+            plan_ctx += f"## {s['id']}: {s['name']}\n"
+            plan_ctx += f"- Files: {', '.join(s['files']) if s['files'] else 'TBD'}\n"
+            plan_ctx += f"- Dependencies: {', '.join(s['dependencies']) if s['dependencies'] else 'None'}\n\n"
+        (context_dir / "plan.md").write_text(plan_ctx)
+
         print(json.dumps(plan_json, indent=2))
         return plan_json
 
@@ -406,6 +416,18 @@ async def cmd_verify(
 
         job_result = {"command": "verify", "status": status, "results": results}
         _write_job_result(cwd, run_id, job_id, job_result)
+
+        # Write verify context
+        context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
+        context_dir.mkdir(parents=True, exist_ok=True)
+        verify_ctx = f"## Verification: {status}\n"
+        if "test" in results:
+            t = results["test"]
+            verify_ctx += f"- Tests: {t.get('passed', 0)} passed, {t.get('failed', 0)} failed\n"
+        if "codex" in results:
+            verify_ctx += f"- Codex: {'issues found' if results['codex'].get('has_issues') else 'clean'}\n"
+        (context_dir / f"verify-{job_id}.md").write_text(verify_ctx)
+
         print(json.dumps(job_result, indent=2))
         return job_result
 
