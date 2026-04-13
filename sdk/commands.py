@@ -186,6 +186,28 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
     result_path = run_dir / "result.json"
     result_path.write_text(json.dumps(result, indent=2))
 
+    # Update routing hints
+    try:
+        from sdk.run_validator import update_routing_hints, RunReport
+        from sdk.orchestrator import detect_stack
+        stack = detect_stack(cwd)
+        codex_had_issues = any(
+            j.get("codex_result", {}).get("has_issues") for j in job_results
+        )
+        runtime_had_issues = any(
+            j.get("runtime_result", {}).get("status") == "FAIL" for j in job_results
+        )
+        total_fix_loops = sum(j.get("fix_attempts", 0) for j in job_results)
+        update_routing_hints(
+            report=RunReport(),  # Minimal — hints only need aggregate stats
+            stack=stack,
+            codex_had_issues=codex_had_issues,
+            runtime_had_issues=runtime_had_issues,
+            fix_loops_used=total_fix_loops,
+        )
+    except Exception:
+        pass  # Non-critical — don't fail run_complete for hints
+
     bus, emitter = await _setup_bus(run_id, dashboard_url)
     try:
         await bus.emit(RunCompleted(result_summary=json.dumps(summary)))

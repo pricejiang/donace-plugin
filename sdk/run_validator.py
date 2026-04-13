@@ -236,3 +236,84 @@ def validate_run(
             ))
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# Routing hints — accumulate across runs for team-lead reference
+# ---------------------------------------------------------------------------
+
+def _hints_path() -> str:
+    """Default routing hints file path."""
+    import os
+    plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if plugin_data:
+        base = plugin_data
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".claude", "plugins", "data", "donace")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "routing_hints.json")
+
+
+def load_routing_hints(stack: str | None = None) -> dict[str, Any]:
+    """Load routing hints for a tech stack. Returns empty dict if no data."""
+    import json
+    path = _hints_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    if stack and stack in data.get("stack_hints", {}):
+        return data["stack_hints"][stack]
+    return data
+
+
+def update_routing_hints(
+    report: RunReport,
+    stack: str | None,
+    codex_had_issues: bool,
+    runtime_had_issues: bool,
+    fix_loops_used: int,
+) -> None:
+    """Update routing hints after a run completes.
+
+    Uses exponential moving average — recent runs weighted more heavily.
+    """
+    import json
+    path = _hints_path()
+
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {"stack_hints": {}, "total_runs": 0}
+
+    data["total_runs"] = data.get("total_runs", 0) + 1
+
+    if stack:
+        hints = data["stack_hints"].setdefault(stack, {
+            "codex_useful_rate": 0.5,
+            "runtime_useful_rate": 0.5,
+            "avg_fix_loops": 1.0,
+        })
+
+        # Exponential moving average (alpha=0.3 — recent runs weighted more)
+        alpha = 0.3
+        hints["codex_useful_rate"] = round(
+            alpha * (1.0 if codex_had_issues else 0.0)
+            + (1 - alpha) * hints.get("codex_useful_rate", 0.5),
+            3,
+        )
+        hints["runtime_useful_rate"] = round(
+            alpha * (1.0 if runtime_had_issues else 0.0)
+            + (1 - alpha) * hints.get("runtime_useful_rate", 0.5),
+            3,
+        )
+        hints["avg_fix_loops"] = round(
+            alpha * fix_loops_used
+            + (1 - alpha) * hints.get("avg_fix_loops", 1.0),
+            2,
+        )
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
