@@ -239,6 +239,9 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
     except Exception:
         pass  # Non-critical — don't fail run_complete for hints
 
+    # Cleanup: screenshots and dev servers
+    _cleanup_after_run(cwd)
+
     bus, emitter = await _setup_bus(run_id, dashboard_url, cwd=cwd)
     try:
         await bus.emit(RunCompleted(result_summary=json.dumps(summary)))
@@ -246,6 +249,42 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
         return result
     finally:
         await _teardown(emitter)
+
+
+def _cleanup_after_run(cwd: str) -> None:
+    """Clean up artifacts left by runtime-verifier.
+
+    Only cleans up known safe targets:
+    - .playwright-mcp/ directory (Playwright MCP plugin's screenshot cache)
+    - Untracked *.png files (screenshots created during this run, not committed)
+    - Processes started by agents (tracked via .ai/runs/ pid files)
+    """
+    import subprocess
+
+    project = Path(cwd)
+
+    # 1. Delete .playwright-mcp/ screenshots (plugin-managed, always safe to clean)
+    playwright_dir = project / ".playwright-mcp"
+    if playwright_dir.is_dir():
+        for f in playwright_dir.glob("*.png"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    # 2. Delete untracked *.png at project root (not committed = not a project asset)
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "*.png"],
+            capture_output=True, text=True, cwd=cwd, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n"):
+            if line.strip():
+                f = project / line.strip()
+                if f.exists() and f.parent == project:
+                    f.unlink()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
 
 
 # ---------------------------------------------------------------------------
