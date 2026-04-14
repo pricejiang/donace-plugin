@@ -91,14 +91,21 @@ def _agents_dir() -> str:
     return str(Path(__file__).parent.parent / "agents")
 
 
+DEFAULT_DASHBOARD_URL = "ws://localhost:8741"
+
+
 def _resolve_dashboard_url(cwd: str, run_id: str, explicit_url: str | None) -> str | None:
-    """Resolve dashboard URL: explicit arg > persisted from run_start."""
+    """Resolve dashboard URL: explicit arg > persisted from run_start > default.
+
+    Falls back to ws://localhost:8741 so events always stream to dashboard
+    even if team-lead forgets --dashboard-url or skips run_start.
+    """
     if explicit_url:
         return explicit_url
     url_file = Path(cwd) / ".ai" / "runs" / run_id / "dashboard_url"
     if url_file.exists():
         return url_file.read_text().strip()
-    return None
+    return DEFAULT_DASHBOARD_URL
 
 
 def _load_context(cwd: str, run_id: str, level: str = "full") -> str:
