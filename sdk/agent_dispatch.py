@@ -541,13 +541,13 @@ class AgentDispatcher:
         except asyncio.TimeoutError:
             # disconnect() kills the CLI process and all its subagents
             try:
-                client.disconnect()
+                await client.disconnect()
             except Exception:
                 pass
             raise RuntimeError(f"agent={agent} timed out after {timeout}s")
         except Exception:
             try:
-                client.disconnect()
+                await client.disconnect()
             except Exception:
                 pass
             raise
@@ -587,7 +587,7 @@ class AgentDispatcher:
             raise RuntimeError(f"agent={agent} model={model_id}: {exc}") from exc
         finally:
             try:
-                client.disconnect()
+                await client.disconnect()
             except Exception:
                 pass
 
