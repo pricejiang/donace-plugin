@@ -527,8 +527,9 @@ class AgentDispatcher:
             "model": model_id,
             "hooks": self._make_hooks(agent),
         }
-        if config.mcp_servers:
-            opts["mcp_servers"] = config.mcp_servers
+        # MCP servers (e.g. playwright) are auto-loaded by Claude CLI from
+        # installed plugins. No need to pass them via SDK — the subprocess
+        # inherits the user's plugin configuration.
 
         options = ClaudeAgentOptions(**opts)
 
