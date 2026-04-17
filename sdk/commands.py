@@ -1140,7 +1140,13 @@ async def cmd_document(
                 "output": cards_output[:500],
             },
         }
-        _supersede_prior_jobs(cwd, run_id, "document", job_id)
+        # Only supersede when the new result represents forward progress.
+        # overall=ERROR means the core phase crashed before writing anything,
+        # so the rerun added zero new state — keep any prior PASS/PARTIAL
+        # intact instead of regressing a previously good run. Team-lead
+        # reruns to recover.
+        if overall != "ERROR":
+            _supersede_prior_jobs(cwd, run_id, "document", job_id)
         _write_job_result(cwd, run_id, job_id, job_result)
         print(json.dumps(job_result, indent=2))
         return job_result
