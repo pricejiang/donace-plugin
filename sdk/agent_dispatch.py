@@ -216,6 +216,125 @@ def _is_path_outside_cwd(file_path: str, cwd: str) -> bool:
         return True
 
 
+# Mass-mutating commands that walk directory trees. Banned under file_scope.
+_MASS_MUTATORS = (
+    "prettier --write",
+    "black ",
+    "rustfmt ",
+    "gofmt -w",
+    "cargo fmt",
+    "ruff format",
+    "ruff check --fix",
+    "rubocop -a",
+    "rubocop --autocorrect",
+)
+
+# Shell redirection: `cmd > file`, `cmd >> file`, `cmd 2> file`, `cmd &> file`.
+# Captures the file target, skipping fd duplicates like `2>&1`.
+_REDIR_RE = re.compile(r"(?:^|[^0-9&<>])(?:[0-9]|&)?>>?\s*([^\s|;&<>()`]+)")
+_SED_PERL_INPLACE_RE = re.compile(r"\b(?:sed|perl)\s+(?:-\S+\s+)*-(?:p)?i\b")
+
+# Shell operators that end a command's argument list when walking tokens.
+_SHELL_OPS = frozenset({"|", ";", "&&", "||", "&", "|&", ">", ">>", "<"})
+
+
+def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) -> str | None:
+    """Detect bash commands that write files outside `file_scope`.
+
+    Catches the common escape patterns — redirection, sed/perl -i, tee,
+    cp/mv destinations, and known mass-mutating formatters. Not a full
+    sandbox — unknown write patterns are allowed. Returns a reason string
+    if blocked, None if the command is safe (or unrecognized).
+    """
+    # 1. Mass-mutators walk trees — reject outright under file_scope
+    for needle in _MASS_MUTATORS:
+        if needle in command:
+            return (
+                f"'{needle.strip()}' can modify many files — "
+                f"disabled when file_scope is active (scope: {file_scope})"
+            )
+
+    write_targets: list[tuple[str, str]] = []  # (target, kind)
+
+    # 2a. Shell redirection
+    for m in _REDIR_RE.finditer(command):
+        target = m.group(1).strip("\"'")
+        if not target or target.startswith("&") or target.startswith("/dev/"):
+            continue
+        write_targets.append((target, "redirection"))
+
+    # Tokenize once for tee/sed/perl/cp/mv
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        tokens = []
+
+    # 2b. tee — walk ALL operands after `tee` until shell operator or end.
+    # Regex-only capture missed the second+ target (e.g., `tee ok.txt bad.txt`
+    # would pass scope check on ok.txt while silently writing bad.txt).
+    for i, tok in enumerate(tokens):
+        if tok != "tee":
+            continue
+        j = i + 1
+        while j < len(tokens):
+            arg = tokens[j]
+            if arg in _SHELL_OPS:
+                break
+            # Skip tee options: -a, -i, --append, etc.
+            if arg.startswith("-") and arg != "-":
+                j += 1
+                continue
+            if arg != "-":  # "-" means stdout, not a file
+                write_targets.append((arg, "tee"))
+            j += 1
+
+    # 2c. sed -i / perl -i / perl -pi — conventionally the last positional is the target.
+    # Look for the last non-flag token that looks like a filepath.
+    if _SED_PERL_INPLACE_RE.search(command):
+        for tok in reversed(tokens):
+            if tok and not tok.startswith("-") and ("/" in tok or "." in tok):
+                write_targets.append((tok, "sed/perl -i"))
+                break
+
+    # 2d. cp / mv / install — last positional is destination
+    for i, tok in enumerate(tokens):
+        if tok in ("cp", "mv", "install"):
+            rest = tokens[i + 1:]
+            pos = [t for t in rest if not t.startswith("-")]
+            if len(pos) >= 2:
+                write_targets.append((pos[-1], tok))
+
+    # 3. Validate each target against the scope.
+    # Note: Bash does NOT go through the Read/Write/Edit path-boundary
+    # check, so we also have to reject writes escaping cwd here.
+    cwd_abs = os.path.abspath(cwd)
+    for target, kind in write_targets:
+        if target.startswith("/dev/"):
+            continue
+        abs_path = (
+            os.path.normpath(target) if os.path.isabs(target)
+            else os.path.normpath(os.path.join(cwd_abs, target))
+        )
+        # Escape from the project root — Bash would otherwise slip through
+        if not (abs_path == cwd_abs or abs_path.startswith(cwd_abs + os.sep)):
+            return (
+                f"Bash {kind} writes '{abs_path}' outside project directory {cwd_abs}. "
+                f"All writes must stay inside the project."
+            )
+        rel = os.path.relpath(abs_path, cwd_abs)
+        in_scope = any(
+            rel == s or rel.startswith(s.rstrip("/") + "/")
+            for s in file_scope
+        )
+        if not in_scope:
+            return (
+                f"Bash {kind} writes '{rel}' outside file_scope {file_scope}. "
+                f"This stage must only write files listed in its plan."
+            )
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Agent markdown loading
 # ---------------------------------------------------------------------------
@@ -335,6 +454,14 @@ class AgentDispatcher:
                 blocked = _is_blocked_command(command)
                 if blocked:
                     return {"decision": "block", "reason": blocked}
+
+                # --- File scope: detect Bash writes outside the stage's files ---
+                # `is not None` (not truthy) so empty list = "no files in scope"
+                # = readonly mode where every write is blocked.
+                if self.file_scope is not None:
+                    scope_reason = _bash_writes_outside_scope(command, self.file_scope, cwd)
+                    if scope_reason:
+                        return {"decision": "block", "reason": scope_reason}
 
             # --- Security: path boundary check ---
             if tool_name in ("Read", "Write", "Edit"):
@@ -493,7 +620,10 @@ class AgentDispatcher:
         "documenter": "~5,000 output tokens",
     }
 
-    async def query(self, agent: str, prompt: str, model: str = "sonnet", **_: Any) -> str:
+    async def query(
+        self, agent: str, prompt: str, model: str = "sonnet",
+        tools: list[str] | None = None, **_: Any,
+    ) -> str:
         """Run an agent query using Claude Agent SDK.
 
         Uses ClaudeSDKClient (not sdk_query) so we can call disconnect()
@@ -503,6 +633,9 @@ class AgentDispatcher:
             agent: Agent name (matches agents/{name}.md)
             prompt: User prompt to send
             model: Model shortname override (opus/sonnet/haiku)
+            tools: Override the agent's declared tool list. Use this to
+                restrict tools further (e.g. strip Write/Edit for read-only
+                passes). None → use the agent's declared tools.
 
         Returns:
             The agent's final text response.
@@ -519,10 +652,11 @@ class AgentDispatcher:
         if budget:
             prompt = f"TOKEN BUDGET: {budget}. Focus on the specific files listed below.\n\n{prompt}"
 
+        allowed_tools = (tools if tools is not None else config.tools) + ["TodoWrite"]
         opts: dict[str, Any] = {
             "system_prompt": config.system_prompt,
             "cwd": self.cwd,
-            "allowed_tools": config.tools + ["TodoWrite"],
+            "allowed_tools": allowed_tools,
             "permission_mode": "bypassPermissions",
             "model": model_id,
             "hooks": self._make_hooks(agent),
@@ -669,12 +803,31 @@ class AgentDispatcher:
         except Exception:
             return "(unable to detect changed files)"
 
-    async def run_test_engineer(self, stage: Stage) -> dict:
-        """Dispatch test-engineer agent and parse structured output."""
+    async def run_test_engineer(self, stage: Stage, readonly: bool = False) -> dict:
+        """Dispatch test-engineer agent and parse structured output.
+
+        Args:
+            stage: Stage to test.
+            readonly: If True, the agent may only run existing tests — it cannot
+                write new test files. Used by `verify` to avoid mutating the
+                working tree during a supposedly read-only check.
+        """
         changed_files = await self._get_changed_files()
         # Check if test files already exist in the changed files
         test_files = [f for f in changed_files.splitlines() if 'test' in f.lower() or 'spec' in f.lower()]
-        if test_files:
+
+        if readonly:
+            prompt = (
+                f"Run the existing tests for this scope: {stage.name}\n\n"
+                f"Files changed:\n```\n{changed_files}\n```\n\n"
+                f"READ-ONLY MODE: Do NOT write or edit any files. Only run "
+                f"existing tests and report the result. If coverage is "
+                f"insufficient, note that in your output — do not create test files.\n\n"
+                f"After running the tests, output a summary line in this exact format:\n"
+                f"TEST_SUMMARY: passed=N failed=N\n\n"
+                f"This summary must reflect the actual test run results."
+            )
+        elif test_files:
             prompt = (
                 f"Run the existing tests for this stage: {stage.name}\n\n"
                 f"Files changed by the implementer:\n```\n{changed_files}\n```\n\n"
@@ -695,7 +848,12 @@ class AgentDispatcher:
                 f"TEST_SUMMARY: passed=N failed=N\n\n"
                 f"This summary must reflect the actual test run results."
             )
-        response = await self.query(agent="test-engineer", prompt=prompt, model="sonnet")
+
+        # In readonly mode, strip Write/Edit from the test-engineer's tool list
+        readonly_tools = ["Read", "Bash", "Grep", "Glob"] if readonly else None
+        response = await self.query(
+            agent="test-engineer", prompt=prompt, model="sonnet", tools=readonly_tools,
+        )
 
         # Parse structured output
         passed = 0

@@ -14,7 +14,7 @@ You are a senior software architect. Your job is to analyze the existing codebas
 1. **Explore** — Read existing code to understand patterns, conventions, and architecture
 2. **Identify** — Find 3+ similar features/components to learn from
 3. **Design** — Break the task into 3-5 sequential stages
-4. **Output** — Write the plan to `.ai/plans/current-plan.md` in this format:
+4. **Output** — Write the plan to the file path specified at the top of your prompt (format: `.ai/runs/<run-id>/plan.md`). If no path is given, fall back to `.ai/plans/current-plan.md`. Use this format:
 
 ```markdown
 # Implementation Plan: [Feature Name]
@@ -97,7 +97,7 @@ push notifications without polling. Use the existing auth middleware for connect
 - Prefer composition over inheritance, interfaces over singletons
 - Never propose new tools/libraries without strong justification
 - Keep plans concise — enough detail to execute, no fluff
-- Update **Status** in `.ai/plans/current-plan.md` as each stage progresses; remove the file when all stages are Complete
+- Update **Status** in the plan file (same path you wrote it to) as each stage progresses. The entire run directory is cleaned up as one unit by the orchestrator — don't delete the plan file yourself
 
 ## Stage Sizing (Critical)
 

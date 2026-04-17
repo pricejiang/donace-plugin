@@ -69,31 +69,55 @@ def _collect_failures(
 ) -> list[dict[str, Any]]:
     """Collect failures from verification results.
 
-    Same logic as sprint_loop.collect_failures():
-    test failures = error, codex/runtime = warning.
+    Verifier crashes (status=="error") are treated as blocking errors —
+    a silent crash used to return PASS, which masked real failures.
+    Test failures are always error. Codex/runtime failures are warnings,
+    but their crashes are errors (we never saw the verdict).
     """
     failures: list[dict[str, Any]] = []
 
-    if test_result.get("failed", 0) > 0:
+    # --- test-engineer ---
+    if test_result.get("status") == "error":
+        failures.append({
+            "source": "test-engineer",
+            "description": f"test-engineer crashed: {test_result.get('error', 'unknown')}",
+            "severity": "error",
+        })
+    elif test_result.get("failed", 0) > 0:
         failures.append({
             "source": "test-engineer",
             "description": test_result.get("output", "Test failures detected"),
             "severity": "error",
         })
 
-    if codex_result.get("has_issues"):
+    # --- codex review ---
+    if codex_result.get("status") == "error":
+        failures.append({
+            "source": "codex-review",
+            "description": f"codex-review crashed: {codex_result.get('error', 'unknown')}",
+            "severity": "error",
+        })
+    elif codex_result.get("has_issues"):
         failures.append({
             "source": "codex-review",
             "description": codex_result.get("output", "Issues found"),
             "severity": "warning",
         })
 
-    if runtime_result and runtime_result.get("status") == "FAIL":
-        failures.append({
-            "source": "runtime-verifier",
-            "description": runtime_result.get("output", "Runtime verification failed"),
-            "severity": "warning",
-        })
+    # --- runtime-verifier ---
+    if runtime_result:
+        if runtime_result.get("status") == "error":
+            failures.append({
+                "source": "runtime-verifier",
+                "description": f"runtime-verifier crashed: {runtime_result.get('error', 'unknown')}",
+                "severity": "error",
+            })
+        elif runtime_result.get("status") == "FAIL":
+            failures.append({
+                "source": "runtime-verifier",
+                "description": runtime_result.get("output", "Runtime verification failed"),
+                "severity": "warning",
+            })
 
     return failures
 

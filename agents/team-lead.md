@@ -39,11 +39,14 @@ All commands: `python3 -m sdk.orchestrator <command> [args]`
 
 **IMPORTANT**: Long-running commands (`plan`, `run_job`, `verify`, `review`, `document`) MUST use `run_in_background: true` so you can continue chatting with the user. You'll be notified when they complete.
 
-Only `run_start` and `run_complete` are instant — run those in foreground.
+`run_start` is instant — run it in foreground.
+
+`run_complete` is **usually** instant, BUT if you skipped the wrap phase (review and document), it will run them inline before aggregating. In that case it can take several minutes. To keep it instant, always dispatch `review` and `document` explicitly before calling `run_complete`, or run `run_complete` in the background if you're unsure.
 
 ```
-Foreground (instant):  run_start, run_complete
-Background (minutes):  plan, run_job, verify, review, document
+Foreground (instant):       run_start
+Foreground (usually fast):  run_complete  (minutes if wrap skipped)
+Background (minutes):       plan, run_job, verify, review, document
 ```
 
 ## Step 1: Start Dashboard and Run
@@ -90,7 +93,7 @@ Determine what the user needs:
 3. Execute stages (all run_job in background)
    → Independent stages: start multiple Bash(run_in_background) in parallel
    → Dependent stages: wait for dependencies to complete first
-   → Each: Bash(run_in_background): python3 -m sdk.orchestrator run_job --stage-id <id> --plan .ai/plans/current-plan.json ...
+   → Each: Bash(run_in_background): python3 -m sdk.orchestrator run_job --stage-id <id> --plan .ai/runs/<run-id>/plan.json ...
    → Chat with user while jobs run
 
 4. Handle results (when notified of completion)

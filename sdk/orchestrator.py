@@ -178,10 +178,20 @@ def is_empty_repo(cwd: str) -> bool:
     return True
 
 
-def check_for_resume(cwd: str) -> Plan | None:
-    """Check if .ai/plans/current-plan.md exists with incomplete stages."""
-    plan_path = Path(cwd) / ".ai" / "plans" / "current-plan.md"
+def check_for_resume(cwd: str, run_id: str) -> Plan | None:
+    """Check if .ai/runs/{run_id}/plan.md exists with incomplete stages.
+
+    Per-run scoping: the plan lives inside the run directory, so there is
+    no ambiguity about which run it belongs to. If the run completed,
+    result.json will exist alongside it — in that case we skip resume.
+    """
+    run_dir = Path(cwd) / ".ai" / "runs" / run_id
+    plan_path = run_dir / "plan.md"
     if not plan_path.exists():
+        return None
+
+    # If the run already completed, don't resume
+    if (run_dir / "result.json").exists():
         return None
 
     content = plan_path.read_text()
@@ -363,12 +373,26 @@ async def run_planner(task: str, bus: EventBus, dispatcher: AgentDispatcher) -> 
     return spec
 
 
-async def run_architect(spec: str, bus: EventBus, dispatcher: AgentDispatcher) -> Plan:
-    """Dispatch architect agent to produce a staged plan."""
+async def run_architect(
+    spec: str, bus: EventBus, dispatcher: AgentDispatcher, run_id: str
+) -> Plan:
+    """Dispatch architect agent to produce a staged plan.
+
+    The plan is written to .ai/runs/{run_id}/plan.md (scoped to this run).
+    The path is injected into the prompt so the architect agent writes
+    to the right location.
+    """
+    plan_rel = f".ai/runs/{run_id}/plan.md"
+    plan_file = Path(dispatcher.cwd) / ".ai" / "runs" / run_id / "plan.md"
+    plan_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Inject target path at top of prompt so architect writes to the right place
+    prompt = f"Write the plan to `{plan_rel}`.\n\nTask:\n{spec}"
+
     await bus.emit(AgentStarted(agent="architect", model="opus"))
     t0 = time.time()
     try:
-        plan_raw = await dispatcher.query(agent="architect", prompt=spec, model="opus")
+        plan_raw = await dispatcher.query(agent="architect", prompt=prompt, model="opus")
     except Exception as exc:
         await bus.emit(AgentFailed(agent="architect", error=str(exc)))
         # Fallback: single-stage plan
@@ -378,13 +402,10 @@ async def run_architect(spec: str, bus: EventBus, dispatcher: AgentDispatcher) -
         )
     await bus.emit(AgentCompleted(agent="architect", duration_s=round(time.time() - t0, 1)))
 
-    # Architect writes plan to .ai/plans/current-plan.md.
-    # The agent's return value is often a summary, not the full plan.
-    # Read the actual file if it exists.
-    plan_file = Path(dispatcher.cwd) / ".ai" / "plans" / "current-plan.md"
+    # Read the plan file the architect just wrote. Its return value is
+    # often a summary, not the full plan.
     if plan_file.exists():
         plan_content = plan_file.read_text("utf-8")
-        # Use file content if it has stage headers; otherwise fall back to agent output
         file_stages = _parse_plan_stages(plan_content)
         if file_stages:
             return Plan(stages=file_stages, raw=plan_content)
@@ -472,7 +493,7 @@ async def run_documenter(
         f"All context about what changed is in <run-context> above. "
         f"Do NOT explore the codebase to discover what changed — the context is complete.\n\n"
         f"Update all relevant project documentation: README.md, CLAUDE.md, CHANGELOG.md, "
-        f".ai/plans/current-plan.md, session log, and knowledge cards as needed."
+        f"the run's plan.md (marking completed stages), session log, and knowledge cards as needed."
     )
 
     await bus.emit(AgentStarted(agent="documenter", model="sonnet"))
@@ -560,28 +581,146 @@ def _find_incomplete_run(cwd: str) -> RunState | None:
 # Process lock
 # ---------------------------------------------------------------------------
 
+def _orchestrator_sig() -> str:
+    """Absolute path of this orchestrator.py — the exact file running.
+
+    Used as a process-identity fingerprint in the project lock file so
+    _pid_is_orchestrator can distinguish our orchestrator from some other
+    project's orchestrator.py after PID reuse.
+    """
+    return str(Path(__file__).resolve())
+
+
+def _process_cwd(pid: int) -> str | None:
+    """Return the working directory of a process by pid, or None if unknown.
+
+    Uses lsof on macOS (no /proc). On Linux we could read /proc/<pid>/cwd,
+    but lsof works there too and keeps the code portable.
+
+    The `-a` flag ANDs the pid and fd filters. Without it, lsof ORs them
+    and returns the cwd of EVERY process — a gotcha that quietly returned
+    wrong paths in the first draft of this helper.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    # lsof -F format: lines prefixed with field tag. `n` = name (path).
+    for line in result.stdout.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return line[1:].strip()
+    return None
+
+
+def _paths_equal(a: str, b: str) -> bool:
+    """Normalize and compare two paths."""
+    try:
+        return str(Path(a).resolve()) == str(Path(b).resolve())
+    except Exception:
+        return a == b
+
+
+_CWD_ARG_RE = re.compile(r"--cwd[=\s]+(\S+)")
+
+
+def _pid_is_orchestrator(pid: int, expected_sig: str, expected_cwd: str) -> bool:
+    """Check whether `pid` is running THIS orchestrator for THIS cwd.
+
+    Must pass TWO independent checks:
+      1. The process looks like an orchestrator (script path matches OR
+         module invocation marker is present in cmdline)
+      2. The process is operating on our cwd (lsof says cwd matches,
+         OR the argv has an explicit `--cwd /path` equal to ours)
+
+    Both gates close the holes from prior rounds: filename match alone
+    can be fooled by a different project using the same plugin install
+    path; substring-matching cwd in cmdline can fire on coincidence
+    (the sig path itself often contains the project cwd as a prefix).
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+
+    cmdline = result.stdout.strip()
+    if not cmdline:
+        return False
+
+    # Gate 1: orchestrator-shape check
+    looks_like_orchestrator = bool(
+        (expected_sig and expected_sig in cmdline)
+        or "-m sdk.orchestrator" in cmdline
+    )
+    if not looks_like_orchestrator:
+        return False
+
+    # Gate 2: cwd verification.
+    # Primary: lsof tells us the actual process cwd — authoritative.
+    # Fallback: parse `--cwd <path>` from argv (exact match, not substring).
+    proc_cwd = _process_cwd(pid)
+    if proc_cwd and _paths_equal(proc_cwd, expected_cwd):
+        return True
+    if expected_cwd:
+        m = _CWD_ARG_RE.search(cmdline)
+        if m and _paths_equal(m.group(1), expected_cwd):
+            return True
+
+    return False
+
+
 def _acquire_lock(cwd: str, run_id: str) -> Path:
-    """Acquire a project-level lock. Kill any stale orchestrator for this project."""
+    """Acquire a project-level lock. Kill any stale orchestrator for this project.
+
+    Before SIGKILL we verify the pid is still THIS orchestrator for THIS cwd
+    (not just any orchestrator.py). PIDs recycle fast on macOS, so a naive
+    kill by pid could hit an innocent process whose filename happens to match.
+    """
     lock_path = Path(cwd) / ".ai" / "runs" / ".lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    sig = _orchestrator_sig()
+    cwd_abs = str(Path(cwd).resolve())
 
     if lock_path.exists():
         try:
             lock_data = json.loads(lock_path.read_text())
             old_pid = lock_data.get("pid")
             old_run = lock_data.get("run_id", "unknown")
-            if old_pid:
-                # Check if process is still alive
-                os.kill(old_pid, 0)  # raises OSError if dead
-                # Still alive — kill it
-                print(f"Warning: killing stale orchestrator (pid={old_pid}, run={old_run})", file=sys.stderr)
-                os.kill(old_pid, 9)
-                import time as _time
-                _time.sleep(0.5)  # wait for process to die
-        except (OSError, json.JSONDecodeError, KeyError):
-            pass  # process already dead or lock corrupt — clean up
+            old_sig = lock_data.get("sig", sig)  # back-compat: assume ours if missing
+            old_cwd = lock_data.get("cwd", cwd_abs)
+            if old_pid and _pid_is_orchestrator(old_pid, old_sig, old_cwd):
+                print(
+                    f"Warning: killing stale orchestrator (pid={old_pid}, run={old_run})",
+                    file=sys.stderr,
+                )
+                try:
+                    os.kill(old_pid, 9)
+                    import time as _time
+                    _time.sleep(0.5)  # wait for process to die
+                except OSError:
+                    pass  # permission denied or race — overwrite lock anyway
+            # else: pid is dead, belongs to another program, or we can't tell —
+            # safe to just overwrite the lock
+        except (json.JSONDecodeError, KeyError):
+            pass  # lock corrupt — clean up by overwriting
 
-    lock_path.write_text(json.dumps({"pid": os.getpid(), "run_id": run_id}))
+    lock_path.write_text(json.dumps({
+        "pid": os.getpid(),
+        "run_id": run_id,
+        "sig": sig,
+        "cwd": cwd_abs,
+    }))
     return lock_path
 
 
@@ -701,7 +840,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             ]
             plan = Plan(stages=all_stages, raw=prev_run.plan_raw)
         else:
-            resume_plan = check_for_resume(cwd)
+            resume_plan = check_for_resume(cwd, run_id)
             if not resume_plan:
                 await bus.emit(PhaseStarted(phase="plan"))
                 t0 = time.time()
@@ -718,7 +857,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
 
                 # Architect (skip for trivial single-line fixes)
                 if task_class.needs_plan:
-                    plan = await run_architect(spec, bus, dispatcher)
+                    plan = await run_architect(spec, bus, dispatcher, run_id)
 
                     # Codex plan review (mandatory when plan exists)
                     review = await run_codex_plan_review(plan, bus, dispatcher)
@@ -730,6 +869,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
                             f"Revise plan based on review findings: {review.get('findings', [])}",
                             bus,
                             dispatcher,
+                            run_id,
                         )
                 else:
                     await bus.emit(AgentSkipped(agent="architect", reason=task_class.reason))
