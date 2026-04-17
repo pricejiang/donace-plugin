@@ -606,6 +606,11 @@ class AgentDispatcher:
         "runtime-verifier": 900,
         "typescript-reviewer": 300,
         "ios-reviewer": 300,
+        # Documenter touches 5-7 files (README, CLAUDE.md, CHANGELOG,
+        # plan.md status, session log). 300s was too tight — observed runs
+        # timed out mid-way through knowledge cards. cmd_document splits
+        # core docs and cards into two phases; each gets the full budget.
+        "documenter": 600,
     }
     DEFAULT_TIMEOUT = 300  # 5 minutes
 

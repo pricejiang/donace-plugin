@@ -473,6 +473,7 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
     interrupted = sum(1 for j in job_results if j.get("status") == "INTERRUPTED")
     failed = sum(1 for j in job_results if j.get("status") in ("FAIL", "ERROR"))
     needs_review = sum(1 for j in job_results if j.get("status") == "REVIEW")
+    partial = sum(1 for j in job_results if j.get("status") == "PARTIAL")
     total = len(job_results)
 
     summary = {
@@ -481,9 +482,11 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
         "interrupted": interrupted,
         "failed": failed,
         "needs_review": needs_review,
+        "partial": partial,
         "total": total,
-        # Only PASS when every job is PASS. REVIEW, BLOCKED, INTERRUPTED,
-        # FAIL, ERROR, or any other non-PASS status → INCOMPLETE.
+        # Only PASS when every job is PASS. REVIEW, PARTIAL, BLOCKED,
+        # INTERRUPTED, FAIL, ERROR, or any other non-PASS status →
+        # INCOMPLETE. Team-lead reads per-job details to decide severity.
         "overall": "PASS" if total > 0 and passed == total else "INCOMPLETE",
     }
 
@@ -992,12 +995,39 @@ async def cmd_review(
 # document
 # ---------------------------------------------------------------------------
 
+def _docs_touched_since(bus, mark_idx: int) -> list[str]:
+    """List Write/Edit targets emitted after mark_idx in the bus event log.
+
+    Used for partial-output detection when the documenter agent times out
+    or errors: files it did update before the crash still count as work.
+    """
+    touched: list[str] = []
+    events = bus.get_events()[mark_idx:]
+    for ev in events:
+        if ev.get("type") != "agent.tool_use":
+            continue
+        if ev.get("tool") not in ("Write", "Edit"):
+            continue
+        target = ev.get("target") or ""
+        if target and target not in touched:
+            touched.append(target)
+    return touched
+
+
 async def cmd_document(
     cwd: str,
     run_id: str,
     dashboard_url: str | None,
 ) -> dict:
-    """Update documentation. Dispatches documenter agent."""
+    """Update documentation in two phases.
+
+    Phase A (core): README, CLAUDE.md, CHANGELOG, plan.md status, session log.
+    Phase B (cards): .ai/cards/* knowledge cards.
+
+    Splitting lets us report PARTIAL when core docs land but cards don't —
+    previously a 300s timeout on the single-shot documenter would mark the
+    whole job ERROR even though most of the work was already on disk.
+    """
     job_id = f"job-document-{uuid.uuid4().hex[:8]}"
     bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
     lock_path = _register_job(cwd, run_id, job_id, command="document")
@@ -1009,22 +1039,94 @@ async def cmd_document(
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
 
-        # Summary-level context for documenter (doesn't need verbose details)
         context = _load_context(cwd, run_id, level="summary")
 
-        prompt = (
+        # ---- Phase A: core docs + session log ----
+        core_mark = len(bus.get_events())
+        core_prompt = (
             f"{context}\n\n"
-            "Update project documentation: README.md, CLAUDE.md, CHANGELOG.md, "
-            "and any knowledge cards in .ai/cards/."
+            "Phase 1 of 2: update the core project documentation only. "
+            "In scope: README.md, CLAUDE.md, CHANGELOG.md, plan.md status "
+            "fields, and the session log under .ai/sessions/. "
+            "Out of scope for this phase: knowledge cards under .ai/cards/ — "
+            "those are handled in a follow-up call. Do not touch them yet."
         )
-        result_text = await dispatcher.query("documenter", prompt, model="sonnet")
+        core_status = "PASS"
+        core_error: str | None = None
+        core_output = ""
+        try:
+            core_output = await dispatcher.query("documenter", core_prompt, model="sonnet")
+        except Exception as exc:
+            core_error = str(exc)
+            core_status = "PARTIAL" if _docs_touched_since(bus, core_mark) else "ERROR"
+        core_touched = _docs_touched_since(bus, core_mark)
+
+        # ---- Phase B: knowledge cards (only if core landed) ----
+        cards_mark = len(bus.get_events())
+        cards_status: str
+        cards_error: str | None = None
+        cards_output = ""
+        if core_status == "ERROR":
+            cards_status = "SKIPPED"
+        else:
+            cards_prompt = (
+                f"{context}\n\n"
+                "Phase 2 of 2: promote reusable insights from this run into "
+                "knowledge cards under .ai/cards/. "
+                "If the session log you just wrote has a 'Knowledge proposals' "
+                "section, use those; otherwise review the plan + run outcomes "
+                "and decide whether any insight meets the bar for a card. "
+                "If nothing qualifies, say so and exit — don't invent cards. "
+                "Do NOT re-edit README / CLAUDE.md / CHANGELOG / session log "
+                "— Phase 1 already handled those."
+            )
+            try:
+                cards_output = await dispatcher.query("documenter", cards_prompt, model="sonnet")
+                cards_status = "PASS"
+            except Exception as exc:
+                cards_error = str(exc)
+                cards_status = "PARTIAL" if _docs_touched_since(bus, cards_mark) else "ERROR"
+        cards_touched = _docs_touched_since(bus, cards_mark)
+
+        # ---- Aggregate ----
+        if core_status == "PASS" and cards_status == "PASS":
+            overall = "PASS"
+            summary = f"docs+cards: {len(core_touched)+len(cards_touched)} file(s) updated"
+        elif core_status == "PASS" and cards_status in ("SKIPPED",):
+            overall = "PASS"
+            summary = f"docs: {len(core_touched)} file(s) updated; cards skipped"
+        elif core_status in ("PASS", "PARTIAL") or cards_status == "PARTIAL":
+            overall = "PARTIAL"
+            summary = (
+                f"core={core_status} ({len(core_touched)} file(s)), "
+                f"cards={cards_status} ({len(cards_touched)} file(s))"
+            )
+        else:
+            overall = "ERROR"
+            summary = core_error or cards_error or "documenter failed"
 
         await bus.emit(JobCompleted(
-            job_id=job_id, command="document", status="PASS",
-            result_summary=result_text[:200],
+            job_id=job_id, command="document", status=overall,
+            result_summary=summary[:200],
         ))
 
-        job_result = {"command": "document", "status": "PASS", "output": result_text[:500]}
+        job_result = {
+            "command": "document",
+            "status": overall,
+            "summary": summary,
+            "core": {
+                "status": core_status,
+                "touched": core_touched,
+                "error": core_error,
+                "output": core_output[:500],
+            },
+            "cards": {
+                "status": cards_status,
+                "touched": cards_touched,
+                "error": cards_error,
+                "output": cards_output[:500],
+            },
+        }
         _write_job_result(cwd, run_id, job_id, job_result)
         print(json.dumps(job_result, indent=2))
         return job_result
