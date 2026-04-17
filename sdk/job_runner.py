@@ -129,6 +129,26 @@ def _failure_fingerprint(failures: list[dict]) -> frozenset:
     )
 
 
+def _extract_needs_context(text: str) -> str | None:
+    """Return the message if implementer raised NEEDS_CONTEXT, else None.
+
+    Matches a line 'NEEDS_CONTEXT: <msg>' anywhere in the response. Returns
+    the message portion (trimmed). Checks the last 2000 chars first since
+    the escape hatch is meant to be terminal output.
+    """
+    if not text:
+        return None
+    # Scan last 2000 chars (escape-hatch placement) then full text.
+    for chunk in (text[-2000:], text):
+        for line in chunk.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("NEEDS_CONTEXT:"):
+                msg = stripped[len("NEEDS_CONTEXT:"):].strip()
+                if msg:
+                    return msg
+    return None
+
+
 async def run_job(
     *,
     stage: Stage,
@@ -174,14 +194,18 @@ async def run_job(
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
-            f"The plan above lists this stage's Success Criteria, Tests, and Files. "
-            f"Use those as your target.\n\n"
-            f"SCOPE: Only modify files listed in this stage's plan. "
-            f"Do not explore or read files from other stages."
+            f"Look up this stage in the plan above. Use its Files to modify list "
+            f"as the path list to Read/Edit — do NOT Glob for them. Use its "
+            f"Success Criteria + Tests as your target.\n\n"
+            f"DO NOT run tests, typecheck, build, lint, or curl endpoints. "
+            f"Verifiers run after you return.\n\n"
+            f"If the plan is insufficient (missing Files list, vague Success "
+            f"Criteria), respond with a line 'NEEDS_CONTEXT: <what's missing>' "
+            f"and stop. Do not explore the codebase to compensate."
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
-        await query(agent="implementer", prompt=impl_prompt, model="sonnet")
+        impl_output = await query(agent="implementer", prompt=impl_prompt, model="sonnet")
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
@@ -190,6 +214,18 @@ async def run_job(
             unresolved=[f"Implementer failed: {exc}"],
             completed_steps=completed_steps,
         )
+
+    # Check for NEEDS_CONTEXT escape hatch — implementer signals plan is
+    # insufficient. Bubble to team-lead as BLOCKED so it can enrich the
+    # plan before a blind retry.
+    needs_context_msg = _extract_needs_context(impl_output)
+    if needs_context_msg:
+        return JobResult(
+            status="BLOCKED",
+            unresolved=[f"NEEDS_CONTEXT: {needs_context_msg}"],
+            completed_steps=completed_steps,
+        )
+
     completed_steps.append("implement")
 
     # --- 2. Verify (parallel) ---
@@ -267,8 +303,16 @@ async def run_job(
         t0 = time.time()
         try:
             fix_prompt = (
-                "Fix these issues:\n"
+                "The verifiers reported these issues:\n"
                 + "\n".join(f"- {f['description']}" for f in error_failures)
+                + "\n\nFix them by editing the relevant files. "
+                + "Do NOT run tests, typecheck, build, lint, or curl — "
+                + "verification already ran and will run again after you return. "
+                + "Do NOT re-explore the codebase with Glob/Grep/ls/find — "
+                + "read only the files mentioned in the failures above, "
+                + "apply the minimal edit that addresses each issue, and return. "
+                + "If a failure description is too vague to act on, respond with "
+                + "'NEEDS_CONTEXT: <what's missing>' and stop."
             )
             if task_context:
                 fix_prompt = f"{task_context}\n\n{fix_prompt}"

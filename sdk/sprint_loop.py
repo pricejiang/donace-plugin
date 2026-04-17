@@ -342,7 +342,18 @@ async def run_sprint_loop(
                 await bus.emit(AgentStarted(agent="implementer", model="sonnet", role="fix"))
                 t0 = time.time()
                 try:
-                    await query(agent="implementer", prompt=f"Fix these issues:\n" + "\n".join(failure_descriptions), model="sonnet")
+                    fix_prompt = (
+                        "The verifiers reported these issues:\n"
+                        + "\n".join(f"- {d}" for d in failure_descriptions)
+                        + "\n\nFix them by editing the relevant files. "
+                        + "Do NOT run tests, typecheck, build, lint, or curl. "
+                        + "Do NOT re-explore with Glob/Grep/ls/find — read only "
+                        + "the files named in the failures, apply the minimal "
+                        + "edit, and return. If a failure is too vague to act "
+                        + "on, respond with 'NEEDS_CONTEXT: <what's missing>' "
+                        + "and stop."
+                    )
+                    await query(agent="implementer", prompt=fix_prompt, model="sonnet")
                 except Exception as exc:
                     await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
                     warnings.append(f"Wave {wave_num} fix attempt {attempt} failed: {exc}")
@@ -459,10 +470,14 @@ async def _implement_stage(
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
-            f"The plan above lists this stage's Success Criteria, Tests, and Files. "
-            f"Use those as your target.\n\n"
-            f"SCOPE: Only modify files listed in this stage's plan. "
-            f"Do not explore or read files from other stages."
+            f"Look up this stage in the plan above. Use its Files to modify "
+            f"list as the path list to Read/Edit — do NOT Glob for them. Use "
+            f"its Success Criteria + Tests as your target.\n\n"
+            f"DO NOT run tests, typecheck, build, lint, or curl endpoints. "
+            f"Verifiers run after you return.\n\n"
+            f"If the plan is insufficient (missing Files list, vague Success "
+            f"Criteria), respond with a line 'NEEDS_CONTEXT: <what's missing>' "
+            f"and stop. Do not explore the codebase to compensate."
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
@@ -562,10 +577,14 @@ async def _run_single_stage(
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
-            f"The plan above lists this stage's Success Criteria, Tests, and Files. "
-            f"Use those as your target.\n\n"
-            f"SCOPE: Only modify files listed in this stage's plan. "
-            f"Do not explore or read files from other stages."
+            f"Look up this stage in the plan above. Use its Files to modify "
+            f"list as the path list to Read/Edit — do NOT Glob for them. Use "
+            f"its Success Criteria + Tests as your target.\n\n"
+            f"DO NOT run tests, typecheck, build, lint, or curl endpoints. "
+            f"Verifiers run after you return.\n\n"
+            f"If the plan is insufficient (missing Files list, vague Success "
+            f"Criteria), respond with a line 'NEEDS_CONTEXT: <what's missing>' "
+            f"and stop. Do not explore the codebase to compensate."
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
@@ -668,7 +687,18 @@ async def _run_single_stage(
         await bus.emit(AgentStarted(agent="implementer", model="sonnet", role="fix"))
         t0 = time.time()
         try:
-            await query(agent="implementer", prompt=f"Fix these issues:\n" + "\n".join(failure_descriptions), model="sonnet")
+            fix_prompt = (
+                "The verifiers reported these issues:\n"
+                + "\n".join(f"- {d}" for d in failure_descriptions)
+                + "\n\nFix them by editing the relevant files. "
+                + "Do NOT run tests, typecheck, build, lint, or curl. "
+                + "Do NOT re-explore with Glob/Grep/ls/find — read only "
+                + "the files named in the failures, apply the minimal "
+                + "edit, and return. If a failure is too vague to act "
+                + "on, respond with 'NEEDS_CONTEXT: <what's missing>' "
+                + "and stop."
+            )
+            await query(agent="implementer", prompt=fix_prompt, model="sonnet")
         except Exception as exc:
             await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
             warnings.append(f"Fix attempt {attempt} failed for {stage.name}: {exc}")
