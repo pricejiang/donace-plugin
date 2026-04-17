@@ -69,6 +69,27 @@ def _write_job_result(cwd: str, run_id: str, job_id: str, result: dict) -> Path:
     return path
 
 
+def _supersede_prior_jobs(cwd: str, run_id: str, command: str, current_job_id: str) -> None:
+    """Delete prior job-<command>-*.json files from this run.
+
+    Used for idempotent wrap-phase commands (plan, review, verify, document)
+    where the latest invocation represents the current intent. Without this,
+    a PARTIAL/ERROR/REVIEW job from an earlier attempt lingers in jobs/ and
+    blocks aggregate PASS after a successful retry.
+
+    Stage jobs are NOT superseded — each stage is unique work.
+    """
+    jobs_dir = Path(cwd) / ".ai" / "runs" / run_id / "jobs"
+    if not jobs_dir.exists():
+        return
+    for old in jobs_dir.glob(f"job-{command}-*.json"):
+        if old.stem != current_job_id:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
 def _worktree_snapshot(cwd: str) -> dict[str, tuple]:
     """Snapshot dirty-file state with content identity.
 
@@ -676,17 +697,7 @@ async def cmd_plan(
             job_id=job_id, command="plan", status=status,
             result_summary=f"{len(stages)} stages, codex: {codex_review.get('status', 'skipped')}",
         ))
-        # Supersede any prior plan job results from this run. When team-lead
-        # re-plans after a REVIEW, the previous REVIEW job would otherwise
-        # linger in jobs/ and block aggregate PASS forever.
-        jobs_dir = run_dir / "jobs"
-        if jobs_dir.exists():
-            for old in jobs_dir.glob("job-plan-*.json"):
-                if old.stem != job_id:
-                    try:
-                        old.unlink()
-                    except OSError:
-                        pass
+        _supersede_prior_jobs(cwd, run_id, "plan", job_id)
         _write_job_result(cwd, run_id, job_id, {"command": "plan", "status": status, "plan": plan_json})
 
         # Write the full plan.md (verbatim) into context so subsequent
@@ -911,6 +922,7 @@ async def cmd_verify(
 
         await bus.emit(JobCompleted(job_id=job_id, command="verify", status=status))
 
+        _supersede_prior_jobs(cwd, run_id, "verify", job_id)
         job_result = {"command": "verify", "status": status, "results": results}
         _write_job_result(cwd, run_id, job_id, job_result)
 
@@ -970,6 +982,7 @@ async def cmd_review(
             result_summary=result_text[:200],
         ))
 
+        _supersede_prior_jobs(cwd, run_id, "review", job_id)
         job_result = {"command": "review", "status": "PASS", "reviewer": reviewer, "findings": result_text}
         _write_job_result(cwd, run_id, job_id, job_result)
         print(json.dumps(job_result, indent=2))
@@ -1127,6 +1140,7 @@ async def cmd_document(
                 "output": cards_output[:500],
             },
         }
+        _supersede_prior_jobs(cwd, run_id, "document", job_id)
         _write_job_result(cwd, run_id, job_id, job_result)
         print(json.dumps(job_result, indent=2))
         return job_result
