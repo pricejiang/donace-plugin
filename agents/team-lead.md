@@ -17,7 +17,22 @@ The orchestrator is your sole execution tool. Every agent dispatch goes through 
 
 ## Orchestrator Commands
 
-All commands: `python3 -m sdk.orchestrator <command> [args]`
+All commands invoke the orchestrator script **by absolute path**:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" <command> [args]
+```
+
+**Do NOT use `python3 -m sdk.orchestrator`** — that requires cwd to be
+the plugin root, but your Bash tool runs in the user's project directory.
+The absolute-path form works from any cwd because `sdk/orchestrator.py`
+is self-bootstrapping (inserts plugin root into `sys.path`).
+
+For readability in this doc, examples use `$ORCH` as a shorthand:
+
+```bash
+ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
+```
 
 | Command | When to use | What it does internally |
 |---------|-------------|------------------------|
@@ -54,11 +69,11 @@ Background (minutes):       plan, run_job, verify, review, document
 Before doing anything else:
 
 ```bash
-# Start dashboard (if not running)
-cd ${CLAUDE_PLUGIN_ROOT} && python3 -m sdk.dashboard --port 8741 &
+# Start dashboard (if not running) — absolute path, no cd needed
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/dashboard.py" --port 8741 &
 
 # Start run
-python3 -m sdk.orchestrator run_start \
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_start \
   --run-id <generate-uuid> \
   --cwd <project-root> \
   --dashboard-url ws://localhost:8741
@@ -81,7 +96,7 @@ Determine what the user needs:
 
 ```
 1. Plan (run in background — takes minutes)
-   → Bash(run_in_background): python3 -m sdk.orchestrator plan --task "..." --cwd <dir> --run-id <id>
+   → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" plan --task "..." --cwd <dir> --run-id <id>
    → Chat with user while waiting
    → When notified: read the returned JSON: stages, files, dependencies
 
@@ -93,7 +108,7 @@ Determine what the user needs:
 3. Execute stages (all run_job in background)
    → Independent stages: start multiple Bash(run_in_background) in parallel
    → Dependent stages: wait for dependencies to complete first
-   → Each: Bash(run_in_background): python3 -m sdk.orchestrator run_job --stage-id <id> --plan .ai/runs/<run-id>/plan.json ...
+   → Each: Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_job --stage-id <id> --plan .ai/runs/<run-id>/plan.json ...
    → Chat with user while jobs run
 
 4. Handle results (when notified of completion)
@@ -102,19 +117,19 @@ Determine what the user needs:
    → INTERRUPTED: check what was completed, decide next step
 
 5. After all stages (in background)
-   → Bash(run_in_background): python3 -m sdk.orchestrator verify --agents "test,codex"
-   → Bash(run_in_background): python3 -m sdk.orchestrator review (if significant changes)
-   → Bash(run_in_background): python3 -m sdk.orchestrator document (if user-facing changes)
+   → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" verify --agents "test,codex"
+   → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" review (if significant changes)
+   → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" document (if user-facing changes)
 
 6. Complete
-   → python3 -m sdk.orchestrator run_complete --run-id <id> --cwd <dir>
+   → python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_complete --run-id <id> --cwd <dir>
    → Report to user: what was built, what passed, what blocked
 ```
 
 ### Simple Task Flow
 
 ```
-python3 -m sdk.orchestrator run_job \
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_job \
   --stage-id ad-hoc \
   --plan <write-inline-plan-json> \
   --cwd <dir> \
@@ -131,8 +146,8 @@ For ad-hoc tasks without a plan file, write a minimal plan JSON:
 ### Review / Document Flow
 
 ```
-python3 -m sdk.orchestrator review --cwd <dir> --run-id <id> --reviewer typescript
-python3 -m sdk.orchestrator document --cwd <dir> --run-id <id>
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" review --cwd <dir> --run-id <id> --reviewer typescript
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" document --cwd <dir> --run-id <id>
 ```
 
 ## Decision Making

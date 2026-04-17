@@ -18,6 +18,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Allow running as a script from any cwd:
+#   python3 /abs/path/to/sdk/dashboard.py ...
+# Without this, `-m sdk.dashboard` requires cwd to be plugin root. Using
+# an absolute script path from team-lead is much simpler.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 try:
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, HTMLResponse

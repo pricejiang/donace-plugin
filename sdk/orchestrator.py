@@ -18,6 +18,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# Allow running as a script from any cwd:
+#   python3 /abs/path/to/sdk/orchestrator.py ...
+# Without this, `from sdk.X import Y` below fails unless cwd happens to
+# be the plugin root. team-lead dispatches from the user's project cwd,
+# so making this script self-bootstrapping is the only robust option.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from sdk.events import (
     AgentCompleted,
     AgentFailed,
