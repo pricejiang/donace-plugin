@@ -586,16 +586,18 @@ def _cleanup_after_run(cwd: str, run_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def cmd_plan(
-    task: str,
     cwd: str,
     run_id: str,
     dashboard_url: str | None,
-    skip_planner: bool = False,
     skip_codex: bool = False,
 ) -> dict:
-    """Planning pipeline: planner -> architect -> codex plan review.
+    """Validate an existing plan.md, optionally run codex plan review, write plan.json sidecar.
 
-    Writes Markdown plan + JSON sidecar. Returns plan JSON.
+    Team-lead is responsible for writing `.ai/runs/<run_id>/plan.md`
+    before calling this — either by hand, or by dispatching a subagent
+    that uses the superpowers:writing-plans skill. This command does no
+    LLM planning of its own — it's pure parse + validate + optional
+    codex review. Cost: ~3K tokens (codex) vs ~30K previously.
     """
     job_id = f"job-plan-{uuid.uuid4().hex[:8]}"
     bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
@@ -605,33 +607,43 @@ async def cmd_plan(
         await bus.emit(JobRegistered(job_id=job_id, command="plan", pid=os.getpid()))
         await bus.emit(JobStarted(job_id=job_id, command="plan"))
 
-        from sdk.agent_dispatch import AgentDispatcher
-        from sdk.orchestrator import run_planner, run_architect, run_codex_plan_review
+        run_dir = Path(cwd) / ".ai" / "runs" / run_id
+        plan_file = run_dir / "plan.md"
+        if not plan_file.exists():
+            raise RuntimeError(
+                f"No plan at {plan_file}. Team-lead must write the plan "
+                f"before calling `plan`. Use the template in agents/team-lead.md, "
+                f"or dispatch a subagent that invokes superpowers:writing-plans."
+            )
 
-        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
+        # Parse stages from the plan team-lead wrote
+        from sdk.orchestrator import _parse_plan_stages
+        plan_content = plan_file.read_text("utf-8")
+        stages = _parse_plan_stages(plan_content)
+        if not stages:
+            raise RuntimeError(
+                f"No parseable stages found in {plan_file}. Plan must use "
+                f"`## Stage N: Name` headers with **Files**, **Dependencies**, "
+                f"and **Status** fields. See agents/team-lead.md for the template."
+            )
 
-        # 1. Planner (optional)
-        spec = task
-        if not skip_planner:
+        # Optional codex plan review — the one LLM call in this pipeline
+        codex_review: dict[str, Any] = {"status": "skipped", "has_major_issues": False}
+        if not skip_codex:
             try:
-                spec = await run_planner(task, bus, dispatcher)
-            except Exception:
-                spec = task
+                from sdk.agent_dispatch import AgentDispatcher
+                dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
+                codex_review = await dispatcher.run_codex_plan_review(plan_content)
+            except Exception as exc:
+                codex_review = {
+                    "status": "error",
+                    "has_major_issues": False,
+                    "error": str(exc),
+                }
 
-        # 2. Architect (plan is written to .ai/runs/{run_id}/plan.md)
-        plan = await run_architect(spec, bus, dispatcher, run_id)
-
-        # 3. Codex plan review (optional)
-        codex_review: dict[str, Any] = {"has_major_issues": False}
-        if not skip_codex and plan.raw:
-            try:
-                codex_review = await run_codex_plan_review(plan, bus, dispatcher)
-            except Exception:
-                pass
-
-        # 4. Generate JSON sidecar
+        # Generate JSON sidecar
         plan_json = {
-            "task": task,
+            "plan_file": str(plan_file.relative_to(cwd) if plan_file.is_relative_to(cwd) else plan_file),
             "stages": [
                 {
                     "id": f"stage-{i+1}",
@@ -641,26 +653,27 @@ async def cmd_plan(
                     "has_user_facing_changes": s.has_user_facing_changes,
                     "estimated_turns": s.estimated_turns,
                 }
-                for i, s in enumerate(plan.stages)
+                for i, s in enumerate(stages)
             ],
             "codex_review": codex_review,
         }
 
-        # Plan JSON lives inside the run directory — one per run, no global state
-        run_dir = Path(cwd) / ".ai" / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "plan.json").write_text(json.dumps(plan_json, indent=2))
 
+        # Status reflects codex verdict: PASS if clean, REVIEW if issues flagged.
+        # Team-lead decides whether to revise or proceed.
+        status = "REVIEW" if codex_review.get("has_major_issues") else "PASS"
         await bus.emit(JobCompleted(
-            job_id=job_id, command="plan", status="PASS",
-            result_summary=f"{len(plan.stages)} stages",
+            job_id=job_id, command="plan", status=status,
+            result_summary=f"{len(stages)} stages, codex: {codex_review.get('status', 'skipped')}",
         ))
-        _write_job_result(cwd, run_id, job_id, {"command": "plan", "status": "PASS", "plan": plan_json})
+        _write_job_result(cwd, run_id, job_id, {"command": "plan", "status": status, "plan": plan_json})
 
         # Write plan context for subsequent jobs
-        context_dir = Path(cwd) / ".ai" / "runs" / run_id / "context"
+        context_dir = run_dir / "context"
         context_dir.mkdir(parents=True, exist_ok=True)
-        plan_ctx = f"# Plan: {task}\n\n"
+        plan_ctx = f"# Plan\n\nFrom: {plan_file}\n\n"
         for s in plan_json["stages"]:
             plan_ctx += f"## {s['id']}: {s['name']}\n"
             plan_ctx += f"- Files: {', '.join(s['files']) if s['files'] else 'TBD'}\n"

@@ -7,8 +7,6 @@
   },
   "agents": [
     "agents/team-lead.md",
-    "agents/planner.md",
-    "agents/architect.md",
     "agents/implementer.md",
     "agents/ui-designer.md",
     "agents/runtime-evaluator.md",

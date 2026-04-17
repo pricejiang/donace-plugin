@@ -37,7 +37,7 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 | Command | When to use | What it does internally |
 |---------|-------------|------------------------|
 | `run_start --run-id <id> --cwd <dir>` | Start of every session | Creates run directory, emits run.started |
-| `plan --task "..." --run-id <id> --cwd <dir>` | Complex tasks needing planning | planner → architect → codex plan review → returns plan JSON |
+| `plan --run-id <id> --cwd <dir>` | After you've written `.ai/runs/<id>/plan.md` | Parses plan, runs codex plan review, writes plan.json sidecar. Zero LLM planning — YOU write the plan. |
 | `run_job --stage-id <id> --plan <path> --run-id <id> --cwd <dir>` | Execute a stage | contract → implement → test → codex → fix loop |
 | `verify --run-id <id> --cwd <dir> --agents "test,codex"` | After all stages pass | Runs full verification (read-only) |
 | `review --run-id <id> --cwd <dir> --reviewer typescript` | Code review | Dispatches reviewer agent |
@@ -95,36 +95,89 @@ Determine what the user needs:
 ### Complex Task Flow
 
 ```
-1. Plan (run in background — takes minutes)
-   → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" plan --task "..." --cwd <dir> --run-id <id>
-   → Chat with user while waiting
-   → When notified: read the returned JSON: stages, files, dependencies
+1. Write the plan (YOU do this, not a sub-agent)
+   → For complex tasks: dispatch Agent(subagent_type="general-purpose") with
+     a prompt like: "Invoke the superpowers:writing-plans skill and produce
+     a plan for <task>. Write the plan to .ai/runs/<run-id>/plan.md using
+     the template in agents/team-lead.md §Plan template."
+   → For simple/obvious tasks: write plan.md yourself via the Write tool,
+     following the template below.
+   → Planner/architect sub-agents DO NOT EXIST anymore. There is no
+     orchestrator command that writes the plan for you. Writing the plan
+     is the strategist's job — that's you.
 
-2. Analyze plan
-   → Which stages have no dependencies? → Can run in parallel
-   → Do parallel stages have overlapping files? → Must run serially
-   → Present plan to user, get confirmation
+2. Validate + codex-review the plan
+   → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" plan --run-id <id> --cwd <dir>
+   → This reads your plan.md, parses stages, runs codex plan review, and
+     writes plan.json sidecar. It does NO LLM planning. It's ~3K tokens
+     (codex only) and finishes in seconds + codex review time.
+   → If status=REVIEW: codex flagged issues. Read the plan.json's
+     codex_review.findings, edit plan.md to address them, re-run `plan`.
+   → If status=PASS: proceed to Step 3.
 
-3. Execute stages (all run_job in background)
-   → Independent stages: start multiple Bash(run_in_background) in parallel
+3. Present plan to user, get confirmation
+
+4. Execute stages (all run_job in background)
+   → Read plan.json for stages, files, dependencies
+   → Independent stages (no overlapping files): start multiple Bash(run_in_background) in parallel
    → Dependent stages: wait for dependencies to complete first
    → Each: Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_job --stage-id <id> --plan .ai/runs/<run-id>/plan.json ...
    → Chat with user while jobs run
 
-4. Handle results (when notified of completion)
+5. Handle results (when notified of completion)
    → PASS: continue to next stage
    → BLOCKED: analyze failure details, decide retry or escalate to user
    → INTERRUPTED: check what was completed, decide next step
 
-5. After all stages (in background)
+6. After all stages (in background)
    → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" verify --agents "test,codex"
    → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" review (if significant changes)
    → Bash(run_in_background): python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" document (if user-facing changes)
 
-6. Complete
+7. Complete
    → python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_complete --run-id <id> --cwd <dir>
    → Report to user: what was built, what passed, what blocked
 ```
+
+### Plan template
+
+Every plan.md must use this format — the `plan` command parses stage
+headers (`## Stage N: Name`) and their `**Field**:` lines.
+
+```markdown
+# Implementation Plan: [Feature Name]
+
+## Overview
+[2-3 sentence summary]
+
+## Stage 1: [Specific deliverable name]
+**Goal**: [Concrete observable outcome]
+**Files to modify**: path/to/file.ts (new), path/to/other.ts (modify)
+**Dependencies**: None
+**Has user-facing changes**: Yes
+**Estimated turns**: 15
+**Success Criteria**: [What "done" looks like — testable]
+**Tests**: [Specific test cases]
+**Status**: Not Started
+
+## Stage 2: ...
+**Dependencies**: Stage 1
+...
+```
+
+Stage sizing:
+- ≤ 5 files per stage; split if more.
+- Stage name describes what it delivers ("Auth Guard", "Route Handlers"),
+  never just "Implementation".
+- Dependencies by stage number or name.
+
+### Plan revision
+
+If codex flags issues after `plan`:
+- Edit plan.md directly (fastest) OR re-dispatch the planning subagent
+  with the codex findings as additional context.
+- Re-run `plan` to revalidate. Cost: ~3K tokens per revision instead of
+  ~30K for the old pipeline.
 
 ### Simple Task Flow
 

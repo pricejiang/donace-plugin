@@ -742,6 +742,85 @@ def _release_lock(cwd: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Health check — fail-fast reachability probe for team-lead
+# ---------------------------------------------------------------------------
+
+def cmd_health(cwd: str | None = None) -> int:
+    """Verify orchestrator is reachable and its deps are installed.
+
+    team-lead runs this at session start. If exit code is non-zero, the
+    session aborts before run_start — fail fast instead of discovering
+    missing deps mid-workflow.
+
+    Returns 0 if all critical checks pass, 1 otherwise.
+    """
+    result: dict[str, Any] = {
+        "status": "ok",
+        "python": sys.version.split()[0],
+        "orchestrator": str(Path(__file__).resolve()),
+        "plugin_root": str(_REPO_ROOT),
+        "imports": {},
+        "optional": {},
+        "errors": [],
+        "warnings": [],
+    }
+
+    # Critical: internal sdk modules must import
+    for mod in ("sdk.events", "sdk.commands", "sdk.agent_dispatch", "sdk.job_runner"):
+        try:
+            __import__(mod)
+            result["imports"][mod] = "ok"
+        except Exception as exc:
+            result["imports"][mod] = f"error: {exc}"
+            result["errors"].append(f"cannot import {mod}: {exc}")
+
+    # Critical: claude-agent-sdk is the core dependency
+    try:
+        import claude_agent_sdk  # noqa: F401
+        result["claude_agent_sdk"] = "ok"
+    except ImportError as exc:
+        result["claude_agent_sdk"] = f"missing: {exc}"
+        result["errors"].append(
+            "claude-agent-sdk not installed — run: pip install claude-agent-sdk"
+        )
+
+    # Optional: dashboard deps (orchestrator works without them, just no UI)
+    for mod, purpose in (
+        ("websockets", "dashboard streaming"),
+        ("fastapi", "dashboard server"),
+        ("uvicorn", "dashboard server"),
+    ):
+        try:
+            __import__(mod)
+            result["optional"][mod] = "ok"
+        except ImportError:
+            result["optional"][mod] = "missing"
+            result["warnings"].append(f"{mod} missing (needed for {purpose})")
+
+    # Optional: verify cwd is writable (blocks run_start if not)
+    if cwd:
+        result["cwd"] = cwd
+        try:
+            runs_dir = Path(cwd) / ".ai" / "runs"
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            probe = runs_dir / ".health-probe"
+            probe.touch()
+            probe.unlink()
+            result["cwd_writable"] = True
+        except Exception as exc:
+            result["cwd_writable"] = False
+            result["errors"].append(f"cannot write to {cwd}/.ai/runs: {exc}")
+
+    if result["errors"]:
+        result["status"] = "error"
+    elif result["warnings"]:
+        result["status"] = "degraded"
+
+    print(json.dumps(result, indent=2))
+    return 1 if result["errors"] else 0
+
+
 async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive: bool = False) -> OrchestrationResult:
     """Execute the full orchestration pipeline (Phase 0-3).
 
@@ -1060,13 +1139,16 @@ def main() -> None:
     p.add_argument("--dashboard-url", default=None)
 
     # --- plan ---
-    p = subparsers.add_parser("plan", help="Run planning pipeline")
-    p.add_argument("--task", required=True)
+    p = subparsers.add_parser(
+        "plan",
+        help="Validate existing plan.md, run codex review, write plan.json sidecar. "
+             "Team-lead writes the plan first.",
+    )
     p.add_argument("--cwd", type=str, default=os.getcwd())
     p.add_argument("--run-id", required=True)
     p.add_argument("--dashboard-url", default=None)
-    p.add_argument("--skip-planner", action="store_true")
-    p.add_argument("--skip-codex", action="store_true")
+    p.add_argument("--skip-codex", action="store_true",
+                   help="Skip codex plan review (the only LLM step)")
 
     # --- run_job ---
     p = subparsers.add_parser("run_job", help="Execute a single stage")
@@ -1101,7 +1183,19 @@ def main() -> None:
     p.add_argument("--run-id", required=True)
     p.add_argument("--dashboard-url", default=None)
 
+    # --- health ---
+    p = subparsers.add_parser(
+        "health", help="Smoke-test orchestrator reachability and deps",
+    )
+    p.add_argument("--cwd", type=str, default=None,
+                   help="Optional project dir to check for writability")
+
     args = parser.parse_args()
+
+    # --- health (runs before importing sdk.commands so missing deps
+    #              produce a clean report instead of an ImportError) ---
+    if args.command == "health":
+        sys.exit(cmd_health(cwd=args.cwd))
 
     # --- Legacy mode: --task without subcommand ---
     if args.command is None and args.task:
@@ -1132,9 +1226,9 @@ def main() -> None:
         asyncio.run(cmd_run_complete(args.run_id, args.cwd, args.dashboard_url))
     elif args.command == "plan":
         asyncio.run(cmd_plan(
-            task=args.task, cwd=args.cwd, run_id=args.run_id,
+            cwd=args.cwd, run_id=args.run_id,
             dashboard_url=args.dashboard_url,
-            skip_planner=args.skip_planner, skip_codex=args.skip_codex,
+            skip_codex=args.skip_codex,
         ))
     elif args.command == "run_job":
         skip = set(s for s in args.skip_agents.split(",") if s)
