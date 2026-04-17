@@ -316,11 +316,28 @@ async def run_job(
             )
             if task_context:
                 fix_prompt = f"{task_context}\n\n{fix_prompt}"
-            await query(agent="implementer", prompt=fix_prompt, model="sonnet")
+            fix_output = await query(agent="implementer", prompt=fix_prompt, model="sonnet")
             await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
         except Exception as exc:
             await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
             break
+
+        needs_context_msg = _extract_needs_context(fix_output)
+        if needs_context_msg:
+            unresolved = f"NEEDS_CONTEXT: {needs_context_msg}"
+            await bus.emit(FixLoopExhausted(
+                attempt=fix_attempts,
+                remaining_failures=[unresolved],
+            ))
+            return JobResult(
+                status="BLOCKED",
+                test_result=test_result,
+                codex_result=codex_result,
+                runtime_result=runtime_result,
+                fix_attempts=fix_attempts,
+                unresolved=[unresolved],
+                completed_steps=completed_steps,
+            )
 
         # Re-verify: only tests (codex/runtime don't change between fix iterations)
         if "test" not in skip_agents:

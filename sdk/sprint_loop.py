@@ -97,6 +97,49 @@ def _failure_fingerprint(failures: list[dict[str, Any]]) -> frozenset[tuple[str,
     )
 
 
+class _NeedsContextError(Exception):
+    """Raised when implementer says the stage/failure lacks enough context."""
+
+
+def _extract_needs_context(text: str) -> str | None:
+    """Return the message if implementer raised NEEDS_CONTEXT, else None."""
+    if not text:
+        return None
+    for chunk in (text[-2000:], text):
+        for line in chunk.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("NEEDS_CONTEXT:"):
+                msg = stripped[len("NEEDS_CONTEXT:"):].strip()
+                if msg:
+                    return msg
+    return None
+
+
+def _needs_context_text(message: str) -> str:
+    return f"NEEDS_CONTEXT: {message}"
+
+
+def _needs_context_result(
+    stage: Stage,
+    message: str,
+    *,
+    test_result: dict | None = None,
+    codex_result: dict | None = None,
+    runtime_result: dict | None = None,
+    fix_attempts: int = 0,
+) -> StageResult:
+    return StageResult(
+        name=stage.name,
+        status="BLOCKED",
+        test_result=test_result or {"passed": 0, "failed": 0},
+        codex_result=codex_result or {"status": "skipped", "has_issues": False, "output": ""},
+        runtime_result=runtime_result,
+        fix_attempts=fix_attempts,
+        unresolved=[_needs_context_text(message)],
+        recommendation="MUST_STOP",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sprint loop
 # ---------------------------------------------------------------------------
@@ -256,7 +299,14 @@ async def run_sprint_loop(
             # Collect successful implementations; record failures
             implemented: list[Stage] = []
             for stage, result in zip(ready, impl_results):
-                if isinstance(result, Exception):
+                if isinstance(result, _NeedsContextError):
+                    sr = _needs_context_result(stage, str(result))
+                    warnings.append(f"Implementation needs context for {stage.name}: {result}")
+                    _record(sr)
+                    blocked_names.add(stage.name)
+                    remaining.remove(stage)
+                    await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
+                elif isinstance(result, Exception):
                     sr = StageResult(
                         name=stage.name, status="BLOCKED",
                         test_result={"passed": 0, "failed": 0},
@@ -320,6 +370,7 @@ async def run_sprint_loop(
             failures = collect_failures(test_result, codex_result, runtime_result)
             fix_attempts = 0
             prev_fingerprint: frozenset[tuple[str, str]] | None = None
+            needs_context_msg: str | None = None
 
             for attempt in range(1, 4):
                 if not failures:
@@ -353,7 +404,7 @@ async def run_sprint_loop(
                         + "on, respond with 'NEEDS_CONTEXT: <what's missing>' "
                         + "and stop."
                     )
-                    await query(agent="implementer", prompt=fix_prompt, model="sonnet")
+                    fix_output = await query(agent="implementer", prompt=fix_prompt, model="sonnet")
                 except Exception as exc:
                     await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
                     warnings.append(f"Wave {wave_num} fix attempt {attempt} failed: {exc}")
@@ -361,11 +412,34 @@ async def run_sprint_loop(
                 else:
                     await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 
+                needs_context_msg = _extract_needs_context(fix_output)
+                if needs_context_msg:
+                    break
+
                 # Re-verify: only run tests in fix loop
                 await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
                 re_test_result = await _run_with_timing(run_test_engineer, wave_stage, bus, "test-engineer")
                 test_result = re_test_result
                 failures = collect_failures(test_result, codex_result, runtime_result)
+
+            if needs_context_msg:
+                unresolved = _needs_context_text(needs_context_msg)
+                warnings.append(f"Wave {wave_num} fix needs context: {needs_context_msg}")
+                await bus.emit(FixLoopExhausted(attempt=fix_attempts, remaining_failures=[unresolved]))
+                for stage in implemented:
+                    remaining.remove(stage)
+                    sr = _needs_context_result(
+                        stage,
+                        needs_context_msg,
+                        test_result=test_result,
+                        codex_result=codex_result,
+                        runtime_result=runtime_result,
+                        fix_attempts=fix_attempts,
+                    )
+                    _record(sr)
+                    blocked_names.add(stage.name)
+                    await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
+                continue
 
             if not failures and fix_attempts > 0:
                 await bus.emit(FixLoopResolved(attempt=fix_attempts))
@@ -481,13 +555,16 @@ async def _implement_stage(
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
-        await query(agent="implementer", prompt=impl_prompt, model="sonnet")
+        impl_output = await query(agent="implementer", prompt=impl_prompt, model="sonnet")
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
         warnings.append(f"Implementation failed for {stage.name}: {exc}")
         raise  # propagate to wave handler — don't verify half-finished work
     else:
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
+        needs_context_msg = _extract_needs_context(impl_output)
+        if needs_context_msg:
+            raise _NeedsContextError(needs_context_msg)
 
 
 async def _run_unified_verify(
@@ -588,7 +665,7 @@ async def _run_single_stage(
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
-        await query(agent="implementer", prompt=impl_prompt, model="sonnet")
+        impl_output = await query(agent="implementer", prompt=impl_prompt, model="sonnet")
     except Exception as exc:
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
         warnings.append(f"Implementation failed for {stage.name}: {exc}")
@@ -604,6 +681,12 @@ async def _run_single_stage(
         )
     else:
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
+
+    needs_context_msg = _extract_needs_context(impl_output)
+    if needs_context_msg:
+        warnings.append(f"Implementation needs context for {stage.name}: {needs_context_msg}")
+        await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
+        return _needs_context_result(stage, needs_context_msg)
 
     # --- 2. Verify (parallel) ---
     verify_tasks: list[asyncio.Task] = []
@@ -698,13 +781,28 @@ async def _run_single_stage(
                 + "on, respond with 'NEEDS_CONTEXT: <what's missing>' "
                 + "and stop."
             )
-            await query(agent="implementer", prompt=fix_prompt, model="sonnet")
+            fix_output = await query(agent="implementer", prompt=fix_prompt, model="sonnet")
         except Exception as exc:
             await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
             warnings.append(f"Fix attempt {attempt} failed for {stage.name}: {exc}")
             continue
         else:
             await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
+
+        needs_context_msg = _extract_needs_context(fix_output)
+        if needs_context_msg:
+            unresolved = _needs_context_text(needs_context_msg)
+            warnings.append(f"Fix attempt {attempt} needs context for {stage.name}: {needs_context_msg}")
+            await bus.emit(FixLoopExhausted(attempt=attempt, remaining_failures=[unresolved]))
+            await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
+            return _needs_context_result(
+                stage,
+                needs_context_msg,
+                test_result=test_result,
+                codex_result=codex_result,
+                runtime_result=runtime_result,
+                fix_attempts=fix_attempts,
+            )
 
         # Re-verify: only run tests. Codex review and runtime verification
         # don't need to rerun on every fix attempt — they check code quality
