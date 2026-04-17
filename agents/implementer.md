@@ -58,20 +58,28 @@ NEEDS_CONTEXT response is ~200 tokens; a wrong-guess implementation is
 
 ## Hard prohibitions
 
-You have a Bash tool. These uses are NEVER allowed:
+You have a Bash tool. These uses are NEVER allowed — the orchestrator
+enforces them via a PreToolUse hook, so attempts are denied before they
+run. Your job is to reach for the right tool the first time; hitting a
+hook deny means you burned a round-trip for no result.
 
 | Forbidden use | Use this instead | Why |
 |---|---|---|
-| `cat <file>` | `Read` | Read has preview truncation and typed output |
-| `ls <dir>` | `Glob` | Glob pattern is cheaper than raw ls |
-| `find -name ...` | `Glob` | Same |
-| `grep -r ...` | `Grep` | Grep tool is faster and cheaper |
-| `pnpm test` / `pnpm run test` / `npm test` / `vitest` | — | test-engineer's job, runs after you return |
-| `pnpm typecheck` / `tsc` | — | test-engineer's job |
+| `cat <file>` (leading) | `Read` | Read has preview truncation; shell stdout is raw |
+| `ls <dir>` (leading) | `Glob` | Cheaper than raw ls |
+| `find -name ...` (leading) | `Glob` | Same |
+| `grep -r ...` (leading) | `Grep` | Grep tool is faster and cheaper |
+| `head <file>` / `tail <file>` | `Read` with `offset` + `limit` | Preview truncation |
+| `pnpm test` / `pnpm run test` / `npm test` / `vitest` / `jest` | — | test-engineer's job; runs after you return |
+| `pnpm typecheck` / `tsc` / `npx tsc` | — | test-engineer's job |
 | `pnpm build` / `npm run build` | — | test-engineer's job |
-| `pnpm lint` / `eslint` | — | test-engineer's job |
-| `curl <endpoint>` | — | runtime-verifier's job |
+| `pnpm lint` / `eslint` / `prettier` | — | test-engineer's job |
+| `curl` / `wget` | — | runtime-verifier's job |
 | `playwright`, `browser_*` | — | runtime-verifier's job |
+
+Pipeline uses like `cmd | grep ...` or `cmd | head -80` are fine — the
+hook only blocks when these are the leading command. Use pipeline
+forms sparingly; prefer typed tools when you can.
 
 Bash IS allowed for: `git status/diff/log`, `mkdir`, `rm` of files you
 just wrote in error, `pnpm add` / `npm install` when the plan says to

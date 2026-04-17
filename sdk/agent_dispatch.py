@@ -183,6 +183,116 @@ def _is_blocked_command(command: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Per-agent Bash guardrails
+# ---------------------------------------------------------------------------
+# Every worker agent has a typed tool (Read/Glob/Grep) that beats shelling
+# out to `cat/ls/find/grep -r`. The shell forms bring back raw stdout with
+# no preview truncation — that's how implementer's #9 fix-loop ballooned
+# to 39K output, and how test-engineer's #3 burned 33K exploring tooling.
+
+# Leading commands that have a direct tool equivalent.
+_SHELL_READER_ALTERNATIVES = {
+    "cat": "Read",
+    "less": "Read",
+    "more": "Read",
+    "head": "Read (use the `limit` parameter for partial reads)",
+    "tail": "Read (use `offset` + `limit` for tail-like reads)",
+    "ls": "Glob",
+    "find": "Glob",
+}
+
+# Verification commands the IMPLEMENTER must not run — that work belongs
+# to test-engineer / runtime-verifier and happens AFTER implementer returns.
+_IMPLEMENTER_VERIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bpnpm\s+(?:--filter[=\s]\S+\s+)?(?:run\s+)?(?:test|typecheck|build|lint)(?:\b|:)"),
+     "pnpm test/typecheck/build/lint"),
+    (re.compile(r"\bnpm\s+(?:run\s+)?(?:test|build|lint)\b"),
+     "npm test/build/lint"),
+    (re.compile(r"\byarn\s+(?:run\s+)?(?:test|build|lint)\b"),
+     "yarn test/build/lint"),
+    (re.compile(r"\bnpx\s+(?:vitest|jest|tsc|playwright)\b"),
+     "npx vitest/jest/tsc/playwright"),
+    (re.compile(r"(?:^|[;&|]\s*)(?:vitest|jest|tsc|eslint|prettier)(?:\s|$)"),
+     "test runner / typechecker / linter"),
+    (re.compile(r"\bcurl\b"), "curl"),
+    (re.compile(r"\bwget\b"), "wget"),
+    (re.compile(r"\bplaywright\b"), "playwright"),
+]
+
+
+def _bash_forbidden_for_agent(agent_name: str, command: str) -> str | None:
+    """Agent-specific Bash guardrails. Returns deny reason or None.
+
+    Applies to worker agents (implementer, test-engineer) where we've
+    measured that shell alternatives to typed tools bloat output tokens.
+    Other agents (documenter, reviewers, runtime-verifier) pass through.
+    """
+    cmd = command.strip()
+    if not cmd:
+        return None
+
+    # Extract the leading command word, skipping env-var assignments like
+    # `A=1 cat file`. This is a simple tokeniser, not a full shell parser —
+    # it's intentionally blunt: a chained `&& cat` can still slip through,
+    # but that's unusual in practice and the prompt rules cover it.
+    tokens = cmd.split()
+    leading = ""
+    for tok in tokens:
+        if "=" in tok and not tok.startswith("-"):
+            # env-var assignment like FOO=bar; keep looking
+            continue
+        leading = tok
+        break
+
+    # --- Shared: shell readers have typed tool equivalents ---
+    if agent_name in ("implementer", "test-engineer"):
+        alt = _SHELL_READER_ALTERNATIVES.get(leading)
+        if alt:
+            return (
+                f"`{leading}` via Bash is not allowed for {agent_name} — use the {alt} tool. "
+                f"Shell readers bring back raw stdout with no preview truncation, which "
+                f"bloats your output context. Pipeline uses like `cmd | {leading}` are "
+                f"fine (not blocked here)."
+            )
+        # `grep -r` / `grep -R` as the leading command
+        if leading == "grep" and re.match(r"grep\s+[-\w]*[rR]\b", cmd):
+            return (
+                f"`grep -r/-R` via Bash is not allowed for {agent_name} — use the Grep tool. "
+                f"Pipeline uses like `cmd | grep ...` are fine."
+            )
+
+    # --- Implementer-only: no verification (test-engineer's / runtime-verifier's job) ---
+    if agent_name == "implementer":
+        for pattern, label in _IMPLEMENTER_VERIFY_PATTERNS:
+            if pattern.search(cmd):
+                return (
+                    f"implementer cannot run {label} — that is the verifier's job. "
+                    f"Verification runs automatically after you return. If the "
+                    f"verifier's failure report is too vague to act on, respond with "
+                    f"'NEEDS_CONTEXT: <what's missing>' instead of re-running tests."
+                )
+
+    return None
+
+
+# Paths where test-engineer is allowed to Write/Edit. Everything else is
+# denied — source code is implementer's territory. Caught in #3 of
+# run-phase1-auth-16a42e9b where test-engineer edited packages/shared/src/
+# schemas/auth.ts to add in-source tests instead of writing a proper test
+# file, which blurred the source/test boundary.
+_TEST_PATH_RE = re.compile(
+    r"(?:^|/)(?:tests?|__tests__|spec)/|"      # a test directory segment
+    r"\.(?:test|spec)\.[a-zA-Z0-9]+$"          # *.test.* or *.spec.*
+)
+
+
+def _is_test_writable_path(rel_path: str) -> bool:
+    """True if rel_path looks like a test file / lives under a test directory."""
+    normalized = rel_path.replace("\\", "/")
+    return bool(_TEST_PATH_RE.search(normalized))
+
+
 def _parse_allowed_subagents(tools: list[str]) -> list[str] | None:
     """Extract allowed subagent types from tools list.
 
@@ -455,6 +565,11 @@ class AgentDispatcher:
                 if blocked:
                     return {"decision": "block", "reason": blocked}
 
+                # --- Per-agent Bash guardrails (typed-tool steering + no-verify) ---
+                agent_bash_reason = _bash_forbidden_for_agent(agent_name, command)
+                if agent_bash_reason:
+                    return {"decision": "block", "reason": agent_bash_reason}
+
                 # --- File scope: detect Bash writes outside the stage's files ---
                 # `is not None` (not truthy) so empty list = "no files in scope"
                 # = readonly mode where every write is blocked.
@@ -469,26 +584,49 @@ class AgentDispatcher:
                 if file_path and _is_path_outside_cwd(file_path, cwd):
                     return {"decision": "block", "reason": f"path {file_path} is outside project directory {cwd}"}
 
-            # --- File scope: restrict Write/Edit to stage files (for parallel jobs) ---
-            if tool_name in ("Write", "Edit") and self.file_scope:
+            # --- File scope: restrict Write/Edit ---
+            if tool_name in ("Write", "Edit"):
                 file_path = tool_input.get("file_path", "")
                 if file_path:
                     # Normalize to relative path against cwd for comparison
                     if os.path.isabs(file_path):
                         rel_path = os.path.relpath(file_path, cwd)
                     else:
-                        # Resolve relative path against cwd, then back to relative
                         abs_path = os.path.normpath(os.path.join(cwd, file_path))
                         rel_path = os.path.relpath(abs_path, cwd)
-                    scope_match = any(
-                        rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
-                        for s in self.file_scope
-                    )
-                    if not scope_match:
-                        return {
-                            "decision": "block",
-                            "reason": f"file '{rel_path}' is outside this stage's file scope: {self.file_scope}",
-                        }
+
+                    # test-engineer: allowed to write test files OR files
+                    # explicitly listed in stage.files. Source-code edits
+                    # are implementer's turf. Blocks the #3 boundary
+                    # violation from run-phase1-auth where test-engineer
+                    # edited packages/shared/src/schemas/auth.ts.
+                    if agent_name == "test-engineer":
+                        in_stage_files = self.file_scope is not None and any(
+                            rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
+                            for s in self.file_scope
+                        )
+                        if not _is_test_writable_path(rel_path) and not in_stage_files:
+                            return {
+                                "decision": "block",
+                                "reason": (
+                                    f"test-engineer cannot write '{rel_path}' — "
+                                    f"only test files (under tests/, __tests__/, spec/, "
+                                    f"or *.test.* / *.spec.*) and files listed in "
+                                    f"stage.files are allowed. Source-code edits are "
+                                    f"implementer's job."
+                                ),
+                            }
+                    elif self.file_scope:
+                        # Non-test-engineer agents: restrict to stage files.
+                        scope_match = any(
+                            rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
+                            for s in self.file_scope
+                        )
+                        if not scope_match:
+                            return {
+                                "decision": "block",
+                                "reason": f"file '{rel_path}' is outside this stage's file scope: {self.file_scope}",
+                            }
 
             # --- Security: restrict subagent types ---
             # Agent(X) in frontmatter only enforces in --agent mode.
