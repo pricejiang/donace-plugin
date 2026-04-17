@@ -41,7 +41,7 @@ CHECKPOINTS: dict[str, Checkpoint] = {
     "pre-implement": Checkpoint(
         id="pre-implement",
         description="Before implementation starts",
-        context=["sprint contract", "stage plan"],
+        context=["stage plan"],
         options=["continue", "skip_stage"],
     ),
     "post-verify": Checkpoint(
@@ -82,7 +82,6 @@ class Stage:
 class StageResult:
     name: str
     status: str                          # "PASS", "BLOCKED", "SKIPPED"
-    contract: str
     test_result: dict                    # {"passed": int, "failed": int}
     codex_result: dict                   # {"status": str, "p1_findings": int, "findings": list}
     runtime_result: dict | None          # None if skipped
@@ -373,6 +372,8 @@ class AgentTokens(Event):
     agent: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
     def __post_init__(self) -> None:
         self.type = "agent.tokens"
@@ -646,7 +647,6 @@ class OrchestrationResult:
             stage_dict: dict[str, Any] = {
                 "name": sr.name,
                 "status": sr.status,
-                "contract": sr.contract,
                 "test_result": sr.test_result,
                 "codex_result": sr.codex_result,
                 "fix_attempts": sr.fix_attempts,

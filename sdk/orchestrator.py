@@ -891,7 +891,6 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
                     stages=[StageResult(
                         name="Project bootstrap",
                         status="NEEDS_CONTEXT",
-                        contract="",
                         test_result={"passed": 0, "failed": 0},
                         codex_result={"status": "skipped", "p1_findings": 0, "findings": []},
                         runtime_result=None,
@@ -1006,7 +1005,7 @@ async def run(task: str, cwd: str, dashboard_url: str | None = None, interactive
             query=dispatcher.query,
             run_test_engineer=dispatcher.run_test_engineer,
             run_codex_review=dispatcher.run_codex_review,
-            run_runtime_evaluator=dispatcher.run_runtime_evaluator,
+            run_runtime_verifier=dispatcher.run_runtime_verifier,
             task_context=task_context,
             completed_stage_names=completed_stage_names,
             on_stage_complete=lambda sr: _on_stage_complete(run_state, shared_ctx, sr),
@@ -1088,7 +1087,6 @@ def _on_stage_complete(run_state: RunState, shared_ctx: SharedContext, stage_res
     run_state.stages_completed.append({
         "name": stage_result.name,
         "status": stage_result.status,
-        "contract": stage_result.contract,
         "test_result": stage_result.test_result,
         "codex_result": stage_result.codex_result,
         "runtime_result": stage_result.runtime_result,
@@ -1158,8 +1156,9 @@ def main() -> None:
     p.add_argument("--run-id", required=True)
     p.add_argument("--dashboard-url", default=None)
     p.add_argument("--skip-agents", type=str, default="",
-                   help="Comma-separated: contract,test,codex,runtime")
-    p.add_argument("--max-fix-attempts", type=int, default=3)
+                   help="Comma-separated: test,codex,runtime")
+    p.add_argument("--max-fix-attempts", type=int, default=1,
+                   help="Fix attempts on first failure. Default 1 — escalate to team-lead instead of blindly retrying.")
 
     # --- verify ---
     p = subparsers.add_parser("verify", help="Run verification (read-only)")

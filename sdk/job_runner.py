@@ -1,7 +1,8 @@
-"""Single job runner: contract -> implement -> verify -> fix loop.
+"""Single job runner: implement -> verify -> fix loop.
 
 Extracted from sprint_loop.py::_run_single_stage(). Simplified:
 - No wave scheduling / dependency graph
+- No contract generation (team-lead's plan already carries Success Criteria)
 - No checkpoint wait_for_decision calls (team-lead handles decisions)
 - Checks bus.is_cancelled between each step for graceful interrupt
 - Returns JobResult dataclass
@@ -32,7 +33,6 @@ from sdk.events import (
 class JobResult:
     """Result of a single job execution."""
     status: str                          # "PASS", "BLOCKED", "INTERRUPTED"
-    contract: str = ""
     test_result: dict = field(default_factory=dict)
     codex_result: dict = field(default_factory=dict)
     runtime_result: dict | None = None
@@ -44,7 +44,6 @@ class JobResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
-            "contract": self.contract,
             "test_result": self.test_result,
             "codex_result": self.codex_result,
             "runtime_result": self.runtime_result,
@@ -59,7 +58,8 @@ class JobResult:
 AgentQueryFn = Callable[..., Awaitable[str]]
 TestRunnerFn = Callable[[Stage], Awaitable[dict]]
 CodexRunnerFn = Callable[[], Awaitable[dict]]
-RuntimeRunnerFn = Callable[[str], Awaitable[dict]]
+# (stage_name, task_context) -> dict
+RuntimeRunnerFn = Callable[[str, str], Awaitable[dict]]
 
 
 def _collect_failures(
@@ -137,12 +137,12 @@ async def run_job(
     query: AgentQueryFn,
     run_test_engineer: TestRunnerFn,
     run_codex_review: CodexRunnerFn,
-    run_runtime_evaluator: RuntimeRunnerFn | None,
+    run_runtime_verifier: RuntimeRunnerFn | None,
     task_context: str,
     skip_agents: set[str],
-    max_fix_attempts: int = 3,
+    max_fix_attempts: int = 1,
 ) -> JobResult:
-    """Execute a single job: contract -> implement -> verify -> fix loop.
+    """Execute a single job: implement -> verify -> fix loop.
 
     Checks bus.is_cancelled between each step for graceful interrupt.
 
@@ -153,55 +153,29 @@ async def run_job(
         query: Agent dispatch function.
         run_test_engineer: Test runner callback.
         run_codex_review: Codex review callback.
-        run_runtime_evaluator: Runtime verifier callback (None to skip).
-        task_context: SharedContext prompt prefix.
-        skip_agents: Agents to skip ("contract", "test", "codex", "runtime").
-        max_fix_attempts: Maximum fix loop iterations.
+        run_runtime_verifier: Runtime verifier callback (None to skip).
+        task_context: SharedContext prompt prefix (plan + prior job context).
+        skip_agents: Agents to skip ("test", "codex", "runtime").
+        max_fix_attempts: Maximum fix loop iterations. Default 1 — on first
+            failure, bubble up to team-lead for route-correction instead of
+            blindly retrying.
 
     Returns:
         JobResult with status PASS, BLOCKED, or INTERRUPTED.
     """
     completed_steps: list[str] = []
-    contract = ""
 
-    # --- 1. Contract ---
+    # --- 1. Implement ---
     if bus.is_cancelled:
-        return JobResult(status="INTERRUPTED", interrupted_at="contract", completed_steps=completed_steps)
-
-    if "contract" not in skip_agents:
-        await bus.emit(AgentStarted(agent="runtime-evaluator", model="opus", role="contract"))
-        t0 = time.time()
-        try:
-            contract_prompt = (
-                f"Write sprint contract for: {stage.name}\n\n"
-                f"The architect's plan already contains Success Criteria and Tests for this stage "
-                f"(included in the context below). Use those as your starting point — expand them "
-                f"into specific, testable criteria with exact HTTP status codes, error messages, "
-                f"and data assertions. Do NOT re-explore the codebase from scratch.\n\n"
-                f"Context:\n{task_context}"
-            ) if task_context else f"Write sprint contract for: {stage.name}"
-            contract = await query(agent="runtime-evaluator", prompt=contract_prompt, model="opus")
-            await bus.emit(AgentCompleted(agent="runtime-evaluator", duration_s=round(time.time() - t0, 1)))
-        except Exception as exc:
-            await bus.emit(AgentFailed(agent="runtime-evaluator", error=str(exc)))
-            contract = ""
-        completed_steps.append("contract")
-    else:
-        await bus.emit(AgentSkipped(agent="runtime-evaluator", reason="skipped by team-lead"))
-
-    # --- 2. Implement ---
-    if bus.is_cancelled:
-        return JobResult(status="INTERRUPTED", contract=contract, interrupted_at="implement", completed_steps=completed_steps)
+        return JobResult(status="INTERRUPTED", interrupted_at="implement", completed_steps=completed_steps)
 
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
-        )
-        if contract:
-            impl_prompt += f"Contract:\n{contract}\n\n"
-        impl_prompt += (
+            f"The plan above lists this stage's Success Criteria, Tests, and Files. "
+            f"Use those as your target.\n\n"
             f"SCOPE: Only modify files listed in this stage's plan. "
             f"Do not explore or read files from other stages."
         )
@@ -213,15 +187,14 @@ async def run_job(
         await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
         return JobResult(
             status="BLOCKED",
-            contract=contract,
             unresolved=[f"Implementer failed: {exc}"],
             completed_steps=completed_steps,
         )
     completed_steps.append("implement")
 
-    # --- 3. Verify (parallel) ---
+    # --- 2. Verify (parallel) ---
     if bus.is_cancelled:
-        return JobResult(status="INTERRUPTED", contract=contract, interrupted_at="verify", completed_steps=completed_steps)
+        return JobResult(status="INTERRUPTED", interrupted_at="verify", completed_steps=completed_steps)
 
     verify_coros = []
     verify_names = []
@@ -232,8 +205,8 @@ async def run_job(
     if "codex" not in skip_agents:
         verify_coros.append(run_codex_review())
         verify_names.append("codex-review")
-    if "runtime" not in skip_agents and run_runtime_evaluator and contract:
-        verify_coros.append(run_runtime_evaluator(contract))
+    if "runtime" not in skip_agents and run_runtime_verifier:
+        verify_coros.append(run_runtime_verifier(stage.name, task_context))
         verify_names.append("runtime-verifier")
 
     test_result: dict = {"passed": 0, "failed": 0, "output": ""}
@@ -272,7 +245,7 @@ async def run_job(
     while error_failures and fix_attempts < max_fix_attempts:
         if bus.is_cancelled:
             return JobResult(
-                status="INTERRUPTED", contract=contract,
+                status="INTERRUPTED",
                 test_result=test_result, codex_result=codex_result,
                 runtime_result=runtime_result, fix_attempts=fix_attempts,
                 interrupted_at="fix_loop", completed_steps=completed_steps,
@@ -329,7 +302,7 @@ async def run_job(
 
     if error_failures:
         return JobResult(
-            status="BLOCKED", contract=contract,
+            status="BLOCKED",
             test_result=test_result, codex_result=codex_result,
             runtime_result=runtime_result, fix_attempts=fix_attempts,
             unresolved=[f["description"] for f in error_failures],
@@ -338,7 +311,7 @@ async def run_job(
 
     completed_steps.append("done")
     return JobResult(
-        status="PASS", contract=contract,
+        status="PASS",
         test_result=test_result, codex_result=codex_result,
         runtime_result=runtime_result, fix_attempts=fix_attempts,
         completed_steps=completed_steps,

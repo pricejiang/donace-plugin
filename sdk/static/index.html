@@ -345,16 +345,23 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         const agent = ev.agent || 'unknown';
         const inp = ev.input_tokens || 0;
         const out = ev.output_tokens || 0;
+        const cacheCreate = ev.cache_creation_input_tokens || 0;
+        const cacheRead = ev.cache_read_input_tokens || 0;
+        const emptyUsage = () => ({ input: 0, output: 0, cacheCreate: 0, cacheRead: 0 });
         if (!state.tokenUsage) state.tokenUsage = {};
-        if (!state.tokenUsage[agent]) state.tokenUsage[agent] = { input: 0, output: 0 };
+        if (!state.tokenUsage[agent]) state.tokenUsage[agent] = emptyUsage();
         state.tokenUsage[agent].input += inp;
         state.tokenUsage[agent].output += out;
+        state.tokenUsage[agent].cacheCreate += cacheCreate;
+        state.tokenUsage[agent].cacheRead += cacheRead;
         // Also accumulate into parent if this is a subagent (agent name contains '/')
         if (agent.includes('/')) {
           const parent = agent.split('/')[0];
-          if (!state.tokenUsage[parent]) state.tokenUsage[parent] = { input: 0, output: 0 };
+          if (!state.tokenUsage[parent]) state.tokenUsage[parent] = emptyUsage();
           state.tokenUsage[parent].input += inp;
           state.tokenUsage[parent].output += out;
+          state.tokenUsage[parent].cacheCreate += cacheCreate;
+          state.tokenUsage[parent].cacheRead += cacheRead;
         }
         break;
       }
@@ -508,8 +515,14 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 
   function tokenLine(name) {
     const u = (state.tokenUsage || {})[name];
-    if (!u || (u.input === 0 && u.output === 0)) return '';
-    return `<div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">↳ ${formatTokens(u.input)} in · ${formatTokens(u.output)} out</div>`;
+    if (!u) return '';
+    const total = (u.input || 0) + (u.output || 0) + (u.cacheCreate || 0) + (u.cacheRead || 0);
+    if (total === 0) return '';
+    const cacheParts = [];
+    if (u.cacheCreate) cacheParts.push(`${formatTokens(u.cacheCreate)} cache+`);
+    if (u.cacheRead) cacheParts.push(`${formatTokens(u.cacheRead)} cache`);
+    const cacheStr = cacheParts.length ? ` · ${cacheParts.join(' · ')}` : '';
+    return `<div style="font-size: 10px; color: var(--text-dim); margin-top: 2px;">↳ ${formatTokens(u.input)} in · ${formatTokens(u.output)} out${cacheStr}</div>`;
   }
 
   function renderAgentCards() {
@@ -521,14 +534,24 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       // Only count top-level agents (no '/') to avoid double-counting subagent rollups
       return s;
     }, 0);
-    let runIn = 0, runOut = 0;
+    let runIn = 0, runOut = 0, runCacheCreate = 0, runCacheRead = 0;
     for (const [name, u] of Object.entries(allUsage)) {
-      if (!name.includes('/')) { runIn += u.input; runOut += u.output; }
+      if (!name.includes('/')) {
+        runIn += u.input || 0;
+        runOut += u.output || 0;
+        runCacheCreate += u.cacheCreate || 0;
+        runCacheRead += u.cacheRead || 0;
+      }
     }
-    if (runIn > 0 || runOut > 0) {
+    const runTotal = runIn + runOut + runCacheCreate + runCacheRead;
+    if (runTotal > 0) {
+      const cacheParts = [];
+      if (runCacheCreate) cacheParts.push(`${formatTokens(runCacheCreate)} cache+`);
+      if (runCacheRead) cacheParts.push(`${formatTokens(runCacheRead)} cache`);
+      const cacheStr = cacheParts.length ? ` · ${cacheParts.join(' · ')}` : '';
       html += `<div style="padding: 6px 10px; font-size: 11px; color: var(--text-dim); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between;">
         <span>Run total</span>
-        <span>${formatTokens(runIn)} in · ${formatTokens(runOut)} out</span>
+        <span>${formatTokens(runIn)} in · ${formatTokens(runOut)} out${cacheStr}</span>
       </div>`;
     }
 

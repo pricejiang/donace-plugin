@@ -603,7 +603,6 @@ class AgentDispatcher:
         "architect": 600,
         "implementer": 900,
         "test-engineer": 600,
-        "runtime-evaluator": 300,
         "runtime-verifier": 900,
         "typescript-reviewer": 300,
         "ios-reviewer": 300,
@@ -616,7 +615,7 @@ class AgentDispatcher:
     # Token budget hint per agent (injected into prompt). Not enforced — just guidance.
     AGENT_TOKEN_BUDGET: dict[str, str] = {
         "test-engineer": "~8,000 output tokens",
-        "runtime-evaluator": "~5,000 output tokens",
+        "runtime-verifier": "~5,000 output tokens",
         "documenter": "~5,000 output tokens",
     }
 
@@ -653,17 +652,24 @@ class AgentDispatcher:
             prompt = f"TOKEN BUDGET: {budget}. Focus on the specific files listed below.\n\n{prompt}"
 
         allowed_tools = (tools if tools is not None else config.tools) + ["TodoWrite"]
+        # MCP servers are inherited from the user's CLI plugin config. In
+        # bypassPermissions mode, any MCP tool the CLI knows about becomes
+        # callable unless explicitly disallowed. Block MCP tools the agent
+        # didn't opt into by listing them in its `tools:` frontmatter.
+        disallowed_tools: list[str] = []
+        MCP_OPT_IN_PREFIXES = ("mcp__plugin_playwright",)
+        for prefix in MCP_OPT_IN_PREFIXES:
+            if not any(t.startswith(prefix) for t in allowed_tools):
+                disallowed_tools.append(f"{prefix}*")
         opts: dict[str, Any] = {
             "system_prompt": config.system_prompt,
             "cwd": self.cwd,
             "allowed_tools": allowed_tools,
+            "disallowed_tools": disallowed_tools,
             "permission_mode": "bypassPermissions",
             "model": model_id,
             "hooks": self._make_hooks(agent),
         }
-        # MCP servers (e.g. playwright) are auto-loaded by Claude CLI from
-        # installed plugins. No need to pass them via SDK — the subprocess
-        # inherits the user's plugin configuration.
 
         options = ClaudeAgentOptions(**opts)
 
@@ -710,10 +716,16 @@ class AgentDispatcher:
                     final_text = getattr(message, "result", "") or ""
                     usage = getattr(message, "usage", None)
                     if usage:
+                        def _u(key: str) -> int:
+                            if isinstance(usage, dict):
+                                return usage.get(key, 0) or 0
+                            return getattr(usage, key, 0) or 0
                         await self.bus.emit(AgentTokens(
                             agent=agent,
-                            input_tokens=usage.get("input_tokens", 0) if isinstance(usage, dict) else getattr(usage, "input_tokens", 0),
-                            output_tokens=usage.get("output_tokens", 0) if isinstance(usage, dict) else getattr(usage, "output_tokens", 0),
+                            input_tokens=_u("input_tokens"),
+                            output_tokens=_u("output_tokens"),
+                            cache_creation_input_tokens=_u("cache_creation_input_tokens"),
+                            cache_read_input_tokens=_u("cache_read_input_tokens"),
                         ))
                     break  # ResultMessage = agent done, stop listening
         except RuntimeError:
@@ -1110,18 +1122,29 @@ class AgentDispatcher:
         return None
 
     # ------------------------------------------------------------------
-    # Runtime evaluator dispatch
+    # Runtime verifier dispatch
     # ------------------------------------------------------------------
 
-    async def run_runtime_evaluator(self, contract: str) -> dict:
-        """Dispatch runtime-verifier agent for black-box verification."""
-        prompt = (
-            f"Verify the following sprint contract against the running application:\n\n"
-            f"{contract}\n\n"
+    async def run_runtime_verifier(self, stage_name: str, task_context: str = "") -> dict:
+        """Dispatch runtime-verifier agent for black-box verification.
+
+        The verifier reads the plan's Success Criteria + Tests for this
+        stage from task_context and checks them against the running app.
+        """
+        prompt_parts: list[str] = []
+        if task_context:
+            prompt_parts.append(task_context)
+        prompt_parts.append(
+            f"Verify stage: {stage_name}\n\n"
+            f"Look up this stage in the plan above — specifically its Success Criteria "
+            f"and Tests sections — and verify each item against the running application. "
+            f"Report concrete evidence (HTTP status codes, DB rows, UI state) for each "
+            f"criterion.\n\n"
             f"After verification, output a summary line in this exact format:\n"
             f"VERIFICATION_SUMMARY: status=PASS|FAIL score=N/M\n\n"
             f"Where N is the number of criteria passed and M is total must-pass criteria."
         )
+        prompt = "\n\n".join(prompt_parts)
         response = await self.query(agent="runtime-verifier", prompt=prompt, model="opus")
 
         # Parse structured output

@@ -1,4 +1,4 @@
-"""Phase 2 inner loop: per-stage contract -> implement -> verify (parallel) -> fix loop -> gate check."""
+"""Phase 2 inner loop: per-stage implement -> verify (parallel) -> fix loop -> gate check."""
 from __future__ import annotations
 
 import asyncio
@@ -37,8 +37,8 @@ TestRunnerFn = Callable[[Stage], Awaitable[dict]]
 # run_codex_review() -> dict  {"status": str, "p1_findings": int, "findings": list}
 CodexRunnerFn = Callable[[], Awaitable[dict]]
 
-# run_runtime_evaluator(contract) -> dict  {"status": str, "score": str, "output": str}
-RuntimeRunnerFn = Callable[[str], Awaitable[dict]]
+# run_runtime_verifier(stage_name, task_context) -> dict  {"status": str, "score": str, "output": str}
+RuntimeRunnerFn = Callable[[str, str], Awaitable[dict]]
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ def collect_failures(
     # Runtime failures
     if runtime_result and runtime_result.get("status") == "FAIL":
         failures.append({
-            "source": "runtime-evaluator",
+            "source": "runtime-verifier",
             "description": runtime_result.get("output", "Runtime verification failed"),
             "severity": "warning",  # runtime failures are warnings by default
         })
@@ -112,7 +112,7 @@ async def run_sprint_loop(
     query: AgentQueryFn,
     run_test_engineer: TestRunnerFn,
     run_codex_review: CodexRunnerFn,
-    run_runtime_evaluator: RuntimeRunnerFn,
+    run_runtime_verifier: RuntimeRunnerFn,
     task_context: str = "",
     completed_stage_names: set[str] | None = None,
     on_stage_complete: OnStageCompleteFn = None,
@@ -126,7 +126,7 @@ async def run_sprint_loop(
         query: Function to dispatch an agent query.
         run_test_engineer: Function to run test engineer for a stage.
         run_codex_review: Function to run codex review.
-        run_runtime_evaluator: Function to run runtime evaluator with a contract.
+        run_runtime_verifier: Function to run runtime verifier (stage_name, task_context).
         task_context: Original task + plan text for agent prompts.
         completed_stage_names: Stages already completed in a previous run (skip these).
         on_stage_complete: Callback invoked after each stage completes (for state persistence).
@@ -187,7 +187,7 @@ async def run_sprint_loop(
         ]
         for s in newly_blocked:
             _record(StageResult(
-                name=s.name, status="SKIPPED", contract="",
+                name=s.name, status="SKIPPED",
                 test_result={"passed": 0, "failed": 0},
                 codex_result={"status": "skipped", "has_issues": False, "output": ""},
                 runtime_result=None, fix_attempts=0,
@@ -201,7 +201,7 @@ async def run_sprint_loop(
             # Circular dependency or all remaining stages blocked
             for s in remaining:
                 _record(StageResult(
-                    name=s.name, status="BLOCKED", contract="",
+                    name=s.name, status="BLOCKED",
                     test_result={"passed": 0, "failed": 0},
                     codex_result={"status": "skipped", "has_issues": False, "output": ""},
                     runtime_result=None, fix_attempts=0,
@@ -218,7 +218,7 @@ async def run_sprint_loop(
             idx = stages.index(stage)
             result = await _run_single_stage(
                 stage, idx, len(stages), bus, query,
-                run_test_engineer, run_codex_review, run_runtime_evaluator,
+                run_test_engineer, run_codex_review, run_runtime_verifier,
                 task_context, warnings,
             )
             _record(result)
@@ -231,7 +231,7 @@ async def run_sprint_loop(
                     # MUST_STOP: skip all remaining stages
                     for s in remaining:
                         _record(StageResult(
-                            name=s.name, status="SKIPPED", contract="",
+                            name=s.name, status="SKIPPED",
                             test_result={"passed": 0, "failed": 0},
                             codex_result={"status": "skipped", "has_issues": False, "output": ""},
                             runtime_result=None, fix_attempts=0,
@@ -242,7 +242,7 @@ async def run_sprint_loop(
             # Multiple independent stages — parallel implement, then unified verify.
             # This saves tokens: N implements + 1 verify instead of N × (implement + verify).
 
-            # Phase 1: parallel contract + implement
+            # Phase 1: parallel implement
             impl_tasks = []
             for stage in ready:
                 idx = stages.index(stage)
@@ -254,11 +254,11 @@ async def run_sprint_loop(
             impl_results = await asyncio.gather(*impl_tasks, return_exceptions=True)
 
             # Collect successful implementations; record failures
-            implemented: list[tuple[Stage, str]] = []  # (stage, contract)
+            implemented: list[Stage] = []
             for stage, result in zip(ready, impl_results):
                 if isinstance(result, Exception):
                     sr = StageResult(
-                        name=stage.name, status="BLOCKED", contract="",
+                        name=stage.name, status="BLOCKED",
                         test_result={"passed": 0, "failed": 0},
                         codex_result={"status": "skipped", "has_issues": False, "output": ""},
                         runtime_result=None, fix_attempts=0,
@@ -269,34 +269,32 @@ async def run_sprint_loop(
                     remaining.remove(stage)
                     await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
                 else:
-                    implemented.append((stage, result))
+                    implemented.append(stage)
 
             if not implemented:
                 continue  # all stages in this wave failed
 
             # Phase 2: unified verify (one test run + one codex review for all stages)
-            wave_stage_names = [s.name for s, _ in implemented]
-            has_user_facing = any(s.has_user_facing_changes for s, _ in implemented)
+            wave_stage_names = [s.name for s in implemented]
+            has_user_facing = any(s.has_user_facing_changes for s in implemented)
             # Use a synthetic stage that represents the entire wave
             wave_stage = Stage(
                 name=f"Wave {wave_num}: {', '.join(wave_stage_names)}",
                 has_user_facing_changes=has_user_facing,
             )
-            contracts = {s.name: c for s, c in implemented}
-            combined_contract = "\n\n".join(f"## {name}\n{c}" for name, c in contracts.items())
 
             test_result, codex_result, runtime_result = await _run_unified_verify(
-                wave_stage, combined_contract, bus,
-                run_test_engineer, run_codex_review, run_runtime_evaluator, warnings,
+                wave_stage, task_context, bus,
+                run_test_engineer, run_codex_review, run_runtime_verifier, warnings,
             )
 
             # Checkpoint: post-verify (same as single-stage path)
             decision = await bus.wait_for_decision("post-verify")
             if decision == Decision.SKIP_FIXES:
-                for stage, contract in implemented:
+                for stage in implemented:
                     remaining.remove(stage)
                     sr = StageResult(
-                        name=stage.name, status="PASS", contract=contract,
+                        name=stage.name, status="PASS",
                         test_result=test_result, codex_result=codex_result,
                         runtime_result=runtime_result, fix_attempts=0,
                     )
@@ -305,10 +303,10 @@ async def run_sprint_loop(
                     await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
                 continue
             elif decision == Decision.ABORT:
-                for stage, contract in implemented:
+                for stage in implemented:
                     remaining.remove(stage)
                     sr = StageResult(
-                        name=stage.name, status="BLOCKED", contract=contract,
+                        name=stage.name, status="BLOCKED",
                         test_result=test_result, codex_result=codex_result,
                         runtime_result=runtime_result, fix_attempts=0,
                         recommendation="MUST_STOP",
@@ -387,14 +385,14 @@ async def run_sprint_loop(
                 # Find the first remaining stage that would be in the next wave
                 next_ready = [
                     s for s in remaining
-                    if s not in [st for st, _ in implemented]
-                    and all(d in completed_names or d in {st.name for st, _ in implemented} for d in s.depends_on)
+                    if s not in implemented
+                    and all(d in completed_names or d in {st.name for st in implemented} for d in s.depends_on)
                 ]
                 if next_ready:
                     skip_target = next_ready[0]
                     remaining.remove(skip_target)
                     _record(StageResult(
-                        name=skip_target.name, status="SKIPPED", contract="",
+                        name=skip_target.name, status="SKIPPED",
                         test_result={"passed": 0, "failed": 0},
                         codex_result={"status": "skipped", "has_issues": False, "output": ""},
                         runtime_result=None, fix_attempts=0,
@@ -403,10 +401,10 @@ async def run_sprint_loop(
                     await bus.emit(StageCompleted(stage_name=skip_target.name, status="SKIPPED"))
 
             # Record results for all stages in this wave
-            for stage, contract in implemented:
+            for stage in implemented:
                 remaining.remove(stage)
                 sr = StageResult(
-                    name=stage.name, status=wave_status, contract=contract,
+                    name=stage.name, status=wave_status,
                     test_result=test_result, codex_result=codex_result,
                     runtime_result=runtime_result, fix_attempts=fix_attempts,
                     unresolved=[f["description"] for f in failures] if failures else None,
@@ -448,43 +446,23 @@ async def _implement_stage(
     query: AgentQueryFn,
     task_context: str,
     warnings: list[str],
-) -> str:
-    """Run contract + implement for a single stage. Returns the contract text.
+) -> None:
+    """Run implement for a single stage.
 
     Used by the wave scheduler for parallel implementation.
     Verification is done separately in _run_unified_verify.
     """
     await bus.emit(StageChanged(stage_name=stage.name, stage_index=idx, total_stages=total_stages))
 
-    # Contract
-    await bus.emit(AgentStarted(agent="runtime-evaluator", role="contract"))
-    t0 = time.time()
-    try:
-        contract_prompt = (
-            f"Write sprint contract for: {stage.name}\n\n"
-            f"The architect's plan already contains Success Criteria and Tests for this stage "
-            f"(included in the context below). Use those as your starting point — expand them "
-            f"into specific, testable criteria with exact HTTP status codes, error messages, "
-            f"and data assertions. Do NOT re-explore the codebase from scratch.\n\n"
-            f"Context:\n{task_context}"
-        ) if task_context else f"Write sprint contract for: {stage.name}"
-        contract = await query(agent="runtime-evaluator", prompt=contract_prompt, model="opus")
-    except Exception as exc:
-        await bus.emit(AgentFailed(agent="runtime-evaluator", error=str(exc)))
-        contract = f"[contract generation failed: {exc}]"
-        warnings.append(f"Contract generation failed for {stage.name}: {exc}")
-    else:
-        await bus.emit(AgentCompleted(agent="runtime-evaluator", duration_s=round(time.time() - t0, 1)))
-
-    # Implement
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
-            f"Contract:\n{contract}\n\n"
+            f"The plan above lists this stage's Success Criteria, Tests, and Files. "
+            f"Use those as your target.\n\n"
             f"SCOPE: Only modify files listed in this stage's plan. "
-            f"Do not explore or read files from other stages. "
+            f"Do not explore or read files from other stages."
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
@@ -496,19 +474,17 @@ async def _implement_stage(
     else:
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 
-    return contract
-
 
 async def _run_unified_verify(
     wave_stage: Stage,
-    combined_contract: str,
+    task_context: str,
     bus: EventBus,
     run_test_engineer: TestRunnerFn,
     run_codex_review: CodexRunnerFn,
-    run_runtime_evaluator: RuntimeRunnerFn,
+    run_runtime_verifier: RuntimeRunnerFn,
     warnings: list[str],
 ) -> tuple[dict, dict, dict | None]:
-    """Run test-engineer + codex-review + runtime-evaluator once for a wave of stages."""
+    """Run test-engineer + codex-review + runtime-verifier once for a wave of stages."""
     verify_tasks: list[asyncio.Task] = []
 
     await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
@@ -522,12 +498,12 @@ async def _run_unified_verify(
     ))
 
     if wave_stage.has_user_facing_changes:
-        await bus.emit(AgentStarted(agent="runtime-evaluator", role="verification"))
+        await bus.emit(AgentStarted(agent="runtime-verifier", role="verification"))
         verify_tasks.append(asyncio.create_task(
-            _run_with_timing_str_arg(run_runtime_evaluator, combined_contract, bus, "runtime-evaluator")
+            _run_with_timing_verifier(run_runtime_verifier, wave_stage.name, task_context, bus, "runtime-verifier")
         ))
     else:
-        await bus.emit(AgentSkipped(agent="runtime-evaluator", reason="no user-facing changes in wave"))
+        await bus.emit(AgentSkipped(agent="runtime-verifier", reason="no user-facing changes in wave"))
 
     raw_results = await asyncio.gather(*verify_tasks, return_exceptions=True)
 
@@ -539,7 +515,7 @@ async def _run_unified_verify(
 
     for i, r in enumerate(raw_results):
         if isinstance(r, Exception):
-            agent_name = ["test-engineer", "codex-review", "runtime-evaluator"][i] if i < 3 else f"verify-{i}"
+            agent_name = ["test-engineer", "codex-review", "runtime-verifier"][i] if i < 3 else f"verify-{i}"
             warnings.append(f"Verification {agent_name} failed with exception: {r}")
 
     return test_result, codex_result, runtime_result
@@ -557,11 +533,11 @@ async def _run_single_stage(
     query: AgentQueryFn,
     run_test_engineer: TestRunnerFn,
     run_codex_review: CodexRunnerFn,
-    run_runtime_evaluator: RuntimeRunnerFn,
+    run_runtime_verifier: RuntimeRunnerFn,
     task_context: str,
     warnings: list[str],
 ) -> StageResult:
-    """Execute a single stage: contract → implement → verify → fix loop → gate."""
+    """Execute a single stage: implement → verify → fix loop → gate."""
 
     await bus.emit(StageChanged(
         stage_name=stage.name,
@@ -569,46 +545,27 @@ async def _run_single_stage(
         total_stages=total_stages,
     ))
 
-    # --- 1. Sprint contract (mandatory) ---
-    await bus.emit(AgentStarted(agent="runtime-evaluator", role="contract"))
-    t0 = time.time()
-    try:
-        contract_prompt = (
-            f"Write sprint contract for: {stage.name}\n\n"
-            f"The architect's plan already contains Success Criteria and Tests for this stage "
-            f"(included in the context below). Use those as your starting point — expand them "
-            f"into specific, testable criteria with exact HTTP status codes, error messages, "
-            f"and data assertions. Do NOT re-explore the codebase from scratch.\n\n"
-            f"Context:\n{task_context}"
-        ) if task_context else f"Write sprint contract for: {stage.name}"
-        contract = await query(agent="runtime-evaluator", prompt=contract_prompt, model="opus")
-    except Exception as exc:
-        await bus.emit(AgentFailed(agent="runtime-evaluator", error=str(exc)))
-        contract = f"[contract generation failed: {exc}]"
-        warnings.append(f"Contract generation failed for {stage.name}: {exc}")
-    else:
-        await bus.emit(AgentCompleted(agent="runtime-evaluator", duration_s=round(time.time() - t0, 1)))
-
     # --- Checkpoint: pre-implement ---
     decision = await bus.wait_for_decision("pre-implement")
     if decision == Decision.SKIP_STAGE:
         await bus.emit(StageCompleted(stage_name=stage.name, status="SKIPPED"))
         return StageResult(
-            name=stage.name, status="SKIPPED", contract=contract,
+            name=stage.name, status="SKIPPED",
             test_result={"passed": 0, "failed": 0},
             codex_result={"status": "skipped", "has_issues": False, "output": ""},
             runtime_result=None, fix_attempts=0,
         )
 
-    # --- 2. Implement (mandatory) ---
+    # --- 1. Implement (mandatory) ---
     await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
     t0 = time.time()
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
-            f"Contract:\n{contract}\n\n"
+            f"The plan above lists this stage's Success Criteria, Tests, and Files. "
+            f"Use those as your target.\n\n"
             f"SCOPE: Only modify files listed in this stage's plan. "
-            f"Do not explore or read files from other stages. "
+            f"Do not explore or read files from other stages."
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
@@ -619,7 +576,7 @@ async def _run_single_stage(
         # Don't verify half-finished work — skip straight to BLOCKED
         await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
         return StageResult(
-            name=stage.name, status="BLOCKED", contract=contract,
+            name=stage.name, status="BLOCKED",
             test_result={"passed": 0, "failed": 0},
             codex_result={"status": "skipped", "has_issues": False, "output": ""},
             runtime_result=None, fix_attempts=0,
@@ -629,7 +586,7 @@ async def _run_single_stage(
     else:
         await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
 
-    # --- 3. Verify (parallel) ---
+    # --- 2. Verify (parallel) ---
     verify_tasks: list[asyncio.Task] = []
 
     await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
@@ -643,12 +600,12 @@ async def _run_single_stage(
     ))
 
     if stage.has_user_facing_changes:
-        await bus.emit(AgentStarted(agent="runtime-evaluator", role="verification"))
+        await bus.emit(AgentStarted(agent="runtime-verifier", role="verification"))
         verify_tasks.append(asyncio.create_task(
-            _run_with_timing_str_arg(run_runtime_evaluator, contract, bus, "runtime-evaluator")
+            _run_with_timing_verifier(run_runtime_verifier, stage.name, task_context, bus, "runtime-verifier")
         ))
     else:
-        await bus.emit(AgentSkipped(agent="runtime-evaluator", reason="no user-facing changes"))
+        await bus.emit(AgentSkipped(agent="runtime-verifier", reason="no user-facing changes"))
 
     raw_results = await asyncio.gather(*verify_tasks, return_exceptions=True)
 
@@ -660,7 +617,7 @@ async def _run_single_stage(
 
     for i, r in enumerate(raw_results):
         if isinstance(r, Exception):
-            agent_name = ["test-engineer", "codex-review", "runtime-evaluator"][i] if i < 3 else f"verify-{i}"
+            agent_name = ["test-engineer", "codex-review", "runtime-verifier"][i] if i < 3 else f"verify-{i}"
             warnings.append(f"Verification {agent_name} failed with exception: {r}")
 
     # --- Checkpoint: post-verify ---
@@ -668,25 +625,25 @@ async def _run_single_stage(
     if decision == Decision.SKIP_FIXES:
         await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
         return StageResult(
-            name=stage.name, status="PASS", contract=contract,
+            name=stage.name, status="PASS",
             test_result=test_result, codex_result=codex_result,
             runtime_result=runtime_result, fix_attempts=0,
         )
     elif decision == Decision.ABORT:
         await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
         return StageResult(
-            name=stage.name, status="BLOCKED", contract=contract,
+            name=stage.name, status="BLOCKED",
             test_result=test_result, codex_result=codex_result,
             runtime_result=runtime_result, fix_attempts=0,
             recommendation="MUST_STOP",
         )
 
-    # --- 4. Fix loop (max 3 attempts) ---
+    # --- 3. Fix loop (max 1 attempt — escalate to team-lead on first failure) ---
     failures = collect_failures(test_result, codex_result, runtime_result)
     fix_attempts = 0
     prev_fingerprint: frozenset[tuple[str, str]] | None = None
 
-    for attempt in range(1, 4):
+    for attempt in range(1, 2):
         if not failures:
             break
 
@@ -702,7 +659,7 @@ async def _run_single_stage(
 
         fix_attempts = attempt
         failure_descriptions = [f["description"] for f in failures]
-        await bus.emit(FixLoopStarted(attempt=attempt, max_attempts=3, failures=failure_descriptions))
+        await bus.emit(FixLoopStarted(attempt=attempt, max_attempts=1, failures=failure_descriptions))
 
         decision = await bus.wait_for_decision("pre-fix")
         if decision == Decision.ABORT_FIX_LOOP:
@@ -758,7 +715,7 @@ async def _run_single_stage(
         if should_block:
             await bus.emit(StageCompleted(stage_name=stage.name, status="BLOCKED"))
             return StageResult(
-                name=stage.name, status="BLOCKED", contract=contract,
+                name=stage.name, status="BLOCKED",
                 test_result=test_result, codex_result=codex_result,
                 runtime_result=runtime_result, fix_attempts=fix_attempts,
                 unresolved=[f["description"] for f in failures],
@@ -768,7 +725,7 @@ async def _run_single_stage(
     # Stage passed
     await bus.emit(StageCompleted(stage_name=stage.name, status="PASS"))
     return StageResult(
-        name=stage.name, status="PASS", contract=contract,
+        name=stage.name, status="PASS",
         test_result=test_result, codex_result=codex_result,
         runtime_result=runtime_result, fix_attempts=fix_attempts,
         unresolved=[f["description"] for f in failures] if failures else None,
@@ -806,11 +763,14 @@ async def _run_with_timing_no_arg(fn: CodexRunnerFn, bus: EventBus, agent_name: 
         return result
 
 
-async def _run_with_timing_str_arg(fn: RuntimeRunnerFn, arg: str, bus: EventBus, agent_name: str) -> dict:
-    """Run a string-arg verification function and emit completion event."""
+async def _run_with_timing_verifier(
+    fn: RuntimeRunnerFn, stage_name: str, task_context: str,
+    bus: EventBus, agent_name: str,
+) -> dict:
+    """Run runtime-verifier and emit completion event."""
     t0 = time.time()
     try:
-        result = await fn(arg)
+        result = await fn(stage_name, task_context)
     except Exception as exc:
         await bus.emit(AgentFailed(agent=agent_name, error=str(exc)))
         raise

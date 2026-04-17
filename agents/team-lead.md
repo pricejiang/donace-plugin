@@ -38,7 +38,7 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 |---------|-------------|------------------------|
 | `run_start --run-id <id> --cwd <dir>` | Start of every session | Creates run directory, emits run.started |
 | `plan --run-id <id> --cwd <dir>` | After you've written `.ai/runs/<id>/plan.md` | Parses plan, runs codex plan review, writes plan.json sidecar. Zero LLM planning — YOU write the plan. |
-| `run_job --stage-id <id> --plan <path> --run-id <id> --cwd <dir>` | Execute a stage | contract → implement → test → codex → fix loop |
+| `run_job --stage-id <id> --plan <path> --run-id <id> --cwd <dir>` | Execute a stage | implement → test → codex → (runtime) → fix loop |
 | `verify --run-id <id> --cwd <dir> --agents "test,codex"` | After all stages pass | Runs full verification (read-only) |
 | `review --run-id <id> --cwd <dir> --reviewer typescript` | Code review | Dispatches reviewer agent |
 | `document --run-id <id> --cwd <dir>` | Update docs | Dispatches documenter agent |
@@ -46,8 +46,8 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 
 ### run_job options
 
-- `--skip-agents "contract,test,codex,runtime"` — Skip specific agents
-- `--max-fix-attempts N` — Control fix loop iterations (default: 3)
+- `--skip-agents "test,codex,runtime"` — Skip specific verify agents
+- `--max-fix-attempts N` — Control fix loop iterations (default: 1 — on first failure, escalate to you for route-correction instead of blindly retrying)
 - `--dashboard-url ws://localhost:8741` — Connect to dashboard (auto-discovered from run_start if omitted)
 
 ### Foreground vs Background
@@ -187,7 +187,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_job \
   --plan <write-inline-plan-json> \
   --cwd <dir> \
   --run-id <id> \
-  --skip-agents "contract,codex,runtime"
+  --skip-agents "codex,runtime"
 ```
 
 For ad-hoc tasks without a plan file, write a minimal plan JSON:
@@ -215,7 +215,7 @@ Read the plan JSON. For each pair of stages without dependency:
 
 | Situation | Skip |
 |-----------|------|
-| Typo fix, config change | contract, codex, runtime |
+| Typo fix, config change | codex, runtime |
 | Pure refactor (no user-facing changes) | runtime |
 | Simple feature, low risk | codex |
 | Critical feature, external API | skip nothing |
@@ -225,7 +225,7 @@ Read the plan JSON. For each pair of stages without dependency:
 When a run_job returns BLOCKED:
 
 1. Read the `unresolved` field — what specifically failed?
-2. If test failure looks simple (typo, missing import): retry with `--max-fix-attempts 5`
+2. If test failure looks simple (typo, missing import): retry with `--max-fix-attempts 3`
 3. If structural issue (wrong approach, missing dependency): discuss with user
 4. If agent timeout: retry once, then discuss with user
 
@@ -271,11 +271,10 @@ run_job returns:
   "command": "run_job",
   "stage_id": "stage-1",
   "status": "PASS",
-  "contract": "...",
   "test_result": {"passed": 12, "failed": 0},
   "codex_result": {"status": "clean", "has_issues": false},
   "fix_attempts": 0,
-  "completed_steps": ["contract", "implement", "verify", "done"]
+  "completed_steps": ["implement", "verify", "done"]
 }
 ```
 

@@ -76,7 +76,9 @@ def validate_run(
     report = RunReport()
 
     # ── Gather data from events ──
-    tokens_by_agent: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "output": 0})
+    tokens_by_agent: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
+    )
     duration_by_agent: dict[str, float] = defaultdict(float)
     agents_started: set[str] = set()
     agents_skipped: dict[str, str] = {}  # agent → reason
@@ -92,6 +94,8 @@ def validate_run(
         if ev_type == "agent.tokens":
             tokens_by_agent[agent]["input"] += ev.get("input_tokens", 0)
             tokens_by_agent[agent]["output"] += ev.get("output_tokens", 0)
+            tokens_by_agent[agent]["cache_creation"] += ev.get("cache_creation_input_tokens", 0)
+            tokens_by_agent[agent]["cache_read"] += ev.get("cache_read_input_tokens", 0)
 
         elif ev_type == "agent.completed":
             duration_by_agent[agent] += ev.get("duration_s", 0)

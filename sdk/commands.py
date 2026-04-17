@@ -705,9 +705,9 @@ async def cmd_run_job(
     run_id: str,
     dashboard_url: str | None,
     skip_agents: set[str] | None = None,
-    max_fix_attempts: int = 3,
+    max_fix_attempts: int = 1,
 ) -> dict:
-    """Execute a single stage: contract -> implement -> verify -> fix loop."""
+    """Execute a single stage: implement -> verify -> fix loop."""
     # Guard: reject jobs on already-completed runs
     result_file = Path(cwd) / ".ai" / "runs" / run_id / "result.json"
     if result_file.exists():
@@ -764,7 +764,7 @@ async def cmd_run_job(
             query=dispatcher.query,
             run_test_engineer=dispatcher.run_test_engineer,
             run_codex_review=dispatcher.run_codex_review,
-            run_runtime_evaluator=dispatcher.run_runtime_evaluator if "runtime" not in skip else None,
+            run_runtime_verifier=dispatcher.run_runtime_verifier if "runtime" not in skip else None,
             task_context=task_context,
             skip_agents=skip,
             max_fix_attempts=max_fix_attempts,
@@ -862,7 +862,7 @@ async def cmd_verify(
             coros.append(dispatcher.run_codex_review())
             names.append("codex")
         if "runtime" in active_agents:
-            coros.append(dispatcher.run_runtime_evaluator("Verify all acceptance criteria"))
+            coros.append(dispatcher.run_runtime_verifier("Full verification", ""))
             names.append("runtime")
 
         results: dict[str, Any] = {}
