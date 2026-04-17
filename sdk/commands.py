@@ -90,6 +90,64 @@ def _supersede_prior_jobs(cwd: str, run_id: str, command: str, current_job_id: s
                 pass
 
 
+def _has_prior_job_status(cwd: str, run_id: str, command: str, statuses: set[str]) -> bool:
+    """Return True if this run already has a result for command in statuses."""
+    jobs_dir = Path(cwd) / ".ai" / "runs" / run_id / "jobs"
+    if not jobs_dir.exists():
+        return False
+    for f in jobs_dir.glob(f"job-{command}-*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("command") == command and data.get("status") in statuses:
+            return True
+    return False
+
+
+def _write_error_unless_prior_progress(
+    cwd: str,
+    run_id: str,
+    job_id: str,
+    command: str,
+    result: dict,
+) -> Path | None:
+    """Persist ERROR unless a prior PASS/PARTIAL already represents progress."""
+    if _has_prior_job_status(cwd, run_id, command, {"PASS", "PARTIAL"}):
+        return None
+    return _write_job_result(cwd, run_id, job_id, result)
+
+
+IDEMPOTENT_JOB_COMMANDS = {"plan", "verify", "review", "document"}
+PROGRESS_JOB_STATUSES = {"PASS", "PARTIAL"}
+
+
+def _filter_superseded_idempotent_jobs(job_results: list[dict]) -> list[dict]:
+    """Drop stale non-progress results for idempotent commands."""
+    commands_with_pass = {
+        j.get("command")
+        for j in job_results
+        if j.get("command") in IDEMPOTENT_JOB_COMMANDS
+        and j.get("status") == "PASS"
+    }
+    commands_with_progress = {
+        j.get("command")
+        for j in job_results
+        if j.get("command") in IDEMPOTENT_JOB_COMMANDS
+        and j.get("status") in PROGRESS_JOB_STATUSES
+    }
+    filtered: list[dict] = []
+    for job in job_results:
+        command = job.get("command")
+        status = job.get("status")
+        if command in commands_with_pass and status != "PASS":
+            continue
+        if command in commands_with_progress and status == "ERROR":
+            continue
+        filtered.append(job)
+    return filtered
+
+
 def _worktree_snapshot(cwd: str) -> dict[str, tuple]:
     """Snapshot dirty-file state with content identity.
 
@@ -450,10 +508,8 @@ def _write_wrap_failure_marker(cwd: str, run_id: str, command: str, error: str) 
     """Persist a stand-in ERROR job result when a wrap-phase cmd crashes
     or a wrap lock times out.
 
-    Dedup only against EXISTING ERROR records for the same command — not
-    against PASS records. A prior PASS followed by a rerun that times out
-    is two separate events; suppressing the ERROR would leave the stale
-    PASS as the only aggregate signal for this command.
+    If the command already has PASS/PARTIAL progress, preserve that
+    aggregate state; the failed rerun still appears in live events/stderr.
     """
     jobs_dir = Path(cwd) / ".ai" / "runs" / run_id / "jobs"
     for f in jobs_dir.glob("*.json"):
@@ -465,7 +521,7 @@ def _write_wrap_failure_marker(cwd: str, run_id: str, command: str, error: str) 
             continue
 
     marker_id = f"job-{command}-wrap-crash-{uuid.uuid4().hex[:8]}"
-    _write_job_result(cwd, run_id, marker_id, {
+    _write_error_unless_prior_progress(cwd, run_id, marker_id, command, {
         "command": command,
         "status": "ERROR",
         "error": f"wrap-phase crash before job start: {error}",
@@ -488,6 +544,7 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
                 job_results.append(json.loads(f.read_text()))
             except (json.JSONDecodeError, OSError):
                 continue
+    job_results = _filter_superseded_idempotent_jobs(job_results)
 
     passed = sum(1 for j in job_results if j.get("status") == "PASS")
     blocked = sum(1 for j in job_results if j.get("status") == "BLOCKED")
@@ -713,7 +770,7 @@ async def cmd_plan(
     except Exception as exc:
         await bus.emit(JobCompleted(job_id=job_id, command="plan", status="ERROR", result_summary=str(exc)))
         error_result = {"command": "plan", "status": "ERROR", "error": str(exc)}
-        _write_job_result(cwd, run_id, job_id, error_result)
+        _write_error_unless_prior_progress(cwd, run_id, job_id, "plan", error_result)
         print(json.dumps(error_result, indent=2), file=sys.stderr)
         raise
     finally:
@@ -990,13 +1047,12 @@ async def cmd_review(
 
     except Exception as exc:
         await bus.emit(JobCompleted(job_id=job_id, command="review", status="ERROR", result_summary=str(exc)))
-        # Persist an error result so run_complete's aggregate sees the failure.
-        # Without this, wrap-phase crashes are invisible in the final summary.
+        # Persist unless a prior PASS/PARTIAL already represents progress.
         error_result = {
             "command": "review", "status": "ERROR",
             "reviewer": reviewer, "error": str(exc),
         }
-        _write_job_result(cwd, run_id, job_id, error_result)
+        _write_error_unless_prior_progress(cwd, run_id, job_id, "review", error_result)
         print(json.dumps(error_result, indent=2), file=sys.stderr)
         raise
     finally:
@@ -1147,14 +1203,16 @@ async def cmd_document(
         # reruns to recover.
         if overall != "ERROR":
             _supersede_prior_jobs(cwd, run_id, "document", job_id)
-        _write_job_result(cwd, run_id, job_id, job_result)
+            _write_job_result(cwd, run_id, job_id, job_result)
+        else:
+            _write_error_unless_prior_progress(cwd, run_id, job_id, "document", job_result)
         print(json.dumps(job_result, indent=2))
         return job_result
 
     except Exception as exc:
         await bus.emit(JobCompleted(job_id=job_id, command="document", status="ERROR", result_summary=str(exc)))
         error_result = {"command": "document", "status": "ERROR", "error": str(exc)}
-        _write_job_result(cwd, run_id, job_id, error_result)
+        _write_error_unless_prior_progress(cwd, run_id, job_id, "document", error_result)
         print(json.dumps(error_result, indent=2), file=sys.stderr)
         raise
     finally:
