@@ -1119,7 +1119,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     # Legacy args (used when no subcommand given)
-    parser.add_argument("--task", type=str, help="(Legacy) Task description — runs full pipeline")
+    parser.add_argument("--task", type=str, help="(Removed) Use plan + run_job commands instead. Passing --task now errors out.")
     parser.add_argument("--cwd", type=str, default=os.getcwd())
     parser.add_argument("--dashboard-url", default=None)
     parser.add_argument("--no-interactive", action="store_true")
@@ -1196,22 +1196,24 @@ def main() -> None:
     if args.command == "health":
         sys.exit(cmd_health(cwd=args.cwd))
 
-    # --- Legacy mode: --task without subcommand ---
+    # --- Legacy --task has been removed ---
+    # planner/architect agents no longer exist; --task used to drive a
+    # full pipeline through them and now silently degrades to a generic
+    # single-stage plan. Force users onto the plan + run_job flow.
     if args.command is None and args.task:
-        interactive = not args.no_interactive and args.dashboard_url is not None
-        result = asyncio.run(run(
-            task=args.task,
-            cwd=args.cwd,
-            dashboard_url=args.dashboard_url,
-            interactive=interactive,
-        ))
-        output = result.to_json_output()
-        runs_dir = Path(args.cwd) / ".ai" / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
-        result_path = runs_dir / f"{result.run_id}.json"
-        result_path.write_text(json.dumps(output, indent=2))
-        print(json.dumps(output, indent=2))
-        return
+        print(
+            "ERROR: --task has been removed. The legacy full-pipeline mode "
+            "relied on planner/architect agents that no longer exist.\n\n"
+            "New flow:\n"
+            "  1. Write a plan to .ai/runs/<run-id>/plan.md (team-lead does this)\n"
+            "  2. orchestrator.py run_start --run-id <id> --cwd <dir>\n"
+            "  3. orchestrator.py plan      --run-id <id> --cwd <dir>\n"
+            "  4. orchestrator.py run_job   --stage-id <id> --plan <plan.json> --run-id <id> --cwd <dir>\n"
+            "  5. orchestrator.py run_complete --run-id <id> --cwd <dir>\n\n"
+            "See agents/team-lead.md for the plan template.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # --- Subcommand dispatch ---
     from sdk.commands import (

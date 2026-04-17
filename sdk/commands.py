@@ -471,15 +471,20 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
     passed = sum(1 for j in job_results if j.get("status") == "PASS")
     blocked = sum(1 for j in job_results if j.get("status") == "BLOCKED")
     interrupted = sum(1 for j in job_results if j.get("status") == "INTERRUPTED")
+    failed = sum(1 for j in job_results if j.get("status") in ("FAIL", "ERROR"))
+    needs_review = sum(1 for j in job_results if j.get("status") == "REVIEW")
     total = len(job_results)
 
     summary = {
         "passed": passed,
         "blocked": blocked,
         "interrupted": interrupted,
+        "failed": failed,
+        "needs_review": needs_review,
         "total": total,
-        "failed": sum(1 for j in job_results if j.get("status") in ("FAIL", "ERROR")),
-        "overall": "PASS" if blocked == 0 and interrupted == 0 and total > 0 and all(j.get("status") not in ("FAIL", "ERROR") for j in job_results) else "INCOMPLETE",
+        # Only PASS when every job is PASS. REVIEW, BLOCKED, INTERRUPTED,
+        # FAIL, ERROR, or any other non-PASS status → INCOMPLETE.
+        "overall": "PASS" if total > 0 and passed == total else "INCOMPLETE",
     }
 
     result = {"run_id": run_id, "jobs": job_results, "summary": summary}
@@ -668,17 +673,25 @@ async def cmd_plan(
             job_id=job_id, command="plan", status=status,
             result_summary=f"{len(stages)} stages, codex: {codex_review.get('status', 'skipped')}",
         ))
+        # Supersede any prior plan job results from this run. When team-lead
+        # re-plans after a REVIEW, the previous REVIEW job would otherwise
+        # linger in jobs/ and block aggregate PASS forever.
+        jobs_dir = run_dir / "jobs"
+        if jobs_dir.exists():
+            for old in jobs_dir.glob("job-plan-*.json"):
+                if old.stem != job_id:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
         _write_job_result(cwd, run_id, job_id, {"command": "plan", "status": status, "plan": plan_json})
 
-        # Write plan context for subsequent jobs
+        # Write the full plan.md (verbatim) into context so subsequent
+        # implementer + runtime-verifier prompts can read each stage's
+        # Success Criteria and Tests — not just its id/files/deps.
         context_dir = run_dir / "context"
         context_dir.mkdir(parents=True, exist_ok=True)
-        plan_ctx = f"# Plan\n\nFrom: {plan_file}\n\n"
-        for s in plan_json["stages"]:
-            plan_ctx += f"## {s['id']}: {s['name']}\n"
-            plan_ctx += f"- Files: {', '.join(s['files']) if s['files'] else 'TBD'}\n"
-            plan_ctx += f"- Dependencies: {', '.join(s['dependencies']) if s['dependencies'] else 'None'}\n\n"
-        (context_dir / "plan.md").write_text(plan_ctx)
+        (context_dir / "plan.md").write_text(plan_content)
 
         print(json.dumps(plan_json, indent=2))
         return plan_json
