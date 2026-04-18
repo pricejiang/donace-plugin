@@ -21,6 +21,7 @@ from typing import Any
 
 from sdk.events import (
     AgentCompleted,
+    AgentFailed,
     AgentMessage,
     AgentStarted,
     AgentTokens,
@@ -803,7 +804,7 @@ class AgentDispatcher:
 
     async def query(
         self, agent: str, prompt: str, model: str = "sonnet",
-        tools: list[str] | None = None, **_: Any,
+        tools: list[str] | None = None, role: str | None = None, **_: Any,
     ) -> str:
         """Run an agent query using Claude Agent SDK.
 
@@ -855,25 +856,40 @@ class AgentDispatcher:
 
         options = ClaudeAgentOptions(**opts)
 
+        # Emit lifecycle events around every dispatch so the dashboard
+        # sees planner / reviewer / documenter (which go through here
+        # directly from cmd_*) — not only the implementer/test-engineer
+        # paths that job_runner used to wrap manually. job_runner's
+        # redundant emits have been removed in favour of this.
+        await self.bus.emit(AgentStarted(agent=agent, model=model_id, role=role))
+        t0 = time.time()
+
         client = ClaudeSDKClient(options=options)
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._run_client(client, agent, prompt, model_id),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
-            # disconnect() kills the CLI process and all its subagents
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            raise RuntimeError(f"agent={agent} timed out after {timeout}s")
-        except Exception:
+            error_msg = f"agent={agent} timed out after {timeout}s"
+            await self.bus.emit(AgentFailed(agent=agent, error=error_msg))
+            raise RuntimeError(error_msg)
+        except Exception as exc:
             try:
                 await client.disconnect()
             except Exception:
                 pass
+            await self.bus.emit(AgentFailed(agent=agent, error=str(exc)))
             raise
+        else:
+            await self.bus.emit(AgentCompleted(
+                agent=agent, duration_s=round(time.time() - t0, 1),
+            ))
+            return result
 
     async def _run_client(self, client: Any, agent: str, prompt: str, model_id: str) -> str:
         """Run an agent via ClaudeSDKClient. Called within wait_for timeout."""
@@ -1048,10 +1064,26 @@ class AgentDispatcher:
     async def run_codex_review(self) -> dict:
         """Run codex review via Agent SDK, using the codex companion script.
 
-        Dispatches a lightweight agent with only Bash access to run the
-        codex-companion.mjs script. The absolute path is resolved upfront
-        so the agent doesn't need to find it.
+        Wraps the inner work with AgentStarted / AgentCompleted so the
+        dashboard surfaces activity — same reason as run_codex_plan_review.
+        The underlying `_run_codex_command` uses `sdk_query` directly,
+        bypassing `self.query`, so lifecycle emits don't happen automatically.
         """
+        await self.bus.emit(AgentStarted(agent="codex-review", model="haiku"))
+        t0 = time.time()
+        result: dict = {"status": "skipped", "has_issues": False}
+        try:
+            result = await self._run_codex_review_inner()
+            return result
+        finally:
+            await self.bus.emit(AgentCompleted(
+                agent="codex-review",
+                duration_s=round(time.time() - t0, 1),
+                result_summary=f"status={result.get('status', 'unknown')}",
+            ))
+
+    async def _run_codex_review_inner(self) -> dict:
+        """Actual codex review body — lifecycle emits are in the public wrapper."""
         codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
         if not codex_plugin_root or not companion_script:
             return {

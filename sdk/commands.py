@@ -801,10 +801,17 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
     # Progress: how much of the plan actually happened?
     plan_json_path = run_dir / "plan.json"
     stages_total = 0
+    current_plan_stage_ids: set[str] = set()
     if plan_json_path.exists():
         try:
             plan_data = json.loads(plan_json_path.read_text())
-            stages_total = len(plan_data.get("stages") or [])
+            stages = plan_data.get("stages") or []
+            current_plan_stage_ids = {
+                str(stage["id"])
+                for stage in stages
+                if isinstance(stage, dict) and stage.get("id")
+            }
+            stages_total = len(current_plan_stage_ids)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -813,6 +820,7 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
         label.split(":", 1)[1]: status
         for label, status in current_jobs.items()
         if label.startswith("run_job:")
+        and label.split(":", 1)[1] in current_plan_stage_ids
     }
     stages_passed = sum(
         1 for status in current_stage_statuses.values() if status == "PASS"

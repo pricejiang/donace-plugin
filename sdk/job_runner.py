@@ -17,10 +17,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
 from sdk.events import (
-    AgentCompleted,
-    AgentFailed,
-    AgentSkipped,
-    AgentStarted,
     EventBus,
     FixLoopExhausted,
     FixLoopResolved,
@@ -189,8 +185,8 @@ async def run_job(
     if bus.is_cancelled:
         return JobResult(status="INTERRUPTED", interrupted_at="implement", completed_steps=completed_steps)
 
-    await bus.emit(AgentStarted(agent="implementer", model="sonnet"))
-    t0 = time.time()
+    # Lifecycle emits (AgentStarted/Completed/Failed) now live in
+    # dispatcher.query(), so no need to wrap each call site here.
     try:
         impl_prompt = (
             f"Implement ONLY this stage: {stage.name}\n\n"
@@ -206,9 +202,7 @@ async def run_job(
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
         impl_output = await query(agent="implementer", prompt=impl_prompt, model="sonnet")
-        await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
     except Exception as exc:
-        await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
         return JobResult(
             status="BLOCKED",
             unresolved=[f"Implementer failed: {exc}"],
@@ -250,19 +244,15 @@ async def run_job(
     runtime_result: dict | None = None
 
     if verify_coros:
-        for name in verify_names:
-            await bus.emit(AgentStarted(agent=name))
-
+        # Each run_test_engineer / run_codex_review / run_runtime_verifier
+        # emits its own AgentStarted/Completed via dispatcher.query (or
+        # the codex-review wrapper). No manual emits needed here.
         raw_results = await asyncio.gather(*verify_coros, return_exceptions=True)
 
         for i, name in enumerate(verify_names):
             r = raw_results[i]
             if isinstance(r, Exception):
-                await bus.emit(AgentFailed(agent=name, error=str(r)))
                 r = {"status": "error", "error": str(r)}
-            else:
-                await bus.emit(AgentCompleted(agent=name, duration_s=0))
-
             if name == "test-engineer":
                 test_result = r
             elif name == "codex-review":
@@ -298,9 +288,8 @@ async def run_job(
             failures=[f["description"][:100] for f in error_failures],
         ))
 
-        # Fix attempt
-        await bus.emit(AgentStarted(agent="implementer", model="sonnet", role="fix"))
-        t0 = time.time()
+        # Fix attempt — query() emits lifecycle with role="fix" so the
+        # dashboard can tell this iteration apart from the initial impl.
         try:
             fix_prompt = (
                 "The verifiers reported these issues:\n"
@@ -316,10 +305,10 @@ async def run_job(
             )
             if task_context:
                 fix_prompt = f"{task_context}\n\n{fix_prompt}"
-            fix_output = await query(agent="implementer", prompt=fix_prompt, model="sonnet")
-            await bus.emit(AgentCompleted(agent="implementer", duration_s=round(time.time() - t0, 1)))
-        except Exception as exc:
-            await bus.emit(AgentFailed(agent="implementer", error=str(exc)))
+            fix_output = await query(
+                agent="implementer", prompt=fix_prompt, model="sonnet", role="fix",
+            )
+        except Exception:
             break
 
         needs_context_msg = _extract_needs_context(fix_output)
@@ -339,14 +328,12 @@ async def run_job(
                 completed_steps=completed_steps,
             )
 
-        # Re-verify: only tests (codex/runtime don't change between fix iterations)
+        # Re-verify: only tests (codex/runtime don't change between fix iterations).
+        # run_test_engineer emits its own lifecycle via dispatcher.query.
         if "test" not in skip_agents:
-            await bus.emit(AgentStarted(agent="test-engineer", model="sonnet"))
             try:
                 test_result = await run_test_engineer(stage)
-                await bus.emit(AgentCompleted(agent="test-engineer", duration_s=0))
-            except Exception as exc:
-                await bus.emit(AgentFailed(agent="test-engineer", error=str(exc)))
+            except Exception:
                 break
 
         failures = _collect_failures(test_result, codex_result, runtime_result)
