@@ -410,6 +410,29 @@ async def cmd_write_plan(
     run_dir = Path(cwd) / ".ai" / "runs" / run_id
     plan_path = run_dir / "plan.md"
     plan_rel = plan_path.relative_to(cwd) if plan_path.is_relative_to(cwd) else plan_path
+    had_previous_plan = False
+    previous_plan_bytes: bytes | None = None
+
+    def _recover_plan_artifact() -> tuple[str | None, bool]:
+        """Restore/remove plan.md after a failed write_plan attempt.
+
+        Returns (note, safe_to_preserve_prior_progress). If recovery fails,
+        callers must persist the ERROR job so aggregate state cannot hide a
+        corrupted artifact behind an older PASS result.
+        """
+        try:
+            if previous_plan_bytes is not None:
+                plan_path.parent.mkdir(parents=True, exist_ok=True)
+                plan_path.write_bytes(previous_plan_bytes)
+                return "restored_prior_plan", True
+            if had_previous_plan:
+                return "prior_plan_not_restored_no_snapshot", False
+            if plan_path.exists():
+                plan_path.unlink()
+                return "removed_invalid_plan", True
+            return None, True
+        except OSError as exc:
+            return f"artifact_recovery_failed: {exc}", False
 
     try:
         await bus.emit(JobRegistered(
@@ -421,7 +444,9 @@ async def cmd_write_plan(
         # it to the planner so it can revise rather than rewrite blind.
         existing_plan = ""
         if plan_path.exists():
-            existing_plan = plan_path.read_text()
+            had_previous_plan = True
+            previous_plan_bytes = plan_path.read_bytes()
+            existing_plan = previous_plan_bytes.decode("utf-8", errors="replace")
 
         prompt_parts: list[str] = [f"Task:\n{task}"]
         prompt_parts.append(
@@ -473,6 +498,13 @@ async def cmd_write_plan(
         if error:
             result_payload["error"] = error
 
+        recovery_note: str | None = None
+        recovery_safe = True
+        if status != "PASS":
+            recovery_note, recovery_safe = _recover_plan_artifact()
+            if recovery_note:
+                result_payload["artifact_recovery"] = recovery_note
+
         await bus.emit(JobCompleted(
             job_id=job_id, command="write_plan", status=status,
             result_summary=error or f"plan written to {plan_rel}",
@@ -484,9 +516,12 @@ async def cmd_write_plan(
         else:
             # ERROR path: use the "don't clobber prior progress" writer so
             # a failed revision doesn't erase the prior PASS record.
-            _write_error_unless_prior_progress(
-                cwd, run_id, job_id, "write_plan", result_payload,
-            )
+            if recovery_safe:
+                _write_error_unless_prior_progress(
+                    cwd, run_id, job_id, "write_plan", result_payload,
+                )
+            else:
+                _write_job_result(cwd, run_id, job_id, result_payload)
 
         print(json.dumps(result_payload, indent=2))
         return result_payload
@@ -500,9 +535,15 @@ async def cmd_write_plan(
             "command": "write_plan", "status": "ERROR",
             "error": str(exc),
         }
-        _write_error_unless_prior_progress(
-            cwd, run_id, job_id, "write_plan", error_result,
-        )
+        recovery_note, recovery_safe = _recover_plan_artifact()
+        if recovery_note:
+            error_result["artifact_recovery"] = recovery_note
+        if recovery_safe:
+            _write_error_unless_prior_progress(
+                cwd, run_id, job_id, "write_plan", error_result,
+            )
+        else:
+            _write_job_result(cwd, run_id, job_id, error_result)
         print(json.dumps(error_result, indent=2), file=sys.stderr)
         raise
     finally:
