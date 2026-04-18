@@ -295,23 +295,47 @@ def cmd_health(cwd: str | None = None) -> int:
 # CLI
 # ---------------------------------------------------------------------------
 
+_SUBCOMMANDS = frozenset({
+    "run_start", "run_complete", "list_runs", "mark",
+    "write_plan", "plan", "run_job",
+    "verify", "review", "document", "health",
+})
+
+
+def _looks_like_legacy_task_invocation(argv: list[str]) -> bool:
+    """True iff argv has a top-level --task (legacy shape) rather than a
+    subcommand-level --task (e.g. `write_plan --task ...`, which is valid).
+
+    Walks argv left-to-right: if we hit --task before any known subcommand
+    name, it's legacy. If we hit a subcommand first, the --task after it
+    belongs to that subcommand and we must leave it alone.
+    """
+    for tok in argv:
+        if tok in _SUBCOMMANDS:
+            return False
+        if tok == "--task" or tok.startswith("--task="):
+            return True
+    return False
+
+
 def main() -> None:
     """CLI entry point. Dispatches subcommands to sdk.commands."""
-    # Catch the legacy `--task` flag early so users who were in the habit
-    # of calling the full pipeline get a clear migration message instead
-    # of an unhelpful argparse "invalid choice" error. Done before the
-    # parser is built so argparse never sees the flag.
-    if "--task" in sys.argv[1:]:
+    # Catch the removed legacy `--task` top-level flag so users who were
+    # in the habit of calling the full pipeline get a clear migration
+    # message instead of an unhelpful argparse "invalid choice" error.
+    # Must not fire when --task belongs to write_plan (its legit arg).
+    if _looks_like_legacy_task_invocation(sys.argv[1:]):
         print(
             "ERROR: --task has been removed. The legacy full-pipeline mode "
             "relied on planner/architect agents that no longer exist.\n\n"
             "New flow:\n"
-            "  1. Write a plan to .ai/runs/<run-id>/plan.md (team-lead does this)\n"
-            "  2. orchestrator.py run_start --run-id <id> --cwd <dir>\n"
+            "  1. orchestrator.py run_start --run-id <id> --cwd <dir>\n"
+            "  2. orchestrator.py write_plan --run-id <id> --cwd <dir> --task \"<brief>\"\n"
+            "     (or write .ai/runs/<id>/plan.md yourself)\n"
             "  3. orchestrator.py plan      --run-id <id> --cwd <dir>\n"
             "  4. orchestrator.py run_job   --stage-id <id> --plan <plan.json> --run-id <id> --cwd <dir>\n"
             "  5. orchestrator.py run_complete --run-id <id> --cwd <dir>\n\n"
-            "See agents/team-lead.md for the plan template.",
+            "See agents/team-lead.md for the full template.",
             file=sys.stderr,
         )
         sys.exit(2)
