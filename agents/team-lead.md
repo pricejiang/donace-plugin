@@ -91,14 +91,18 @@ in jobs_completed** — always read the latter to know what actually ran.
 | `empty` | Fresh run_start dir, no jobs yet | Ignore. |
 | `incomplete` | Run started but `result.json` missing | Inspect `progress` to decide (next table) |
 
-### `incomplete` sub-cases — read `progress` to decide
+### `incomplete` sub-cases — read `progress` + `jobs_completed["plan"]` to decide
 
-| progress signal | what it means | action |
+Check `jobs_completed["plan"]` FIRST — if the plan itself has issues,
+there's no point dispatching run_jobs against a broken plan.
+
+| signal | what it means | action |
 |---|---|---|
+| `jobs_completed["plan"] == "REVIEW"` | Codex flagged the plan; stages haven't been dispatched against it | **Revise plan before anything else**. Read `.ai/runs/<id>/jobs/job-plan-*.json` and extract `.plan.codex_review.findings`. Dispatch `write_plan --run-id <id> --task "Revise plan based on codex findings: <summarised list>"` (cmd_write_plan auto-detects the existing plan.md and treats it as a revision brief). Then re-run `plan --run-id <id>` to get the new verdict. Only when the plan's status is `PASS` should you move to dispatching stages. |
 | `stages_total > 0` and `stages_passed == stages_total` and `stages_blocked == 0` | Every planned stage PASSed but run_complete never ran | Just call `run_complete --run-id <id>`. No re-running. |
 | `0 < stages_passed < stages_total` | Prior session died mid-stages | Resume: identify remaining stages from `jobs_completed` keys (format `run_job:<stage_id>`), dispatch `run_job` for the ones NOT in that dict. Don't re-run completed ones. |
-| `stages_passed == 0` and `plan_done == true` | plan.json written, stages not yet started | Dispatch `run_job` for every stage in plan.json. |
-| `stages_blocked > 0` | Something blocked | Read the blocked job's JSON file (`.ai/runs/<id>/jobs/job-run_job-<stage_id>-*.json`) — its `unresolved` field tells you what's wrong. Decide: re-plan, re-try, or escalate to user. |
+| `stages_passed == 0` and `plan_done == true` and plan status is `PASS` | plan.json written, stages not yet started | Dispatch `run_job` for every stage in plan.json. |
+| `stages_blocked > 0` | Something blocked | Read the blocked job's JSON file (`.ai/runs/<id>/jobs/job-run_job-<stage_id>-*.json`) — its `unresolved` field tells you what's wrong. Decide: re-plan (→ `write_plan` again), re-try (→ `run_job` again), or escalate to user. |
 | `stages_total == 0` | No plan.json (write_plan / cmd_plan didn't run, or parse failed) | Start over from Step 1 of whatever phase you need |
 
 ### Resume path
@@ -106,6 +110,7 @@ in jobs_completed** — always read the latter to know what actually ran.
 - **Never call `run_start`** for an existing run dir — it's already set up.
 - Always cross-reference `jobs_completed` (from list_runs) against plan.json's stage list — stages in plan but NOT in `jobs_completed` with status=PASS are the ones still to run.
 - If `jobs_completed` shows a stage with status BLOCKED / PARTIAL / ERROR, that's a prior failure — read the job JSON for `unresolved` before deciding to retry.
+- `write_plan` and `plan` both work with an existing `--run-id`; `write_plan` detects a prior plan.md and treats the new `--task` as a revision brief. Use this to feed codex findings back in without starting a new run.
 
 ### Fresh path
 
