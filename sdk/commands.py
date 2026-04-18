@@ -250,21 +250,24 @@ def _agents_dir() -> str:
     return str(Path(__file__).parent.parent / "agents")
 
 
-DEFAULT_DASHBOARD_URL = "ws://localhost:8741"
-
-
 def _resolve_dashboard_url(cwd: str, run_id: str, explicit_url: str | None) -> str | None:
-    """Resolve dashboard URL: explicit arg > persisted from run_start > default.
+    """Resolve dashboard URL: explicit arg > persisted from run_start > none.
 
-    Falls back to ws://localhost:8741 so events always stream to dashboard
-    even if team-lead forgets --dashboard-url or skips run_start.
+    If neither is available, return None — NO dashboard connection.
+    Previously this fell back to ws://localhost:8741 ("just in case team-lead
+    forgot --dashboard-url"), but that caused unit tests and any script
+    passing dashboard_url=None on a fresh tempdir to silently connect to
+    whatever dashboard happened to be running on localhost:8741 and
+    pollute it with throwaway run_ids. Team-lead's documented flow runs
+    `run_start --dashboard-url ...` which writes the file for subsequent
+    commands to auto-discover; that path still works.
     """
     if explicit_url:
         return explicit_url
     url_file = Path(cwd) / ".ai" / "runs" / run_id / "dashboard_url"
     if url_file.exists():
         return url_file.read_text().strip()
-    return DEFAULT_DASHBOARD_URL
+    return None
 
 
 def _load_context(cwd: str, run_id: str, level: str = "full") -> str:
