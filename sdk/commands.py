@@ -21,6 +21,8 @@ from sdk.events import (
     JobInterrupted,
     JobRegistered,
     JobStarted,
+    PhaseCompleted,
+    PhaseStarted,
     RunCompleted,
     RunStarted,
     RunValidation,
@@ -376,6 +378,49 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
     try:
         await bus.emit(RunStarted(task="", cwd=cwd, interactive=False))
         result = {"status": "started", "run_id": run_id, "run_dir": str(run_dir)}
+        print(json.dumps(result, indent=2))
+        return result
+    finally:
+        await _teardown(emitter)
+
+
+# ---------------------------------------------------------------------------
+# mark — lightweight phase-marker for team-lead work that happens outside
+# the orchestrator process (e.g. dispatching a Claude Code sub-agent to
+# run the writing-plans skill). One emit, no side effects.
+# ---------------------------------------------------------------------------
+
+async def cmd_mark(
+    run_id: str,
+    cwd: str,
+    dashboard_url: str | None,
+    phase: str,
+    status: str,
+) -> dict:
+    """Emit a PhaseStarted or PhaseCompleted event.
+
+    Used by team-lead to bracket work that happens outside the orchestrator
+    (e.g. general-purpose sub-agents writing plan.md via the superpowers
+    skill). Without this, the dashboard goes silent during those phases
+    even though real work is happening.
+    """
+    if status not in ("started", "completed"):
+        raise ValueError(f"--status must be 'started' or 'completed', got '{status}'")
+
+    bus, emitter = await _setup_bus(run_id, dashboard_url, cwd=cwd)
+    try:
+        event: PhaseStarted | PhaseCompleted
+        if status == "started":
+            event = PhaseStarted(phase=phase)
+        else:
+            event = PhaseCompleted(phase=phase)
+        await bus.emit(event)
+        result = {
+            "status": "ok",
+            "run_id": run_id,
+            "phase": phase,
+            "event_type": event.type,
+        }
         print(json.dumps(result, indent=2))
         return result
     finally:

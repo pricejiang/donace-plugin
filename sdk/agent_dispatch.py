@@ -14,12 +14,15 @@ import os
 import re
 import shlex
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from sdk.events import (
+    AgentCompleted,
     AgentMessage,
+    AgentStarted,
     AgentTokens,
     AgentToolResult,
     AgentToolUse,
@@ -1100,7 +1103,32 @@ class AgentDispatcher:
             }
 
     async def run_codex_plan_review(self, plan_text: str) -> dict:
-        """Run Codex against a staged plan and return structured findings."""
+        """Run Codex against a staged plan and return structured findings.
+
+        Wraps the inner work with AgentStarted/AgentCompleted emits so the
+        dashboard shows activity during this otherwise-silent phase. The
+        underlying codex call goes through `sdk_query` (not `self.query`),
+        so none of the tool-level events would otherwise surface — the
+        run just appears frozen until codex returns minutes later.
+        """
+        await self.bus.emit(AgentStarted(agent="codex-plan-review", model="haiku"))
+        t0 = time.time()
+        result: dict = {"status": "skipped", "has_major_issues": False}
+        try:
+            result = await self._run_codex_plan_review_inner(plan_text)
+            return result
+        finally:
+            summary_parts: list[str] = [f"status={result.get('status', 'unknown')}"]
+            if result.get("has_major_issues"):
+                summary_parts.append("verdict=needs-attention")
+            await self.bus.emit(AgentCompleted(
+                agent="codex-plan-review",
+                duration_s=round(time.time() - t0, 1),
+                result_summary=" ".join(summary_parts),
+            ))
+
+    async def _run_codex_plan_review_inner(self, plan_text: str) -> dict:
+        """Actual codex plan review body — emit wrapping is handled by the public method."""
         codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
         if not codex_plugin_root or not companion_script:
             return {

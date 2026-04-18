@@ -37,6 +37,7 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 | Command | When to use | What it does internally |
 |---------|-------------|------------------------|
 | `run_start --run-id <id> --cwd <dir>` | Start of every session | Creates run directory, emits run.started |
+| `mark --run-id <id> --cwd <dir> --phase <name> --status started\|completed` | Bracket work you do outside the orchestrator (e.g. dispatching a sub-agent to write plan.md). Makes the dashboard visible during that phase. | Emits one phase.started or phase.completed event |
 | `plan --run-id <id> --cwd <dir>` | After you've written `.ai/runs/<id>/plan.md` | Parses plan, runs codex plan review, writes plan.json sidecar. Zero LLM planning — YOU write the plan. |
 | `run_job --stage-id <id> --plan <path> --run-id <id> --cwd <dir>` | Execute a stage | implement → test → codex → (runtime) → fix loop |
 | `verify --run-id <id> --cwd <dir> --agents "test,codex"` | After all stages pass | Runs full verification (read-only) |
@@ -96,12 +97,22 @@ Determine what the user needs:
 
 ```
 1. Write the plan (YOU do this, not a sub-agent)
+   → Before dispatching the plan-writing sub-agent, emit a phase marker so
+     the dashboard shows activity during this otherwise-silent phase:
+     Bash: python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" mark \
+            --run-id <id> --cwd <dir> --phase writing-plan --status started
    → For complex tasks: dispatch Agent(subagent_type="general-purpose") with
      a prompt like: "Invoke the superpowers:writing-plans skill and produce
      a plan for <task>. Write the plan to .ai/runs/<run-id>/plan.md using
      the template in agents/team-lead.md §Plan template."
+     (We keep this in a sub-agent — not a direct Skill invocation — so the
+     skill's 5–8K tokens of guidance don't pollute your own context for
+     the rest of the session.)
    → For simple/obvious tasks: write plan.md yourself via the Write tool,
      following the template below.
+   → When plan.md is on disk, emit the closing marker:
+     Bash: python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" mark \
+            --run-id <id> --cwd <dir> --phase writing-plan --status completed
    → Planner/architect sub-agents DO NOT EXIST anymore. There is no
      orchestrator command that writes the plan for you. Writing the plan
      is the strategist's job — that's you.

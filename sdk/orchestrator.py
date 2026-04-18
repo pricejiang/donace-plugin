@@ -331,6 +331,20 @@ def main() -> None:
     p.add_argument("--cwd", type=str, default=os.getcwd())
     p.add_argument("--dashboard-url", default=None)
 
+    # --- mark ---
+    p = subparsers.add_parser(
+        "mark",
+        help="Emit a phase start/complete marker. For team-lead to bracket "
+             "work that happens outside the orchestrator (e.g. dispatching a "
+             "Claude Code sub-agent to write plan.md via the superpowers skill).",
+    )
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--phase", required=True,
+                   help="Short phase name, e.g. writing-plan")
+    p.add_argument("--status", required=True, choices=["started", "completed"])
+
     # --- plan ---
     p = subparsers.add_parser(
         "plan",
@@ -394,13 +408,19 @@ def main() -> None:
     # --- Subcommand dispatch ---
     from sdk.commands import (
         cmd_run_start, cmd_run_complete, cmd_plan, cmd_run_job,
-        cmd_verify, cmd_review, cmd_document,
+        cmd_verify, cmd_review, cmd_document, cmd_mark,
     )
 
     if args.command == "run_start":
         asyncio.run(cmd_run_start(args.run_id, args.cwd, args.dashboard_url))
     elif args.command == "run_complete":
         asyncio.run(cmd_run_complete(args.run_id, args.cwd, args.dashboard_url))
+    elif args.command == "mark":
+        asyncio.run(cmd_mark(
+            run_id=args.run_id, cwd=args.cwd,
+            dashboard_url=args.dashboard_url,
+            phase=args.phase, status=args.status,
+        ))
     elif args.command == "plan":
         asyncio.run(cmd_plan(
             cwd=args.cwd, run_id=args.run_id,
