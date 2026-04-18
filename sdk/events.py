@@ -616,5 +616,3 @@ class EventBus:
         """Called when dashboard relays a user action."""
         if checkpoint in self._pending and not self._pending[checkpoint].done():
             self._pending[checkpoint].set_result(decision)
-
-

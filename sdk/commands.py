@@ -25,6 +25,7 @@ from sdk.events import (
     RunStarted,
     RunValidation,
     Stage,
+    StageChanged,
 )
 from sdk.emitter import WebSocketEmitter
 
@@ -864,9 +865,12 @@ async def cmd_run_job(
         resolved_plan = Path(plan_path) if Path(plan_path).is_absolute() else Path(cwd) / plan_path
         plan_data = json.loads(resolved_plan.read_text())
         stage_def = None
-        for s in plan_data.get("stages", []):
+        stage_index = 0
+        stages_data = plan_data.get("stages", [])
+        for i, s in enumerate(stages_data):
             if s["id"] == stage_id:
                 stage_def = s
+                stage_index = i
                 break
         if not stage_def:
             raise ValueError(f"Stage '{stage_id}' not found in plan at {plan_path}")
@@ -890,6 +894,12 @@ async def cmd_run_job(
         if not file_scope:
             print(f"Warning: stage '{stage_id}' has no files list — file-scope restriction disabled", file=sys.stderr)
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus, file_scope=file_scope)
+        await bus.emit(StageChanged(
+            stage_name=stage.name,
+            stage_index=stage_index,
+            total_stages=len(stages_data),
+            estimated_turns=stage.estimated_turns,
+        ))
         result = await run_job(
             stage=stage,
             cwd=cwd,

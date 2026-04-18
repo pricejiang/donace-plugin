@@ -120,7 +120,8 @@ def validate_run(
             agents_started.add(agent)
             if agent == "test-engineer":
                 stage = ev.get("stage", "unknown")
-                test_runs_per_stage[stage] += 1
+                if stage and stage != "unknown":
+                    test_runs_per_stage[stage] += 1
 
         elif ev_type == "agent.skipped":
             agents_skipped[agent] = ev.get("reason", "")
@@ -139,7 +140,7 @@ def validate_run(
             elif tool == "Read":
                 target = ev.get("target", "") or ""
                 stage = ev.get("stage", "") or ""
-                if target:
+                if target and stage and stage != "unknown":
                     reads_by_agent_file[(agent, stage, target)] += 1
 
         elif ev_type == "hook.denied":
@@ -161,8 +162,10 @@ def validate_run(
     report.token_summary = dict(tokens_by_agent)
     report.duration_summary = dict(duration_by_agent)
 
+    run_job_results = [j for j in job_results if j.get("command") == "run_job"]
+
     status_counts: dict[str, int] = defaultdict(int)
-    for j in job_results:
+    for j in run_job_results:
         status_counts[j.get("status", "UNKNOWN")] += 1
     report.stage_summary = {
         "passed": status_counts.get("PASS", 0),
@@ -171,12 +174,12 @@ def validate_run(
         "partial": status_counts.get("PARTIAL", 0),
         "interrupted": status_counts.get("INTERRUPTED", 0),
         "review": status_counts.get("REVIEW", 0),
-        "total": len(job_results),
+        "total": len(run_job_results),
     }
 
     # ── Check 1: Missing required agents ──
     # Only meaningful if we have event data; dashboard may have been down.
-    if events:
+    if events and run_job_results:
         for required in REQUIRED_SPRINT_AGENTS:
             if required not in agents_started:
                 report.items.append(RunReportItem(
@@ -251,11 +254,11 @@ def validate_run(
 
     # ── Check 7: All stages blocked ──
     blocked = status_counts.get("BLOCKED", 0)
-    if job_results and blocked == len(job_results):
+    if run_job_results and blocked == len(run_job_results):
         report.items.append(RunReportItem(
             severity="ERROR",
             check="all_stages_blocked",
-            message="All jobs are BLOCKED — nothing was successfully implemented",
+            message="All implementation stages are BLOCKED — nothing was successfully implemented",
         ))
 
     # ── Check 8: Agent timeouts ──
@@ -286,7 +289,7 @@ def validate_run(
     for j in job_results:
         unresolved = j.get("unresolved") or []
         for u in unresolved:
-            if isinstance(u, str) and u.startswith("NEEDS_CONTEXT:"):
+            if isinstance(u, str) and "NEEDS_CONTEXT:" in u:
                 needs_context_jobs.append({
                     "stage_id": j.get("stage_id") or j.get("command", "?"),
                     "message": u,
