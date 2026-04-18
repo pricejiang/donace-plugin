@@ -345,11 +345,26 @@ def main() -> None:
                    help="Short phase name, e.g. writing-plan")
     p.add_argument("--status", required=True, choices=["started", "completed"])
 
+    # --- write_plan ---
+    p = subparsers.add_parser(
+        "write_plan",
+        help="Dispatch the planner agent to produce .ai/runs/<id>/plan.md. "
+             "Use this for complex tasks instead of having team-lead dispatch "
+             "a general-purpose sub-agent — it's dashboard-visible and uses "
+             "the same hook/token/validation infrastructure as every other "
+             "step.",
+    )
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--task", required=True,
+                   help="Task brief for the planner (a short paragraph is fine)")
+
     # --- plan ---
     p = subparsers.add_parser(
         "plan",
         help="Validate existing plan.md, run codex review, write plan.json sidecar. "
-             "Team-lead writes the plan first.",
+             "Team-lead writes the plan first (either directly or via write_plan).",
     )
     p.add_argument("--cwd", type=str, default=os.getcwd())
     p.add_argument("--run-id", required=True)
@@ -408,7 +423,7 @@ def main() -> None:
     # --- Subcommand dispatch ---
     from sdk.commands import (
         cmd_run_start, cmd_run_complete, cmd_plan, cmd_run_job,
-        cmd_verify, cmd_review, cmd_document, cmd_mark,
+        cmd_verify, cmd_review, cmd_document, cmd_mark, cmd_write_plan,
     )
 
     if args.command == "run_start":
@@ -420,6 +435,12 @@ def main() -> None:
             run_id=args.run_id, cwd=args.cwd,
             dashboard_url=args.dashboard_url,
             phase=args.phase, status=args.status,
+        ))
+    elif args.command == "write_plan":
+        asyncio.run(cmd_write_plan(
+            run_id=args.run_id, cwd=args.cwd,
+            dashboard_url=args.dashboard_url,
+            task=args.task,
         ))
     elif args.command == "plan":
         asyncio.run(cmd_plan(

@@ -76,7 +76,7 @@ def _write_job_result(cwd: str, run_id: str, job_id: str, result: dict) -> Path:
 def _supersede_prior_jobs(cwd: str, run_id: str, command: str, current_job_id: str) -> None:
     """Delete prior job-<command>-*.json files from this run.
 
-    Used for idempotent wrap-phase commands (plan, review, verify, document)
+    Used for idempotent commands (write_plan, plan, review, verify, document)
     where the latest invocation represents the current intent. Without this,
     a PARTIAL/ERROR/REVIEW job from an earlier attempt lingers in jobs/ and
     blocks aggregate PASS after a successful retry.
@@ -122,7 +122,7 @@ def _write_error_unless_prior_progress(
     return _write_job_result(cwd, run_id, job_id, result)
 
 
-IDEMPOTENT_JOB_COMMANDS = {"plan", "verify", "review", "document"}
+IDEMPOTENT_JOB_COMMANDS = {"plan", "write_plan", "verify", "review", "document"}
 PROGRESS_JOB_STATUSES = {"PASS", "PARTIAL"}
 
 
@@ -381,6 +381,132 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
         print(json.dumps(result, indent=2))
         return result
     finally:
+        await _teardown(emitter)
+
+
+# ---------------------------------------------------------------------------
+# write_plan — dispatch the planner agent to write .ai/runs/<id>/plan.md.
+# Team-lead uses this instead of spawning a Claude Code general-purpose
+# sub-agent with the writing-plans skill: the dispatched planner goes
+# through the SDK, so every tool_use / token / hook_deny event streams
+# to the dashboard and feeds into validate_run.
+# ---------------------------------------------------------------------------
+
+async def cmd_write_plan(
+    run_id: str,
+    cwd: str,
+    dashboard_url: str | None,
+    task: str,
+) -> dict:
+    """Dispatch the planner agent to produce .ai/runs/<run-id>/plan.md."""
+    # job_id command prefix must match the literal "write_plan" command
+    # name so _supersede_prior_jobs' glob `job-write_plan-*.json` finds
+    # prior attempts. Using a dash here (`job-write-plan-...`) would
+    # orphan stale ERROR jobs across retries.
+    job_id = f"job-write_plan-{uuid.uuid4().hex[:8]}"
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
+    lock_path = _register_job(cwd, run_id, job_id, command="write_plan")
+
+    run_dir = Path(cwd) / ".ai" / "runs" / run_id
+    plan_path = run_dir / "plan.md"
+    plan_rel = plan_path.relative_to(cwd) if plan_path.is_relative_to(cwd) else plan_path
+
+    try:
+        await bus.emit(JobRegistered(
+            job_id=job_id, command="write_plan", pid=os.getpid(),
+        ))
+        await bus.emit(JobStarted(job_id=job_id, command="write_plan"))
+
+        # If a prior plan exists (e.g. revision after codex review), hand
+        # it to the planner so it can revise rather than rewrite blind.
+        existing_plan = ""
+        if plan_path.exists():
+            existing_plan = plan_path.read_text()
+
+        prompt_parts: list[str] = [f"Task:\n{task}"]
+        prompt_parts.append(
+            f"Write the plan to: {plan_path}\n"
+            f"(relative to cwd: {plan_rel})"
+        )
+        if existing_plan:
+            prompt_parts.append(
+                "A PRIOR plan already exists at that path. The task above is "
+                "likely a revision brief (e.g. codex plan review findings). "
+                "Read the existing plan, address the feedback, and overwrite "
+                "it with the revised version.\n\n"
+                "--- existing plan ---\n"
+                f"{existing_plan}\n"
+                "--- end existing plan ---"
+            )
+        prompt = "\n\n".join(prompt_parts)
+
+        # file_scope pins planner's Write/Edit to plan.md only. Planner
+        # has Read/Grep/Glob/Skill for context; no source-code mutation.
+        run_dir.mkdir(parents=True, exist_ok=True)
+        from sdk.agent_dispatch import AgentDispatcher
+        dispatcher = AgentDispatcher(
+            agents_dir=_agents_dir(), cwd=cwd, bus=bus,
+            file_scope=[str(plan_rel)],
+        )
+        await dispatcher.query("planner", prompt, model="opus")
+
+        # Verify the planner actually wrote plan.md
+        if not plan_path.exists():
+            status = "ERROR"
+            error: str | None = (
+                f"planner returned but {plan_rel} was not written"
+            )
+        else:
+            wrote_size = plan_path.stat().st_size
+            if wrote_size < 100:
+                status = "ERROR"
+                error = f"{plan_rel} is suspiciously small ({wrote_size} bytes)"
+            else:
+                status = "PASS"
+                error = None
+
+        result_payload: dict = {
+            "command": "write_plan",
+            "status": status,
+            "plan_path": str(plan_rel),
+        }
+        if error:
+            result_payload["error"] = error
+
+        await bus.emit(JobCompleted(
+            job_id=job_id, command="write_plan", status=status,
+            result_summary=error or f"plan written to {plan_rel}",
+        ))
+
+        if status == "PASS":
+            _supersede_prior_jobs(cwd, run_id, "write_plan", job_id)
+            _write_job_result(cwd, run_id, job_id, result_payload)
+        else:
+            # ERROR path: use the "don't clobber prior progress" writer so
+            # a failed revision doesn't erase the prior PASS record.
+            _write_error_unless_prior_progress(
+                cwd, run_id, job_id, "write_plan", result_payload,
+            )
+
+        print(json.dumps(result_payload, indent=2))
+        return result_payload
+
+    except Exception as exc:
+        await bus.emit(JobCompleted(
+            job_id=job_id, command="write_plan", status="ERROR",
+            result_summary=str(exc),
+        ))
+        error_result = {
+            "command": "write_plan", "status": "ERROR",
+            "error": str(exc),
+        }
+        _write_error_unless_prior_progress(
+            cwd, run_id, job_id, "write_plan", error_result,
+        )
+        print(json.dumps(error_result, indent=2), file=sys.stderr)
+        raise
+    finally:
+        _unregister_job(lock_path)
         await _teardown(emitter)
 
 

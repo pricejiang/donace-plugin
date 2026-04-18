@@ -772,8 +772,12 @@ class AgentDispatcher:
 
     # Per-agent timeout (seconds) and max turns.
     AGENT_TIMEOUT: dict[str, int] = {
-        "planner": 300,
-        "architect": 600,
+        # Planner writes .ai/runs/<id>/plan.md. It invokes the
+        # superpowers:writing-plans skill for non-trivial tasks, reads
+        # a handful of files for context, and produces a structured
+        # plan. 600s covers the skill invocation plus small context
+        # gathering; longer plans should still fit comfortably.
+        "planner": 600,
         "implementer": 900,
         "test-engineer": 600,
         "runtime-verifier": 900,
