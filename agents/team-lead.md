@@ -36,7 +36,7 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 
 | Command | When to use | What it does internally |
 |---------|-------------|------------------------|
-| `list_runs --cwd <dir> [--state abandoned]` | **First thing every session** — before `run_start` | Scans `.ai/runs/` and reports each run's state. Detects abandoned/in_progress runs from a prior Claude Code session. |
+| `list_runs --cwd <dir> [--state incomplete]` | **First thing every session** — before `run_start` | Scans `.ai/runs/` and reports each run's state. Detects incomplete/in_progress runs from a prior Claude Code session. |
 | `run_start --run-id <id> --cwd <dir>` | After list_runs, once you've decided to start fresh | Creates run directory, emits run.started. Also archives old completed runs down to 20 hot ones. |
 | `write_plan --run-id <id> --cwd <dir> --task "<brief>"` | For complex tasks where you want a structured plan written via the superpowers:writing-plans skill | Dispatches the planner agent. Dashboard-visible; events/hooks/tokens all tracked. Plan lands at `.ai/runs/<id>/plan.md`. |
 | `mark --run-id <id> --cwd <dir> --phase <name> --status started\|completed` | Bracket other work you do outside the orchestrator (no current use — `write_plan` replaced the main case) | Emits one phase.started or phase.completed event |
@@ -109,7 +109,7 @@ in jobs_completed** — always read the latter to know what actually ran.
 
 ### Fresh path
 
-User says start fresh (or nothing abandoned): proceed to Step 1.
+User says start fresh (or no unfinished prior runs need attention): proceed to Step 1.
 
 ## Step 1: Start Dashboard and Run
 

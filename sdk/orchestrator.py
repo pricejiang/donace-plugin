@@ -335,8 +335,8 @@ def main() -> None:
     p = subparsers.add_parser(
         "list_runs",
         help="List runs in this project with state (completed / in_progress / "
-             "abandoned / empty). Team-lead uses this at session startup to "
-             "detect abandoned runs that may need to be resumed.",
+             "incomplete / empty). Team-lead uses this at session startup to "
+             "detect incomplete runs that may need to be resumed.",
     )
     p.add_argument("--cwd", type=str, default=os.getcwd())
     p.add_argument("--include-archived", action="store_true",

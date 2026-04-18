@@ -401,7 +401,7 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
 
 # ---------------------------------------------------------------------------
 # list_runs — survey .ai/runs/ (and optionally .ai/archive/) so team-lead
-# can detect abandoned runs on session startup and decide whether to
+# can detect incomplete runs on session startup and decide whether to
 # resume them or start fresh.
 # ---------------------------------------------------------------------------
 
@@ -423,7 +423,7 @@ async def cmd_list_runs(
     Output format (list of dicts, printed as JSON to stdout):
       {
         "run_id": str,
-        "state": "completed" | "in_progress" | "abandoned" | "empty",
+        "state": "completed" | "in_progress" | "incomplete" | "empty",
         "started_at": str (ISO-8601 UTC, "" if unknown),
         "archived": bool,
         ...state-specific fields...
@@ -752,34 +752,26 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
         info["state"] = "completed"
 
     jobs_dir = run_dir / "jobs"
-    review_done = False
-    document_done = False
-    stages_passed = 0
-    stages_blocked = 0
-
     if jobs_dir.exists():
+        job_entries: list[tuple[int, str, dict[str, Any]]] = []
         for jf in jobs_dir.glob("*.json"):
             try:
                 data = json.loads(jf.read_text())
+                stat = jf.stat()
             except (json.JSONDecodeError, OSError):
                 continue
+            job_entries.append((stat.st_mtime_ns, jf.name, data))
+
+        # Later retries supersede earlier attempts for resume/progress
+        # decisions. Ties fall back to filename for deterministic output.
+        for _mtime_ns, _name, data in sorted(job_entries):
             cmd = data.get("command", "") or ""
             stage = data.get("stage_id")
             status = data.get("status", "UNKNOWN") or "UNKNOWN"
             label = f"{cmd}:{stage}" if stage else cmd
             if not label:
-                label = jf.stem
+                label = _name.removesuffix(".json")
             info["jobs_completed"][label] = status
-
-            if cmd == "run_job":
-                if status == "PASS":
-                    stages_passed += 1
-                elif status in ("BLOCKED", "FAIL", "ERROR", "PARTIAL"):
-                    stages_blocked += 1
-            elif cmd == "review" and status == "PASS":
-                review_done = True
-            elif cmd == "document" and status in ("PASS", "PARTIAL"):
-                document_done = True
 
         for lock in jobs_dir.glob("*.lock"):
             try:
@@ -815,6 +807,23 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
             stages_total = len(plan_data.get("stages") or [])
         except (json.JSONDecodeError, OSError):
             pass
+
+    current_jobs = info["jobs_completed"]
+    current_stage_statuses = {
+        label.split(":", 1)[1]: status
+        for label, status in current_jobs.items()
+        if label.startswith("run_job:")
+    }
+    stages_passed = sum(
+        1 for status in current_stage_statuses.values() if status == "PASS"
+    )
+    stages_blocked = sum(
+        1
+        for status in current_stage_statuses.values()
+        if status in ("BLOCKED", "FAIL", "ERROR", "PARTIAL")
+    )
+    review_done = current_jobs.get("review") == "PASS"
+    document_done = current_jobs.get("document") in ("PASS", "PARTIAL")
 
     info["progress"] = {
         "plan_done": (run_dir / "plan.md").exists() or plan_json_path.exists(),
@@ -867,7 +876,7 @@ def _archive_run(run_dir: Path, archive_dir: Path) -> Path:
 def _enforce_run_retention(cwd: str, limit: int = HOT_RUN_LIMIT) -> list[Path]:
     """Archive oldest completed runs so only `limit` newest stay hot.
 
-    Only completed runs are candidates — in_progress/abandoned/empty never
+    Only completed runs are candidates — in_progress/incomplete/empty never
     get archived because the user (or team-lead's resume workflow) may
     still want to touch them. Best-effort: individual archive failures are
     swallowed so a flaky file doesn't block run_start.
