@@ -207,10 +207,10 @@ _SHELL_READER_ALTERNATIVES = {
 _IMPLEMENTER_VERIFY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bpnpm\s+(?:--filter[=\s]\S+\s+)?(?:run\s+)?(?:test|typecheck|build|lint)(?:\b|:)"),
      "pnpm test/typecheck/build/lint"),
-    (re.compile(r"\bnpm\s+(?:run\s+)?(?:test|build|lint)\b"),
-     "npm test/build/lint"),
-    (re.compile(r"\byarn\s+(?:run\s+)?(?:test|build|lint)\b"),
-     "yarn test/build/lint"),
+    (re.compile(r"\bnpm\s+(?:run\s+)?(?:test|typecheck|build|lint)\b"),
+     "npm test/typecheck/build/lint"),
+    (re.compile(r"\byarn\s+(?:run\s+)?(?:test|typecheck|build|lint)\b"),
+     "yarn test/typecheck/build/lint"),
     (re.compile(r"\bnpx\s+(?:vitest|jest|tsc|playwright)\b"),
      "npx vitest/jest/tsc/playwright"),
     (re.compile(r"(?:^|[;&|]\s*)(?:vitest|jest|tsc|eslint|prettier)(?:\s|$)"),
@@ -291,6 +291,26 @@ def _is_test_writable_path(rel_path: str) -> bool:
     """True if rel_path looks like a test file / lives under a test directory."""
     normalized = rel_path.replace("\\", "/")
     return bool(_TEST_PATH_RE.search(normalized))
+
+
+def _extract_needs_context_line(text: str) -> str | None:
+    """Return the message if the agent raised NEEDS_CONTEXT, else None.
+
+    Mirrors the implementer-side helper in job_runner/sprint_loop so the
+    test-engineer escape hatch is detected at dispatch time. Checking the
+    trailing chunk first because the convention is to emit it as the last
+    line of output.
+    """
+    if not text:
+        return None
+    for chunk in (text[-2000:], text):
+        for line in chunk.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("NEEDS_CONTEXT:"):
+                msg = stripped[len("NEEDS_CONTEXT:"):].strip()
+                if msg:
+                    return msg
+    return None
 
 
 def _parse_allowed_subagents(tools: list[str]) -> list[str] | None:
@@ -595,25 +615,23 @@ class AgentDispatcher:
                         abs_path = os.path.normpath(os.path.join(cwd, file_path))
                         rel_path = os.path.relpath(abs_path, cwd)
 
-                    # test-engineer: allowed to write test files OR files
-                    # explicitly listed in stage.files. Source-code edits
-                    # are implementer's turf. Blocks the #3 boundary
-                    # violation from run-phase1-auth where test-engineer
-                    # edited packages/shared/src/schemas/auth.ts.
+                    # test-engineer: only test-looking paths are writable.
+                    # No stage.files exemption — normal stages list source
+                    # files there, and allowing those would re-open the #3
+                    # boundary violation (test-engineer editing
+                    # packages/shared/src/schemas/auth.ts) that this guard
+                    # was added to prevent. If the plan legitimately asks
+                    # test-engineer to edit a non-standard test path,
+                    # expand _TEST_PATH_RE instead of punching a hole here.
                     if agent_name == "test-engineer":
-                        in_stage_files = self.file_scope is not None and any(
-                            rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
-                            for s in self.file_scope
-                        )
-                        if not _is_test_writable_path(rel_path) and not in_stage_files:
+                        if not _is_test_writable_path(rel_path):
                             return {
                                 "decision": "block",
                                 "reason": (
                                     f"test-engineer cannot write '{rel_path}' — "
-                                    f"only test files (under tests/, __tests__/, spec/, "
-                                    f"or *.test.* / *.spec.*) and files listed in "
-                                    f"stage.files are allowed. Source-code edits are "
-                                    f"implementer's job."
+                                    f"only test files (under tests/, __tests__/, "
+                                    f"spec/, or *.test.* / *.spec.*) are allowed. "
+                                    f"Source-code edits are implementer's job."
                                 ),
                             }
                     elif self.file_scope:
@@ -1009,6 +1027,22 @@ class AgentDispatcher:
         response = await self.query(
             agent="test-engineer", prompt=prompt, model="sonnet", tools=readonly_tools,
         )
+
+        # NEEDS_CONTEXT escape hatch: if test-engineer couldn't run tests
+        # (missing test command, opaque tooling failure, etc.) it emits a
+        # line like 'NEEDS_CONTEXT: ...' and stops. Without this check the
+        # missing TEST_SUMMARY would fall through as passed=0 failed=0,
+        # which _collect_failures reads as a clean verifier result, and
+        # the job would incorrectly PASS.
+        nc_msg = _extract_needs_context_line(response)
+        if nc_msg:
+            return {
+                "status": "error",
+                "passed": 0,
+                "failed": 0,
+                "error": f"NEEDS_CONTEXT: {nc_msg}",
+                "output": response[-2000:] if len(response) > 2000 else response,
+            }
 
         # Parse structured output
         passed = 0
