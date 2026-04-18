@@ -331,6 +331,20 @@ def main() -> None:
     p.add_argument("--cwd", type=str, default=os.getcwd())
     p.add_argument("--dashboard-url", default=None)
 
+    # --- list_runs ---
+    p = subparsers.add_parser(
+        "list_runs",
+        help="List runs in this project with state (completed / in_progress / "
+             "abandoned / empty). Team-lead uses this at session startup to "
+             "detect abandoned runs that may need to be resumed.",
+    )
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--include-archived", action="store_true",
+                   help="Also list runs that have been compressed into .ai/archive/")
+    p.add_argument("--state", type=str, default=None,
+                   choices=["completed", "in_progress", "abandoned", "empty"],
+                   help="Only show runs matching this state")
+
     # --- mark ---
     p = subparsers.add_parser(
         "mark",
@@ -424,12 +438,19 @@ def main() -> None:
     from sdk.commands import (
         cmd_run_start, cmd_run_complete, cmd_plan, cmd_run_job,
         cmd_verify, cmd_review, cmd_document, cmd_mark, cmd_write_plan,
+        cmd_list_runs,
     )
 
     if args.command == "run_start":
         asyncio.run(cmd_run_start(args.run_id, args.cwd, args.dashboard_url))
     elif args.command == "run_complete":
         asyncio.run(cmd_run_complete(args.run_id, args.cwd, args.dashboard_url))
+    elif args.command == "list_runs":
+        asyncio.run(cmd_list_runs(
+            cwd=args.cwd,
+            include_archived=args.include_archived,
+            state_filter=args.state,
+        ))
     elif args.command == "mark":
         asyncio.run(cmd_mark(
             run_id=args.run_id, cwd=args.cwd,

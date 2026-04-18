@@ -36,7 +36,8 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 
 | Command | When to use | What it does internally |
 |---------|-------------|------------------------|
-| `run_start --run-id <id> --cwd <dir>` | Start of every session | Creates run directory, emits run.started |
+| `list_runs --cwd <dir> [--state abandoned]` | **First thing every session** — before `run_start` | Scans `.ai/runs/` and reports each run's state. Detects abandoned/in_progress runs from a prior Claude Code session. |
+| `run_start --run-id <id> --cwd <dir>` | After list_runs, once you've decided to start fresh | Creates run directory, emits run.started. Also archives old completed runs down to 20 hot ones. |
 | `write_plan --run-id <id> --cwd <dir> --task "<brief>"` | For complex tasks where you want a structured plan written via the superpowers:writing-plans skill | Dispatches the planner agent. Dashboard-visible; events/hooks/tokens all tracked. Plan lands at `.ai/runs/<id>/plan.md`. |
 | `mark --run-id <id> --cwd <dir> --phase <name> --status started\|completed` | Bracket other work you do outside the orchestrator (no current use — `write_plan` replaced the main case) | Emits one phase.started or phase.completed event |
 | `plan --run-id <id> --cwd <dir>` | After `.ai/runs/<id>/plan.md` exists (from write_plan or your own Write) | Parses plan, runs codex plan review, writes plan.json sidecar. Zero LLM planning. |
@@ -66,15 +67,43 @@ Foreground (usually fast):  run_complete  (minutes if wrap skipped)
 Background (minutes):       plan, run_job, verify, review, document
 ```
 
-## Step 1: Start Dashboard and Run
+## Step 0: Check for abandoned prior runs
 
-Before doing anything else:
+Before creating a new run, scan for in-progress or abandoned runs from
+a prior Claude Code session. If the user killed Claude Code mid-work and
+restarted, the old run dir still has `plan.md`, a partial `jobs/`, and
+maybe stale `*.lock` files with dead pids — but no one told you about
+it because you're a fresh agent.
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs --cwd <project-root>
+```
+
+Interpret the output:
+
+| state | what it means | what you do |
+|---|---|---|
+| `in_progress` | Another process is actively running this run (live pid on some lock) | Do NOT start a new run. Tell the user — another session/process is working. |
+| `abandoned` | Prior session died mid-run. plan / jobs are partial. | Ask the user: "Found abandoned run `<id>` from `<started_at>` — resume it or start fresh?" |
+| `completed` | `result.json` exists. Done. | Ignore — nothing to resume. |
+| `empty` | Dir exists but is essentially blank (rare) | Ignore. |
+
+**Resume path** (if user says resume): do NOT call `run_start` — the dir
+already exists. Read `.ai/runs/<id>/plan.json` to see which stages
+completed, then dispatch the remaining `run_job`s. If plan.md is
+missing/corrupt, team-lead should decide: restore from a prior
+`write_plan` record or start the stage from scratch.
+
+**Fresh path** (user says start fresh, or no abandoned runs): proceed
+to Step 1.
+
+## Step 1: Start Dashboard and Run
 
 ```bash
 # Start dashboard (if not running) — absolute path, no cd needed
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/dashboard.py" --port 8741 &
 
-# Start run
+# Start run — auto-archives old completed runs down to the 20 newest
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" run_start \
   --run-id <generate-uuid> \
   --cwd <project-root> \

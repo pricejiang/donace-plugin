@@ -359,8 +359,23 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
     can distinguish "PNG created during this run" from pre-existing user
     assets. Directory mtime is unreliable — it updates on every child
     file write, so by cleanup time it's ~now, defeating the filter.
+
+    Before creating the new run dir, opportunistically archives old
+    completed runs down to the HOT_RUN_LIMIT cap (see _enforce_run_retention).
     """
     import time as _time
+
+    # Retention: archive older completed runs so .ai/runs/ doesn't grow
+    # unbounded. Best-effort — failures don't block run_start.
+    try:
+        archived = _enforce_run_retention(cwd)
+        if archived:
+            print(
+                f"Archived {len(archived)} older completed run(s) to .ai/archive/",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: run retention failed: {exc}", file=sys.stderr)
 
     run_dir = Path(cwd) / ".ai" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -382,6 +397,85 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
         return result
     finally:
         await _teardown(emitter)
+
+
+# ---------------------------------------------------------------------------
+# list_runs — survey .ai/runs/ (and optionally .ai/archive/) so team-lead
+# can detect abandoned runs on session startup and decide whether to
+# resume them or start fresh.
+# ---------------------------------------------------------------------------
+
+def _format_iso_utc(ts: float) -> str:
+    """Unix timestamp → ISO-8601 UTC string (no fractional seconds)."""
+    import datetime as _dt
+    if not ts:
+        return ""
+    return _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def cmd_list_runs(
+    cwd: str,
+    include_archived: bool = False,
+    state_filter: str | None = None,
+) -> list[dict]:
+    """List runs in this project with their state.
+
+    Output format (list of dicts, printed as JSON to stdout):
+      {
+        "run_id": str,
+        "state": "completed" | "in_progress" | "abandoned" | "empty",
+        "started_at": str (ISO-8601 UTC, "" if unknown),
+        "archived": bool,
+        ...state-specific fields...
+      }
+
+    Sorted by started_at descending (newest first). Dashboard-ordering
+    compatible.
+    """
+    results: list[dict] = []
+
+    runs_root = Path(cwd) / ".ai" / "runs"
+    if runs_root.exists():
+        for d in runs_root.iterdir():
+            if not d.is_dir():
+                continue
+            info = _classify_run_state(d)
+            entry: dict = {
+                "run_id": d.name,
+                "state": info["state"],
+                "started_at": _format_iso_utc(_run_start_time(d)),
+                "archived": False,
+            }
+            # Only include non-empty lists to keep output tidy
+            if info["jobs_completed"]:
+                entry["jobs_completed"] = sorted(set(info["jobs_completed"]))
+            if info["live_locks"]:
+                entry["live_locks"] = info["live_locks"]
+            if info["stale_locks"]:
+                entry["stale_locks"] = info["stale_locks"]
+            results.append(entry)
+
+    if include_archived:
+        archive_root = Path(cwd) / ".ai" / "archive"
+        if archive_root.exists():
+            for f in archive_root.glob("*.tar.gz"):
+                results.append({
+                    "run_id": f.stem.removesuffix(".tar"),
+                    "state": "completed",
+                    "started_at": _format_iso_utc(f.stat().st_mtime),
+                    "archived": True,
+                    "archive_path": str(f.relative_to(cwd) if f.is_relative_to(cwd) else f),
+                })
+
+    # Filter by state if requested
+    if state_filter:
+        results = [r for r in results if r["state"] == state_filter]
+
+    # Sort newest first (empty started_at sorts to the end)
+    results.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+
+    print(json.dumps(results, indent=2))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +710,143 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Run retention: classify each run dir by state and archive old completed ones
+# so `.ai/runs/` doesn't grow unbounded and glob scans stay fast.
+# ---------------------------------------------------------------------------
+
+HOT_RUN_LIMIT = 20  # how many completed runs stay uncompressed in .ai/runs/
+
+
+def _classify_run_state(run_dir: Path) -> dict[str, Any]:
+    """Inspect a single run dir and return {state, live_pids, stale_locks, ...}.
+
+    States:
+      completed  — result.json exists (cmd_run_complete ran)
+      in_progress — at least one *.lock has a live pid
+      abandoned  — has plan/jobs but no result.json and no live locks
+      empty      — fresh run_start dir with nothing inside yet
+    """
+    info: dict[str, Any] = {
+        "state": "empty",
+        "live_locks": [],
+        "stale_locks": [],
+        "jobs_completed": [],
+    }
+    if (run_dir / "result.json").exists():
+        info["state"] = "completed"
+
+    jobs_dir = run_dir / "jobs"
+    if jobs_dir.exists():
+        for jf in jobs_dir.glob("*.json"):
+            try:
+                data = json.loads(jf.read_text())
+                cmd = data.get("command", "")
+                stage = data.get("stage_id")
+                label = f"{cmd}:{stage}" if stage else cmd
+                info["jobs_completed"].append(label or jf.stem)
+            except (json.JSONDecodeError, OSError):
+                continue
+        for lock in jobs_dir.glob("*.lock"):
+            try:
+                data = json.loads(lock.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            pid = data.get("pid")
+            lock_info = {
+                "job_id": data.get("job_id"),
+                "command": data.get("command"),
+                "pid": pid,
+            }
+            if _pid_alive(pid):
+                info["live_locks"].append(lock_info)
+            else:
+                info["stale_locks"].append(lock_info)
+
+    # Override state based on observed live/stale activity
+    if info["state"] != "completed":
+        if info["live_locks"]:
+            info["state"] = "in_progress"
+        elif info["jobs_completed"] or info["stale_locks"] \
+                or (run_dir / "plan.md").exists() \
+                or (run_dir / "plan.json").exists():
+            info["state"] = "abandoned"
+
+    return info
+
+
+def _run_start_time(run_dir: Path) -> float:
+    """Unix timestamp of when this run started. Falls back to dir mtime."""
+    start_file = run_dir / ".start_time"
+    try:
+        return float(start_file.read_text().strip())
+    except (OSError, ValueError):
+        try:
+            return run_dir.stat().st_mtime
+        except OSError:
+            return 0.0
+
+
+def _archive_run(run_dir: Path, archive_dir: Path) -> Path:
+    """tar.gz a run dir into .ai/archive/<run_id>.tar.gz, then delete original."""
+    import shutil
+    import tarfile
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / f"{run_dir.name}.tar.gz"
+    # Write to a tmp name first so an interrupted archive doesn't leave a
+    # half-written .tar.gz sitting next to a deleted source.
+    tmp_path = archive_path.with_suffix(".tar.gz.partial")
+    try:
+        with tarfile.open(tmp_path, "w:gz") as tar:
+            tar.add(run_dir, arcname=run_dir.name)
+        os.replace(tmp_path, archive_path)  # atomic on same fs
+        shutil.rmtree(run_dir)
+    except (OSError, tarfile.TarError):
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return archive_path
+
+
+def _enforce_run_retention(cwd: str, limit: int = HOT_RUN_LIMIT) -> list[Path]:
+    """Archive oldest completed runs so only `limit` newest stay hot.
+
+    Only completed runs are candidates — in_progress/abandoned/empty never
+    get archived because the user (or team-lead's resume workflow) may
+    still want to touch them. Best-effort: individual archive failures are
+    swallowed so a flaky file doesn't block run_start.
+    """
+    runs_root = Path(cwd) / ".ai" / "runs"
+    if not runs_root.exists():
+        return []
+
+    completed: list[tuple[float, Path]] = []
+    for d in runs_root.iterdir():
+        if not d.is_dir():
+            continue
+        info = _classify_run_state(d)
+        if info["state"] != "completed":
+            continue
+        completed.append((_run_start_time(d), d))
+
+    if len(completed) <= limit:
+        return []
+
+    completed.sort(key=lambda x: -x[0])  # newest first
+    to_archive = completed[limit:]
+    archive_dir = Path(cwd) / ".ai" / "archive"
+
+    archived: list[Path] = []
+    for _, d in to_archive:
+        try:
+            archived.append(_archive_run(d, archive_dir))
+        except (OSError, Exception):  # noqa: BLE001 — truly best-effort
+            pass
+    return archived
 
 
 def _scan_job_state(jobs_dir: Path) -> tuple[set[str], set[str]]:
