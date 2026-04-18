@@ -67,35 +67,49 @@ Foreground (usually fast):  run_complete  (minutes if wrap skipped)
 Background (minutes):       plan, run_job, verify, review, document
 ```
 
-## Step 0: Check for abandoned prior runs
+## Step 0: Check for unfinished prior runs
 
-Before creating a new run, scan for in-progress or abandoned runs from
-a prior Claude Code session. If the user killed Claude Code mid-work and
-restarted, the old run dir still has `plan.md`, a partial `jobs/`, and
-maybe stale `*.lock` files with dead pids — but no one told you about
-it because you're a fresh agent.
+Before creating a new run, scan for prior runs that need attention — a
+session that died mid-work, or one that finished all stages but never
+called `run_complete`.
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs --cwd <project-root>
 ```
 
-Interpret the output:
+Each run entry includes `state`, `progress`, and (if applicable)
+`jobs_completed` (a dict mapping `"run_job:stage-N"` → `"PASS"` or
+`"BLOCKED"` etc.). **plan.json lists planned stages; completion lives
+in jobs_completed** — always read the latter to know what actually ran.
 
-| state | what it means | what you do |
+### State decision table
+
+| state | meaning | action |
 |---|---|---|
-| `in_progress` | Another process is actively running this run (live pid on some lock) | Do NOT start a new run. Tell the user — another session/process is working. |
-| `abandoned` | Prior session died mid-run. plan / jobs are partial. | Ask the user: "Found abandoned run `<id>` from `<started_at>` — resume it or start fresh?" |
-| `completed` | `result.json` exists. Done. | Ignore — nothing to resume. |
-| `empty` | Dir exists but is essentially blank (rare) | Ignore. |
+| `in_progress` | Some `*.lock` has a live pid — **another process is running this run right now** | Do NOT start a new run. Warn user; maybe wait. |
+| `completed` | `result.json` exists — run was formally closed | Ignore. |
+| `empty` | Fresh run_start dir, no jobs yet | Ignore. |
+| `incomplete` | Run started but `result.json` missing | Inspect `progress` to decide (next table) |
 
-**Resume path** (if user says resume): do NOT call `run_start` — the dir
-already exists. Read `.ai/runs/<id>/plan.json` to see which stages
-completed, then dispatch the remaining `run_job`s. If plan.md is
-missing/corrupt, team-lead should decide: restore from a prior
-`write_plan` record or start the stage from scratch.
+### `incomplete` sub-cases — read `progress` to decide
 
-**Fresh path** (user says start fresh, or no abandoned runs): proceed
-to Step 1.
+| progress signal | what it means | action |
+|---|---|---|
+| `stages_total > 0` and `stages_passed == stages_total` and `stages_blocked == 0` | Every planned stage PASSed but run_complete never ran | Just call `run_complete --run-id <id>`. No re-running. |
+| `0 < stages_passed < stages_total` | Prior session died mid-stages | Resume: identify remaining stages from `jobs_completed` keys (format `run_job:<stage_id>`), dispatch `run_job` for the ones NOT in that dict. Don't re-run completed ones. |
+| `stages_passed == 0` and `plan_done == true` | plan.json written, stages not yet started | Dispatch `run_job` for every stage in plan.json. |
+| `stages_blocked > 0` | Something blocked | Read the blocked job's JSON file (`.ai/runs/<id>/jobs/job-run_job-<stage_id>-*.json`) — its `unresolved` field tells you what's wrong. Decide: re-plan, re-try, or escalate to user. |
+| `stages_total == 0` | No plan.json (write_plan / cmd_plan didn't run, or parse failed) | Start over from Step 1 of whatever phase you need |
+
+### Resume path
+
+- **Never call `run_start`** for an existing run dir — it's already set up.
+- Always cross-reference `jobs_completed` (from list_runs) against plan.json's stage list — stages in plan but NOT in `jobs_completed` with status=PASS are the ones still to run.
+- If `jobs_completed` shows a stage with status BLOCKED / PARTIAL / ERROR, that's a prior failure — read the job JSON for `unresolved` before deciding to retry.
+
+### Fresh path
+
+User says start fresh (or nothing abandoned): proceed to Step 1.
 
 ## Step 1: Start Dashboard and Run
 

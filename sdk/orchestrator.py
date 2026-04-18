@@ -342,7 +342,7 @@ def main() -> None:
     p.add_argument("--include-archived", action="store_true",
                    help="Also list runs that have been compressed into .ai/archive/")
     p.add_argument("--state", type=str, default=None,
-                   choices=["completed", "in_progress", "abandoned", "empty"],
+                   choices=["completed", "in_progress", "incomplete", "empty"],
                    help="Only show runs matching this state")
 
     # --- mark ---

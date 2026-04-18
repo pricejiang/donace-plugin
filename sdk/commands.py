@@ -445,10 +445,10 @@ async def cmd_list_runs(
                 "state": info["state"],
                 "started_at": _format_iso_utc(_run_start_time(d)),
                 "archived": False,
+                "progress": info["progress"],
             }
-            # Only include non-empty lists to keep output tidy
             if info["jobs_completed"]:
-                entry["jobs_completed"] = sorted(set(info["jobs_completed"]))
+                entry["jobs_completed"] = info["jobs_completed"]  # label → status
             if info["live_locks"]:
                 entry["live_locks"] = info["live_locks"]
             if info["stale_locks"]:
@@ -721,34 +721,66 @@ HOT_RUN_LIMIT = 20  # how many completed runs stay uncompressed in .ai/runs/
 
 
 def _classify_run_state(run_dir: Path) -> dict[str, Any]:
-    """Inspect a single run dir and return {state, live_pids, stale_locks, ...}.
+    """Inspect a single run dir and return {state, jobs_completed, progress, ...}.
 
     States:
-      completed  — result.json exists (cmd_run_complete ran)
+      completed   — result.json exists (cmd_run_complete ran)
       in_progress — at least one *.lock has a live pid
-      abandoned  — has plan/jobs but no result.json and no live locks
-      empty      — fresh run_start dir with nothing inside yet
+      incomplete  — has plan/jobs but no result.json and no live locks;
+                    team-lead may resume OR just run_complete if done
+      empty       — fresh run_start dir with nothing inside yet
+
+    `jobs_completed` is a dict mapping label → status ("PASS", "BLOCKED",
+    etc.) so callers can distinguish successful stages from ones that
+    need rework. Reading plan.json alone does NOT tell you what finished
+    — that lives in jobs/job-*.json.
+
+    `progress` summarises the run at a glance so team-lead's resume
+    decision doesn't need to cross-reference files:
+      plan_done, stages_total, stages_passed, stages_blocked,
+      review_done, document_done, run_completed.
     """
     info: dict[str, Any] = {
         "state": "empty",
         "live_locks": [],
         "stale_locks": [],
-        "jobs_completed": [],
+        "jobs_completed": {},  # label → status
     }
-    if (run_dir / "result.json").exists():
+    result_json_path = run_dir / "result.json"
+    result_json_exists = result_json_path.exists()
+    if result_json_exists:
         info["state"] = "completed"
 
     jobs_dir = run_dir / "jobs"
+    review_done = False
+    document_done = False
+    stages_passed = 0
+    stages_blocked = 0
+
     if jobs_dir.exists():
         for jf in jobs_dir.glob("*.json"):
             try:
                 data = json.loads(jf.read_text())
-                cmd = data.get("command", "")
-                stage = data.get("stage_id")
-                label = f"{cmd}:{stage}" if stage else cmd
-                info["jobs_completed"].append(label or jf.stem)
             except (json.JSONDecodeError, OSError):
                 continue
+            cmd = data.get("command", "") or ""
+            stage = data.get("stage_id")
+            status = data.get("status", "UNKNOWN") or "UNKNOWN"
+            label = f"{cmd}:{stage}" if stage else cmd
+            if not label:
+                label = jf.stem
+            info["jobs_completed"][label] = status
+
+            if cmd == "run_job":
+                if status == "PASS":
+                    stages_passed += 1
+                elif status in ("BLOCKED", "FAIL", "ERROR", "PARTIAL"):
+                    stages_blocked += 1
+            elif cmd == "review" and status == "PASS":
+                review_done = True
+            elif cmd == "document" and status in ("PASS", "PARTIAL"):
+                document_done = True
+
         for lock in jobs_dir.glob("*.lock"):
             try:
                 data = json.loads(lock.read_text())
@@ -772,7 +804,27 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
         elif info["jobs_completed"] or info["stale_locks"] \
                 or (run_dir / "plan.md").exists() \
                 or (run_dir / "plan.json").exists():
-            info["state"] = "abandoned"
+            info["state"] = "incomplete"
+
+    # Progress: how much of the plan actually happened?
+    plan_json_path = run_dir / "plan.json"
+    stages_total = 0
+    if plan_json_path.exists():
+        try:
+            plan_data = json.loads(plan_json_path.read_text())
+            stages_total = len(plan_data.get("stages") or [])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    info["progress"] = {
+        "plan_done": (run_dir / "plan.md").exists() or plan_json_path.exists(),
+        "stages_total": stages_total,
+        "stages_passed": stages_passed,
+        "stages_blocked": stages_blocked,
+        "review_done": review_done,
+        "document_done": document_done,
+        "run_completed": result_json_exists,
+    }
 
     return info
 
