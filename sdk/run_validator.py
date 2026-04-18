@@ -1,16 +1,17 @@
 """Run validator — pure Python checks on pipeline run quality.
 
-Analyzes event stream and sprint results to detect anomalies:
-token waste, missing agents, unexpected behavior, etc.
-Zero LLM cost, runs in < 1 second.
+Analyzes event stream + aggregated job results to detect anomalies:
+token waste, missing agents, hook denies, agent re-reading same files,
+NEEDS_CONTEXT frequency, fix-loop exhaustion, etc.
+
+Zero LLM cost, runs in < 1 second. Output feeds back into result.json
+so team-lead can reflect on the run and spot pipeline improvements.
 """
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
-
-from sdk.events import SprintResult
 
 
 # ---------------------------------------------------------------------------
@@ -58,9 +59,15 @@ class RunReport:
 # Thresholds
 # ---------------------------------------------------------------------------
 
-MAX_AGENT_OUTPUT_TOKENS = 25_000
-TEST_TO_IMPL_TOKEN_RATIO = 2.0
+MAX_AGENT_OUTPUT_TOKENS = 25_000          # single-call output that feels high
+TEST_TO_IMPL_TOKEN_RATIO = 2.0            # test-engineer > 2× implementer = weird
 REQUIRED_SPRINT_AGENTS = {"implementer", "test-engineer"}
+
+# New-check thresholds
+NEEDS_CONTEXT_THRESHOLD = 2               # 2+ NEEDS_CONTEXT → plan likely under-specified
+HOOK_DENY_THRESHOLD = 3                   # 3+ hook denies for one agent → prompt rules not working
+REPEATED_STAGE_FAILURE_THRESHOLD = 2      # same stage_id BLOCKED ≥ 2× → systemic issue
+DUPLICATE_READ_THRESHOLD = 3              # same (agent, file) Read ≥ 3× → thrashing
 
 
 # ---------------------------------------------------------------------------
@@ -69,23 +76,32 @@ REQUIRED_SPRINT_AGENTS = {"implementer", "test-engineer"}
 
 def validate_run(
     events: list[dict[str, Any]],
-    sprint_result: SprintResult,
+    job_results: list[dict[str, Any]],
     stack: str | None,
 ) -> RunReport:
-    """Validate a completed run and return a diagnostic report."""
+    """Validate a completed run and return a diagnostic report.
+
+    Args:
+        events: Full event list for this run (from dashboard or local log).
+            Can be empty — signals-by-job-result checks still run.
+        job_results: Aggregated job result dicts from .ai/runs/<id>/jobs/*.json.
+        stack: Detected project stack (typescript/ios/python/both/None).
+    """
     report = RunReport()
 
-    # ── Gather data from events ──
+    # ── Pass 1: gather stats from events ──
     tokens_by_agent: dict[str, dict[str, int]] = defaultdict(
         lambda: {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0}
     )
     duration_by_agent: dict[str, float] = defaultdict(float)
     agents_started: set[str] = set()
-    agents_skipped: dict[str, str] = {}  # agent → reason
-    agents_failed: dict[str, str] = {}   # agent → error
+    agents_skipped: dict[str, str] = {}
+    agents_failed: dict[str, str] = {}
     skill_calls: list[dict] = []
     fix_loop_exhausted: list[dict] = []
     test_runs_per_stage: dict[str, int] = defaultdict(int)
+    hook_denies_by_agent: dict[str, list[dict]] = defaultdict(list)
+    reads_by_agent_file: dict[tuple[str, str, str], int] = defaultdict(int)  # (agent, stage, target) → count
 
     for ev in events:
         ev_type = ev.get("type", "")
@@ -112,10 +128,25 @@ def validate_run(
         elif ev_type == "agent.failed":
             agents_failed[agent] = ev.get("error", "")
 
-        elif ev_type == "agent.tool_use" and ev.get("tool") == "Skill":
-            skill_calls.append({
-                "agent": agent,
-                "skill": ev.get("input_preview", ""),
+        elif ev_type == "agent.tool_use":
+            tool = ev.get("tool", "")
+            if tool == "Skill":
+                skill_calls.append({
+                    "agent": agent,
+                    "skill": ev.get("input_preview", ""),
+                    "stage": ev.get("stage", ""),
+                })
+            elif tool == "Read":
+                target = ev.get("target", "") or ""
+                stage = ev.get("stage", "") or ""
+                if target:
+                    reads_by_agent_file[(agent, stage, target)] += 1
+
+        elif ev_type == "hook.denied":
+            hook_denies_by_agent[agent].append({
+                "tool": ev.get("tool", ""),
+                "reason": ev.get("reason", ""),
+                "input_preview": ev.get("input_preview", ""),
                 "stage": ev.get("stage", ""),
             })
 
@@ -126,47 +157,62 @@ def validate_run(
                 "remaining": ev.get("remaining_failures", []),
             })
 
-    # ── Populate summaries ──
+    # ── Pass 2: summaries derived from job_results ──
     report.token_summary = dict(tokens_by_agent)
     report.duration_summary = dict(duration_by_agent)
+
+    status_counts: dict[str, int] = defaultdict(int)
+    for j in job_results:
+        status_counts[j.get("status", "UNKNOWN")] += 1
     report.stage_summary = {
-        "passed": sum(1 for s in sprint_result.stages if s.status == "PASS"),
-        "blocked": sum(1 for s in sprint_result.stages if s.status == "BLOCKED"),
-        "skipped": sum(1 for s in sprint_result.stages if s.status == "SKIPPED"),
-        "total": len(sprint_result.stages),
+        "passed": status_counts.get("PASS", 0),
+        "blocked": status_counts.get("BLOCKED", 0),
+        "skipped": status_counts.get("SKIPPED", 0),
+        "partial": status_counts.get("PARTIAL", 0),
+        "interrupted": status_counts.get("INTERRUPTED", 0),
+        "review": status_counts.get("REVIEW", 0),
+        "total": len(job_results),
     }
 
     # ── Check 1: Missing required agents ──
-    for required in REQUIRED_SPRINT_AGENTS:
-        if required not in agents_started:
-            report.items.append(RunReportItem(
-                severity="ERROR",
-                check="missing_agent",
-                message=f"Required agent '{required}' never started during sprint",
-            ))
+    # Only meaningful if we have event data; dashboard may have been down.
+    if events:
+        for required in REQUIRED_SPRINT_AGENTS:
+            if required not in agents_started:
+                report.items.append(RunReportItem(
+                    severity="ERROR",
+                    check="missing_agent",
+                    message=f"Required agent '{required}' never started during run",
+                ))
 
     # ── Check 2: Final review skipped when stack is known ──
-    if stack and stack != "unknown":
-        reviewer = "typescript-reviewer" if stack in ("typescript", "both") else "ios-reviewer" if stack == "ios" else None
+    if stack and stack != "unknown" and events:
+        reviewer = (
+            "typescript-reviewer" if stack in ("typescript", "both")
+            else "ios-reviewer" if stack == "ios"
+            else None
+        )
         if reviewer and reviewer not in agents_started:
             skip_reason = agents_skipped.get("final-review", "")
             report.items.append(RunReportItem(
                 severity="WARNING",
                 check="final_review_skipped",
-                message=f"Stack is '{stack}' but final review was skipped: {skip_reason}",
+                message=f"Stack is '{stack}' but no {reviewer} invocation observed",
                 details={"stack": stack, "reviewer": reviewer, "reason": skip_reason},
             ))
 
-    # ── Check 3: Token anomaly (single agent > 25K output) ──
+    # ── Check 3: Token anomaly (single agent > threshold output) ──
     for agent, usage in tokens_by_agent.items():
-        if agent.startswith("planner") or agent.startswith("architect"):
-            continue  # plan/architecture output can be long
         if usage["output"] > MAX_AGENT_OUTPUT_TOKENS:
             report.items.append(RunReportItem(
                 severity="WARNING",
                 check="token_anomaly",
                 message=f"'{agent}' produced {usage['output']:,} output tokens (threshold: {MAX_AGENT_OUTPUT_TOKENS:,})",
-                details={"agent": agent, "output_tokens": usage["output"], "threshold": MAX_AGENT_OUTPUT_TOKENS},
+                details={
+                    "agent": agent,
+                    "output_tokens": usage["output"],
+                    "threshold": MAX_AGENT_OUTPUT_TOKENS,
+                },
             ))
 
     # ── Check 4: Token ratio (test-engineer vs implementer) ──
@@ -177,11 +223,11 @@ def validate_run(
         report.items.append(RunReportItem(
             severity="WARNING",
             check="token_ratio_anomaly",
-            message=f"test-engineer output ({test_out:,}) is {ratio}x implementer output ({impl_out:,})",
+            message=f"test-engineer output ({test_out:,}) is {ratio}× implementer output ({impl_out:,})",
             details={"test_output": test_out, "impl_output": impl_out, "ratio": ratio},
         ))
 
-    # ── Check 5: Skill calls (informational) ──
+    # ── Check 5: Skill calls from worker agents (informational) ──
     for call in skill_calls:
         report.items.append(RunReportItem(
             severity="INFO",
@@ -196,30 +242,23 @@ def validate_run(
         report.items.append(RunReportItem(
             severity="WARNING",
             check="fix_loop_exhausted",
-            message=f"Fix loop exhausted after {exhausted['attempt']} attempts in '{exhausted['stage']}' with {len(remaining)} unresolved issue(s)",
+            message=(
+                f"Fix loop exhausted after {exhausted['attempt']} attempts "
+                f"in '{exhausted['stage']}' with {len(remaining)} unresolved issue(s)"
+            ),
             details=exhausted,
         ))
 
     # ── Check 7: All stages blocked ──
-    if sprint_result.stages and all(s.status == "BLOCKED" for s in sprint_result.stages):
+    blocked = status_counts.get("BLOCKED", 0)
+    if job_results and blocked == len(job_results):
         report.items.append(RunReportItem(
             severity="ERROR",
             check="all_stages_blocked",
-            message="All stages are BLOCKED — nothing was successfully implemented",
+            message="All jobs are BLOCKED — nothing was successfully implemented",
         ))
 
-    # ── Check 8: Codex review skipped unexpectedly ──
-    if "codex-review" in agents_skipped:
-        reason = agents_skipped["codex-review"]
-        if "not found" not in reason.lower() and "disabled" not in reason.lower():
-            report.items.append(RunReportItem(
-                severity="WARNING",
-                check="codex_skipped",
-                message=f"Codex review was skipped: {reason}",
-                details={"reason": reason},
-            ))
-
-    # ── Check 9: Agent timeouts ──
+    # ── Check 8: Agent timeouts ──
     for agent, error in agents_failed.items():
         if "timed out" in error.lower():
             report.items.append(RunReportItem(
@@ -229,7 +268,7 @@ def validate_run(
                 details={"agent": agent, "error": error},
             ))
 
-    # ── Check 10: Excessive test reruns ──
+    # ── Check 9: Excessive test reruns ──
     for stage, count in test_runs_per_stage.items():
         if count > 2:
             report.items.append(RunReportItem(
@@ -238,6 +277,117 @@ def validate_run(
                 message=f"test-engineer ran {count} times in stage '{stage}'",
                 details={"stage": stage, "count": count},
             ))
+
+    # ── Check 10 (NEW): NEEDS_CONTEXT frequency ──
+    # A job signals NEEDS_CONTEXT by returning BLOCKED with an unresolved
+    # line starting with "NEEDS_CONTEXT:". Multiple in one run means the
+    # plan is consistently under-specified — team-lead should enrich.
+    needs_context_jobs: list[dict] = []
+    for j in job_results:
+        unresolved = j.get("unresolved") or []
+        for u in unresolved:
+            if isinstance(u, str) and u.startswith("NEEDS_CONTEXT:"):
+                needs_context_jobs.append({
+                    "stage_id": j.get("stage_id") or j.get("command", "?"),
+                    "message": u,
+                })
+                break
+    if len(needs_context_jobs) >= NEEDS_CONTEXT_THRESHOLD:
+        report.items.append(RunReportItem(
+            severity="WARNING",
+            check="needs_context_frequency",
+            message=(
+                f"{len(needs_context_jobs)} job(s) raised NEEDS_CONTEXT — "
+                f"the plan is likely under-specified for this pipeline"
+            ),
+            details={"count": len(needs_context_jobs), "jobs": needs_context_jobs},
+        ))
+    elif needs_context_jobs:
+        # Single NEEDS_CONTEXT is informational, not a warning
+        report.items.append(RunReportItem(
+            severity="INFO",
+            check="needs_context",
+            message=f"1 job raised NEEDS_CONTEXT: {needs_context_jobs[0]['message']}",
+            details=needs_context_jobs[0],
+        ))
+
+    # ── Check 11 (NEW): Hook deny volume per agent ──
+    # Prompt-level "don't run pnpm test" is soft; hook is hard. If an agent
+    # still triggers N+ hook denies, the prompt isn't sinking in and we may
+    # need to strengthen the agent MD or change the task shape.
+    for agent, denies in hook_denies_by_agent.items():
+        if len(denies) >= HOOK_DENY_THRESHOLD:
+            # Aggregate deny reasons to surface the pattern
+            reason_counts: dict[str, int] = defaultdict(int)
+            for d in denies:
+                # Take the first line of reason as the key
+                key = d.get("reason", "").split(". ")[0][:80]
+                reason_counts[key] += 1
+            top_reasons = sorted(reason_counts.items(), key=lambda x: -x[1])[:3]
+            report.items.append(RunReportItem(
+                severity="WARNING",
+                check="hook_deny_volume",
+                message=(
+                    f"'{agent}' hit hook deny {len(denies)} times — "
+                    f"prompt rules aren't landing. Top reasons: "
+                    f"{', '.join(f'{r} (×{c})' for r, c in top_reasons)}"
+                ),
+                details={
+                    "agent": agent,
+                    "count": len(denies),
+                    "top_reasons": dict(top_reasons),
+                    "samples": denies[:5],
+                },
+            ))
+
+    # ── Check 12 (NEW): Repeated stage failures ──
+    # Multiple BLOCKED attempts at the same stage_id = systemic issue.
+    # Typical cause: team-lead retries a BLOCKED stage without changing
+    # anything, or the fix loop resumes after a structural failure.
+    stage_blocked_counts: dict[str, int] = defaultdict(int)
+    for j in job_results:
+        if j.get("status") != "BLOCKED":
+            continue
+        sid = j.get("stage_id")
+        if sid:
+            stage_blocked_counts[sid] += 1
+    for stage_id, count in stage_blocked_counts.items():
+        if count >= REPEATED_STAGE_FAILURE_THRESHOLD:
+            report.items.append(RunReportItem(
+                severity="ERROR",
+                check="repeated_stage_failure",
+                message=(
+                    f"stage '{stage_id}' BLOCKED {count} times in this run — "
+                    f"a retry without a plan change won't fix it"
+                ),
+                details={"stage_id": stage_id, "count": count},
+            ))
+
+    # ── Check 13 (NEW): Agent re-reading same file (thrashing signal) ──
+    # Reading the same file 3+ times in the same stage means the agent
+    # keeps losing context or can't find what it needs — symptoms of a
+    # fragmented plan or bad file organization.
+    duplicate_reads: list[dict] = []
+    for (agent, stage, target), count in reads_by_agent_file.items():
+        if count >= DUPLICATE_READ_THRESHOLD:
+            duplicate_reads.append({
+                "agent": agent, "stage": stage, "file": target, "count": count,
+            })
+    if duplicate_reads:
+        # Rank by count so the worst cases surface first
+        duplicate_reads.sort(key=lambda d: -d["count"])
+        worst = duplicate_reads[0]
+        total_wasted_reads = sum(d["count"] - 1 for d in duplicate_reads)  # first read is legit
+        report.items.append(RunReportItem(
+            severity="INFO" if total_wasted_reads < 5 else "WARNING",
+            check="duplicate_reads",
+            message=(
+                f"{len(duplicate_reads)} (agent, stage, file) combo(s) re-read ≥ "
+                f"{DUPLICATE_READ_THRESHOLD}×. Worst: '{worst['agent']}' read "
+                f"'{worst['file']}' {worst['count']}× in stage '{worst['stage']}'"
+            ),
+            details={"combos": duplicate_reads[:10], "wasted_reads": total_wasted_reads},
+        ))
 
     return report
 
@@ -258,22 +408,7 @@ def _hints_path() -> str:
     return os.path.join(base, "routing_hints.json")
 
 
-def load_routing_hints(stack: str | None = None) -> dict[str, Any]:
-    """Load routing hints for a tech stack. Returns empty dict if no data."""
-    import json
-    path = _hints_path()
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    if stack and stack in data.get("stack_hints", {}):
-        return data["stack_hints"][stack]
-    return data
-
-
 def update_routing_hints(
-    report: RunReport,
     stack: str | None,
     codex_had_issues: bool,
     runtime_had_issues: bool,

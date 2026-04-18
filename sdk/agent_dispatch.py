@@ -24,6 +24,7 @@ from sdk.events import (
     AgentToolResult,
     AgentToolUse,
     EventBus,
+    HookDenied,
     Stage,
     SubagentCompleted,
     SubagentStarted,
@@ -577,17 +578,33 @@ class AgentDispatcher:
             tool_name = hook_input["tool_name"]
             tool_input = hook_input.get("tool_input") or {}
 
+            async def deny(reason: str) -> dict:
+                """Emit HookDenied (for validate_run analytics) + return block decision."""
+                preview: str | None = None
+                if isinstance(tool_input, dict):
+                    # Compact preview — the full input may be huge (e.g. Write
+                    # with a big content block), so cap it.
+                    try:
+                        preview = json.dumps(tool_input, ensure_ascii=False)[:400]
+                    except (TypeError, ValueError):
+                        preview = str(tool_input)[:400]
+                await bus.emit(HookDenied(
+                    agent=agent_name, tool=tool_name,
+                    reason=reason, input_preview=preview,
+                ))
+                return {"decision": "block", "reason": reason}
+
             # --- Security: command blocklist ---
             if tool_name == "Bash":
                 command = tool_input.get("command", "")
                 blocked = _is_blocked_command(command)
                 if blocked:
-                    return {"decision": "block", "reason": blocked}
+                    return await deny(blocked)
 
                 # --- Per-agent Bash guardrails (typed-tool steering + no-verify) ---
                 agent_bash_reason = _bash_forbidden_for_agent(agent_name, command)
                 if agent_bash_reason:
-                    return {"decision": "block", "reason": agent_bash_reason}
+                    return await deny(agent_bash_reason)
 
                 # --- File scope: detect Bash writes outside the stage's files ---
                 # `is not None` (not truthy) so empty list = "no files in scope"
@@ -595,13 +612,13 @@ class AgentDispatcher:
                 if self.file_scope is not None:
                     scope_reason = _bash_writes_outside_scope(command, self.file_scope, cwd)
                     if scope_reason:
-                        return {"decision": "block", "reason": scope_reason}
+                        return await deny(scope_reason)
 
             # --- Security: path boundary check ---
             if tool_name in ("Read", "Write", "Edit"):
                 file_path = tool_input.get("file_path", "")
                 if file_path and _is_path_outside_cwd(file_path, cwd):
-                    return {"decision": "block", "reason": f"path {file_path} is outside project directory {cwd}"}
+                    return await deny(f"path {file_path} is outside project directory {cwd}")
 
             # --- File scope: restrict Write/Edit ---
             if tool_name in ("Write", "Edit"):
@@ -624,15 +641,12 @@ class AgentDispatcher:
                     # expand _TEST_PATH_RE instead of punching a hole here.
                     if agent_name == "test-engineer":
                         if not _is_test_writable_path(rel_path):
-                            return {
-                                "decision": "block",
-                                "reason": (
-                                    f"test-engineer cannot write '{rel_path}' — "
-                                    f"only test files (under tests/, __tests__/, "
-                                    f"spec/, or *.test.* / *.spec.*) are allowed. "
-                                    f"Source-code edits are implementer's job."
-                                ),
-                            }
+                            return await deny(
+                                f"test-engineer cannot write '{rel_path}' — "
+                                f"only test files (under tests/, __tests__/, "
+                                f"spec/, or *.test.* / *.spec.*) are allowed. "
+                                f"Source-code edits are implementer's job."
+                            )
                     elif self.file_scope:
                         # Non-test-engineer agents: restrict to stage files.
                         scope_match = any(
@@ -640,10 +654,9 @@ class AgentDispatcher:
                             for s in self.file_scope
                         )
                         if not scope_match:
-                            return {
-                                "decision": "block",
-                                "reason": f"file '{rel_path}' is outside this stage's file scope: {self.file_scope}",
-                            }
+                            return await deny(
+                                f"file '{rel_path}' is outside this stage's file scope: {self.file_scope}"
+                            )
 
             # --- Security: restrict subagent types ---
             # Agent(X) in frontmatter only enforces in --agent mode.
@@ -654,7 +667,9 @@ class AgentDispatcher:
                 if allowed_subagents is not None:
                     subagent_type = tool_input.get("subagent_type") or tool_input.get("type") or ""
                     if subagent_type and subagent_type not in allowed_subagents:
-                        return {"decision": "block", "reason": f"agent '{agent_name}' can only spawn {allowed_subagents}, not '{subagent_type}'"}
+                        return await deny(
+                            f"agent '{agent_name}' can only spawn {allowed_subagents}, not '{subagent_type}'"
+                        )
 
             # --- EventBus: emit tool use event (full content for Raw Log) ---
             target = tool_input.get("file_path") or tool_input.get("command", "")

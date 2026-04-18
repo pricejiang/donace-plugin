@@ -90,13 +90,6 @@ class StageResult:
     recommendation: str | None = None    # "SKIP_ALLOWED" or "MUST_STOP", None if PASS
 
 
-@dataclass
-class SprintResult:
-    stages: list[StageResult]
-    warnings: list[str]
-    summary: dict                        # {"passed": int, "blocked": int, "skipped": int, "total": int}
-
-
 # ---------------------------------------------------------------------------
 # Event base class
 # ---------------------------------------------------------------------------
@@ -379,6 +372,24 @@ class AgentTokens(Event):
         self.type = "agent.tokens"
 
 
+@dataclass
+class HookDenied(Event):
+    """Emitted when a PreToolUse hook returns {"decision": "block"}.
+
+    Tracked separately from agent.tool_result because the SDK may not call
+    PostToolUse on a blocked tool call, and because validate_run uses these
+    as a signal of agent misbehaviour (trying to run forbidden bash
+    commands, write outside scope, etc.) for post-run analysis.
+    """
+    agent: str = ""
+    tool: str = ""
+    reason: str = ""
+    input_preview: str | None = None
+
+    def __post_init__(self) -> None:
+        self.type = "hook.denied"
+
+
 # ---------------------------------------------------------------------------
 # Subagent events
 # ---------------------------------------------------------------------------
@@ -489,6 +500,7 @@ _register("agent.message", AgentMessage)
 _register("agent.tool_use", AgentToolUse)
 _register("agent.tool_result", AgentToolResult)
 _register("agent.tokens", AgentTokens)
+_register("hook.denied", HookDenied)
 _register("subagent.started", SubagentStarted)
 _register("subagent.completed", SubagentCompleted)
 
@@ -606,43 +618,3 @@ class EventBus:
             self._pending[checkpoint].set_result(decision)
 
 
-# ---------------------------------------------------------------------------
-# OrchestrationResult (final output)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OrchestrationResult:
-    sprint: SprintResult
-    review: str = ""
-    run_id: str = ""
-    validation: Any = None  # RunReport from run_validator (optional to avoid circular import)
-
-    def to_json_output(self) -> dict:
-        """Produce the JSON output dict for stdout (team-lead reads this)."""
-        stages = []
-        for sr in self.sprint.stages:
-            stage_dict: dict[str, Any] = {
-                "name": sr.name,
-                "status": sr.status,
-                "test_result": sr.test_result,
-                "codex_result": sr.codex_result,
-                "fix_attempts": sr.fix_attempts,
-            }
-            if sr.runtime_result is not None:
-                stage_dict["runtime_result"] = sr.runtime_result
-            if sr.unresolved:
-                stage_dict["unresolved"] = sr.unresolved
-            if sr.recommendation:
-                stage_dict["recommendation"] = sr.recommendation
-            stages.append(stage_dict)
-
-        output: dict[str, Any] = {
-            "run_id": self.run_id,
-            "stages": stages,
-            "warnings": self.sprint.warnings,
-            "summary": self.sprint.summary,
-            "review": self.review,
-        }
-        if self.validation is not None:
-            output["validation"] = self.validation.to_dict()
-        return output

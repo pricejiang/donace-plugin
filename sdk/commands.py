@@ -23,6 +23,7 @@ from sdk.events import (
     JobStarted,
     RunCompleted,
     RunStarted,
+    RunValidation,
     Stage,
 )
 from sdk.emitter import WebSocketEmitter
@@ -248,6 +249,37 @@ def _unregister_job(lock_path: Path) -> None:
 
 def _agents_dir() -> str:
     return str(Path(__file__).parent.parent / "agents")
+
+
+def _fetch_events_from_dashboard(cwd: str, run_id: str, timeout_s: float = 2.0) -> list[dict]:
+    """Fetch this run's full event list from the dashboard via HTTP GET.
+
+    Returns [] if the dashboard URL isn't persisted, the server is down,
+    the request times out, or the response isn't valid JSON. Failure is
+    silent on purpose — validation is nice-to-have, and run_complete must
+    not fail just because the dashboard isn't reachable.
+
+    The dashboard stores events in SQLite and serves them at
+    GET http://<host>:<port>/api/events/{run_id}. Since emitters connect
+    via ws://, we convert the scheme before the request.
+    """
+    import urllib.request
+    import urllib.error
+
+    url_file = Path(cwd) / ".ai" / "runs" / run_id / "dashboard_url"
+    if not url_file.exists():
+        return []
+    ws_url = url_file.read_text().strip()
+    if not ws_url:
+        return []
+    http_url = ws_url.replace("ws://", "http://", 1).replace("wss://", "https://", 1)
+    endpoint = f"{http_url.rstrip('/')}/api/events/{run_id}"
+    try:
+        with urllib.request.urlopen(endpoint, timeout=timeout_s) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return data if isinstance(data, list) else []
+    except (urllib.error.URLError, json.JSONDecodeError, OSError, TimeoutError):
+        return []
 
 
 def _resolve_dashboard_url(cwd: str, run_id: str, explicit_url: str | None) -> str | None:
@@ -571,17 +603,30 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
         "overall": "PASS" if total > 0 and passed == total else "INCOMPLETE",
     }
 
+    # --- Run validation: reflect on the run so team-lead can improve ---
+    from sdk.orchestrator import detect_stack
+    stack = detect_stack(cwd)
+    validation_dict: dict | None = None
+    try:
+        from sdk.run_validator import validate_run
+        events = _fetch_events_from_dashboard(cwd, run_id)
+        report = validate_run(events=events, job_results=job_results, stack=stack)
+        validation_dict = report.to_dict()
+    except Exception as exc:
+        # Non-critical: record the failure but don't block run_complete
+        validation_dict = {"status": "error", "error": str(exc)}
+
     result = {"run_id": run_id, "jobs": job_results, "summary": summary}
+    if validation_dict is not None:
+        result["validation"] = validation_dict
 
     # Persist
     result_path = run_dir / "result.json"
     result_path.write_text(json.dumps(result, indent=2))
 
-    # Update routing hints
+    # Update routing hints (EMA signals for next run's stack-specific routing)
     try:
-        from sdk.run_validator import update_routing_hints, RunReport
-        from sdk.orchestrator import detect_stack
-        stack = detect_stack(cwd)
+        from sdk.run_validator import update_routing_hints
         codex_had_issues = any(
             j.get("codex_result", {}).get("has_issues") for j in job_results
         )
@@ -590,7 +635,6 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
         )
         total_fix_loops = sum(j.get("fix_attempts", 0) for j in job_results)
         update_routing_hints(
-            report=RunReport(),  # Minimal — hints only need aggregate stats
             stack=stack,
             codex_had_issues=codex_had_issues,
             runtime_had_issues=runtime_had_issues,
@@ -604,6 +648,8 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
 
     bus, emitter = await _setup_bus(run_id, dashboard_url, cwd=cwd)
     try:
+        if validation_dict is not None and validation_dict.get("status") != "error":
+            await bus.emit(RunValidation(validation=validation_dict))
         await bus.emit(RunCompleted(result_summary=json.dumps(summary)))
         print(json.dumps(result, indent=2))
         return result
