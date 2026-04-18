@@ -607,29 +607,6 @@ class EventBus:
 
 
 # ---------------------------------------------------------------------------
-# TaskClass (used by orchestrator for task classification)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class TaskClass:
-    needs_spec: bool
-    needs_plan: bool
-    reason: str = ""
-
-    @classmethod
-    def from_response(cls, response: dict) -> TaskClass:
-        """Parse from Haiku tool_use response."""
-        # Extract from tool_use block
-        if isinstance(response, dict):
-            return cls(
-                needs_spec=response.get("needs_spec", True),
-                needs_plan=response.get("needs_plan", True),
-                reason=response.get("reason", ""),
-            )
-        return cls(needs_spec=True, needs_plan=True, reason="default")
-
-
-# ---------------------------------------------------------------------------
 # OrchestrationResult (final output)
 # ---------------------------------------------------------------------------
 

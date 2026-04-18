@@ -27,7 +27,6 @@ from sdk.events import (
     Stage,
     SubagentCompleted,
     SubagentStarted,
-    TaskClass,
 )
 
 try:
@@ -900,52 +899,6 @@ class AgentDispatcher:
                 pass
 
         return final_text
-
-    # ------------------------------------------------------------------
-    # Task classification (lightweight SDK query, no tools needed)
-    # ------------------------------------------------------------------
-
-    async def classify_task(self, task: str) -> TaskClass:
-        """Classify a task using a lightweight SDK query."""
-        classify_prompt = (
-            f"Classify this development task. Respond with ONLY a JSON object, no other text:\n\n"
-            f"Task: {task}\n\n"
-            f'{{"needs_spec": true/false, "needs_plan": true/false, "reason": "..."}}\n\n'
-            f"needs_spec: true if this is a new feature/product that needs a spec. "
-            f"False for bug fixes, refactors, single-file changes.\n"
-            f"needs_plan: true unless this is a trivial single-line fix."
-        )
-
-        options = ClaudeAgentOptions(
-            system_prompt="You classify development tasks. Respond with only valid JSON.",
-            cwd=self.cwd,
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            max_turns=1,
-            model=_resolve_model("haiku"),
-        )
-
-        result_text = ""
-        async for message in sdk_query(prompt=classify_prompt, options=options):
-            if isinstance(message, ResultMessage):
-                result_text = getattr(message, "result", "") or ""
-
-        # Parse JSON from response
-        try:
-            # Find JSON object in response (in case of extra text)
-            json_match = re.search(r'\{[^}]+\}', result_text)
-            if json_match:
-                data = json.loads(json_match.group())
-                return TaskClass(
-                    needs_spec=data.get("needs_spec", True),
-                    needs_plan=data.get("needs_plan", True),
-                    reason=data.get("reason", ""),
-                )
-        except (json.JSONDecodeError, KeyError):
-            pass
-
-        # Fallback
-        return TaskClass(needs_spec=True, needs_plan=True, reason="classification failed, defaulting to full planning")
 
     # ------------------------------------------------------------------
     # Test engineer dispatch
