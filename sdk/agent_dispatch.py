@@ -553,7 +553,14 @@ def _extract_yaml_list(text: str, key: str) -> list[str] | None:
 class AgentDispatcher:
     """Dispatches agent queries using Claude Agent SDK, with EventBus integration."""
 
-    def __init__(self, agents_dir: str, cwd: str, bus: EventBus, file_scope: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        agents_dir: str,
+        cwd: str,
+        bus: EventBus,
+        file_scope: list[str] | None = None,
+        codex_review_base: str | None = None,
+    ) -> None:
         if not HAS_SDK:
             raise RuntimeError(
                 "claude-agent-sdk not installed. Run: pip install claude-agent-sdk"
@@ -562,6 +569,11 @@ class AgentDispatcher:
         self.cwd = cwd
         self.bus = bus
         self.file_scope = file_scope  # If set, Write/Edit restricted to these paths
+        # Explicit codex review base SHA. When set (typically to the pre-stage
+        # HEAD captured by cmd_run_job), codex diffs this stage only, not the
+        # cumulative merge-base..HEAD range. Left None for verify flows and
+        # anywhere else that wants the prior "full diff since main" behavior.
+        self.codex_review_base = codex_review_base
         self._agent_configs: dict[str, AgentConfig] = {}
 
     def _get_config(self, agent_name: str) -> AgentConfig:
@@ -1093,20 +1105,25 @@ class AgentDispatcher:
                 "reason": reason or "codex plugin not found",
             }
 
-        # Determine base ref for diff
-        base = "HEAD~1"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "git", "merge-base", "HEAD", "origin/main",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.cwd,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            if proc.returncode == 0:
-                base = stdout.decode().strip()
-        except (asyncio.TimeoutError, Exception):
-            pass  # fall back to HEAD~1
+        # Determine base ref for diff. If the caller pinned a base
+        # (cmd_run_job does this with the pre-stage SHA), use it verbatim
+        # so review sees only this stage's diff. Otherwise fall back to
+        # merge-base(HEAD, origin/main) so verify-style calls still see
+        # the full run diff.
+        base = self.codex_review_base or "HEAD~1"
+        if not self.codex_review_base:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "merge-base", "HEAD", "origin/main",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.cwd,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+                if proc.returncode == 0:
+                    base = stdout.decode().strip()
+            except (asyncio.TimeoutError, Exception):
+                pass  # fall back to HEAD~1
 
         cmd = f"node {shlex.quote(str(companion_script))} review --wait --base {shlex.quote(base)}"
 

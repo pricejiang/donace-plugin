@@ -86,10 +86,11 @@ names are load-bearing:
 
 ## Rules
 
-- Independent stages (no overlapping `Files to modify`) can run in
-  parallel — the orchestrator's wave scheduler uses this. Design with
-  that in mind: separate backend changes from frontend changes when
-  possible.
+- Independent stages (no overlapping `Files to modify`) can be reordered,
+  but `run_job` executes one stage at a time because per-stage commits and
+  codex review use shared git state. Design with that in mind: separate
+  backend changes from frontend changes when possible, but keep dependency
+  order explicit.
 - The `Status: Not Started` field exists so the documenter can update
   it after each stage completes. Leave the default.
 - If team-lead's dispatch prompt references a prior plan that needs

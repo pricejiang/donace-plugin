@@ -224,6 +224,274 @@ def _diff_snapshots(before: dict[str, tuple], after: dict[str, tuple]) -> list[s
     return changed
 
 
+def _git_head(cwd: str) -> str | None:
+    """Return current HEAD SHA, or None if not a git repo / no commits."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, cwd=cwd, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
+def _git_is_dirty(cwd: str) -> bool:
+    """True iff the worktree has uncommitted or untracked changes.
+
+    Returns False if cwd isn't a git repo — there's nothing to be dirty
+    about, so callers that gate on dirtiness can safely no-op on non-repo
+    cwds.
+    """
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "-uall"],
+            capture_output=True, text=True, cwd=cwd, timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        return bool(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def _normalize_git_paths(cwd: str, files: list[str]) -> tuple[list[str], list[str]]:
+    """Return repo-relative paths safe to hand to git, plus skipped entries."""
+    project = Path(cwd).resolve()
+    normalized: list[str] = []
+    skipped: list[str] = []
+
+    for raw in files:
+        path = str(raw).strip()
+        if not path:
+            continue
+
+        candidate = Path(path)
+        if candidate.is_absolute():
+            try:
+                rel = candidate.resolve().relative_to(project)
+                norm = rel.as_posix()
+            except ValueError:
+                skipped.append(path)
+                continue
+        else:
+            norm = os.path.normpath(path).replace("\\", "/")
+            if norm in ("", ".") or norm == ".." or norm.startswith("../"):
+                skipped.append(path)
+                continue
+
+        if norm not in normalized:
+            normalized.append(norm)
+
+    return normalized, skipped
+
+
+def _parse_porcelain_paths(output: str) -> list[str]:
+    """Parse `git status --porcelain -z` output into changed paths."""
+    paths: list[str] = []
+    records = output.split("\0")
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        status = rec[:2]
+        path = rec[3:]
+        if path and path not in paths:
+            paths.append(path)
+        if status[0] in ("R", "C"):
+            i += 1
+    return paths
+
+
+def _git_dirty_paths(cwd: str, files: list[str]) -> list[str]:
+    """Return dirty tracked/untracked paths under the provided path list."""
+    import subprocess
+
+    paths, _ = _normalize_git_paths(cwd, files)
+    if not paths:
+        return []
+
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "-uall", "-z", "--"] + paths,
+            capture_output=True, text=True, cwd=cwd, timeout=15,
+        )
+        if result.returncode != 0:
+            return []
+        return _parse_porcelain_paths(result.stdout)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+
+
+def _git_changed_roots(cwd: str, files: list[str]) -> list[str]:
+    """Return input roots that currently contain a git-visible change."""
+    changed: list[str] = []
+    for path in files:
+        if _git_dirty_paths(cwd, [path]):
+            changed.append(path)
+    return changed
+
+
+def _git_commit_stage(
+    cwd: str,
+    files: list[str],
+    message: str,
+    expected_head: str | None = None,
+    pre_stage_dirty_files: list[str] | None = None,
+) -> dict[str, Any]:
+    """Commit only the provided file paths and return commit metadata.
+
+    The real index may contain user-staged work, so this builds the commit
+    through a temporary index. After moving HEAD, it refreshes the real index
+    for just the committed paths so unrelated staged edits are left alone.
+    """
+    import subprocess
+    import tempfile
+
+    paths, skipped_paths = _normalize_git_paths(cwd, files)
+    result: dict[str, Any] = {
+        "status": "skipped",
+        "skipped_paths": skipped_paths,
+    }
+    if not paths:
+        result["reason"] = "stage has no commit-safe file paths"
+        return result
+    if pre_stage_dirty_files:
+        result["reason"] = (
+            "stage files were dirty before run_job started; refusing to "
+            "bundle pre-existing edits into the stage commit"
+        )
+        result["pre_stage_dirty_files"] = pre_stage_dirty_files
+        return result
+
+    parent = expected_head or _git_head(cwd)
+    if not parent:
+        result["reason"] = "not a git repository or HEAD is unavailable"
+        return result
+    current_head = _git_head(cwd)
+    if current_head != parent:
+        result["reason"] = (
+            "HEAD moved while the stage was running; likely parallel run_job "
+            "or external git activity"
+        )
+        result["expected_head"] = parent
+        result["actual_head"] = current_head
+        return result
+
+    changed_roots = _git_changed_roots(cwd, paths)
+    if not changed_roots:
+        result["reason"] = "stage files have no git-visible changes"
+        return result
+
+    tmp_index = tempfile.NamedTemporaryFile(prefix="orchestrator-index-", delete=False)
+    tmp_index.close()
+    # GIT_INDEX_FILE should point at a path Git can create. An existing empty
+    # file can be treated as a corrupt index by some Git versions.
+    Path(tmp_index.name).unlink(missing_ok=True)
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = tmp_index.name
+
+    def git(args: list[str], timeout: int = 30):
+        return subprocess.run(
+            ["git"] + args,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+        )
+
+    try:
+        read_tree = git(["read-tree", parent], timeout=15)
+        if read_tree.returncode != 0:
+            result["reason"] = f"failed to initialise temporary index: {read_tree.stderr.strip()}"
+            return result
+
+        add = git(["add", "-A", "--"] + changed_roots, timeout=30)
+        if add.returncode != 0:
+            result["reason"] = f"failed to stage stage files: {add.stderr.strip()}"
+            return result
+
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--"] + changed_roots,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            env=env,
+            timeout=15,
+        )
+        if diff.returncode == 0:
+            result["reason"] = "temporary index has no staged diff for stage files"
+            return result
+        if diff.returncode != 1:
+            result["reason"] = f"failed to inspect staged diff: {diff.stderr.strip()}"
+            return result
+
+        tree = git(["write-tree"], timeout=15)
+        if tree.returncode != 0:
+            result["reason"] = f"failed to write temporary tree: {tree.stderr.strip()}"
+            return result
+        tree_sha = tree.stdout.strip()
+
+        commit = subprocess.run(
+            ["git", "commit-tree", tree_sha, "-p", parent, "-m", message],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=30,
+        )
+        if commit.returncode != 0:
+            result["reason"] = f"failed to create commit: {commit.stderr.strip()}"
+            return result
+        commit_sha = commit.stdout.strip()
+
+        update = subprocess.run(
+            ["git", "update-ref", "-m", message, "HEAD", commit_sha, parent],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=15,
+        )
+        if update.returncode != 0:
+            result["reason"] = f"failed to move HEAD: {update.stderr.strip()}"
+            result["commit_sha"] = commit_sha
+            return result
+
+        # The temporary-index commit moved HEAD without touching the real
+        # index. Refresh only the committed paths; unrelated staged changes
+        # stay staged.
+        reset = subprocess.run(
+            ["git", "reset", "-q", "--"] + changed_roots,
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=15,
+        )
+        if reset.returncode != 0:
+            result["index_refresh_warning"] = reset.stderr.strip()
+
+        result.update({
+            "status": "committed",
+            "commit_sha": commit_sha,
+            "files": changed_roots,
+        })
+        return result
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        result["reason"] = "git subprocess failed while creating stage commit"
+        return result
+    finally:
+        try:
+            Path(tmp_index.name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _register_job(cwd: str, run_id: str, job_id: str, command: str = "") -> Path:
     """Create job lock file for dashboard registry.
 
@@ -376,6 +644,19 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
             )
     except Exception as exc:  # noqa: BLE001
         print(f"Warning: run retention failed: {exc}", file=sys.stderr)
+
+    # Pre-flight: warn if the worktree is dirty. Per-stage commits skip
+    # stages whose own files were already dirty when run_job started, so
+    # users still get a successful run but not a misleading stage commit.
+    # Warn-and-continue rather than hard-reject: dirty unrelated files do
+    # not prevent temporary-index commits for clean stage scopes.
+    if _git_is_dirty(cwd):
+        print(
+            "Warning: worktree has uncommitted changes. Per-stage commits "
+            "will skip any stage whose files were already dirty when that "
+            "stage starts. Stash or commit first for cleaner history.",
+            file=sys.stderr,
+        )
 
     run_dir = Path(cwd) / ".ai" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1398,14 +1679,29 @@ async def cmd_run_job(
         # Load accumulated context — full detail for implementer
         task_context = _load_context(cwd, run_id, level="full")
 
-        # Dispatch — file_scope limits Write/Edit to stage files (for parallel safety)
+        stage_files = stage_def.get("files") or []
+
+        # Capture pre-stage HEAD and dirty state. The SHA is passed to the
+        # dispatcher as codex review base so review diffs this stage only.
+        # Dirty stage files are recorded so the PASS-time auto-commit can
+        # refuse to bundle edits that existed before this job started.
+        pre_stage_sha = _git_head(cwd)
+        pre_stage_dirty_files = _git_dirty_paths(cwd, stage_files)
+
+        # Dispatch — file_scope limits Write/Edit to this stage's files.
         from sdk.agent_dispatch import AgentDispatcher
         from sdk.job_runner import run_job
 
-        file_scope = stage_def.get("files") or None
+        file_scope = stage_files or None
         if not file_scope:
             print(f"Warning: stage '{stage_id}' has no files list — file-scope restriction disabled", file=sys.stderr)
-        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus, file_scope=file_scope)
+        dispatcher = AgentDispatcher(
+            agents_dir=_agents_dir(),
+            cwd=cwd,
+            bus=bus,
+            file_scope=file_scope,
+            codex_review_base=pre_stage_sha,
+        )
         await bus.emit(StageChanged(
             stage_name=stage.name,
             stage_index=stage_index,
@@ -1437,8 +1733,32 @@ async def cmd_run_job(
                 result_summary=f"{stage.name}: {result.status}",
             ))
 
-        # Persist result
+        # Build result dict
         job_result = {"command": "run_job", "stage_id": stage_id, **result.to_dict()}
+        if pre_stage_sha:
+            job_result["pre_stage_sha"] = pre_stage_sha
+        if pre_stage_dirty_files:
+            job_result["pre_stage_dirty_files"] = pre_stage_dirty_files
+
+        # Per-stage commit on PASS. Bounds the next stage's codex review
+        # scope — without this, every review diffs merge-base..HEAD and
+        # context grows linearly with the run. The helper commits only the
+        # listed stage files, handles deletions, and records skip reasons
+        # instead of silently doing nothing.
+        if result.status == "PASS" and pre_stage_sha:
+            commit_msg = f"[{stage_id}] {stage.name}"
+            commit_info = _git_commit_stage(
+                cwd,
+                stage_files,
+                commit_msg,
+                expected_head=pre_stage_sha,
+                pre_stage_dirty_files=pre_stage_dirty_files,
+            )
+            job_result["auto_commit"] = commit_info
+            if commit_info.get("status") == "committed":
+                job_result["commit_sha"] = commit_info.get("commit_sha")
+
+        # Persist result
         _write_job_result(cwd, run_id, job_id, job_result)
 
         # Write context for subsequent jobs
