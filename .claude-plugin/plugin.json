@@ -18,6 +18,7 @@
   ],
   "skills": [
     "skills/plan/SKILL.md",
-    "skills/execute/SKILL.md"
+    "skills/execute/SKILL.md",
+    "skills/chat/SKILL.md"
   ]
 }
