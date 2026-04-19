@@ -6,7 +6,7 @@ Generator-Evaluator agent harness for Claude Code. Sprint-based development work
 
 | Agent | Model | Role |
 |---|---|---|
-| **team-lead** | opus | Orchestrator — coordinates the full workflow |
+| **team-lead** | opus | Execution coordinator — dispatched by `/donace:execute` to run validated plans (run_job → verify → review → document → run_complete) |
 | **planner** | opus | Expands brief into product spec |
 | **architect** | opus | Designs staged implementation plan |
 | **implementer** | sonnet | Writes production code following the plan |
