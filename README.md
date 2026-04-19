@@ -16,18 +16,47 @@ Generator-Evaluator agent harness for Claude Code. Sprint-based development work
 | **typescript-reviewer** | opus | Deep TypeScript/React code review |
 | **ui-designer** | opus | On-demand UI/UX design specs |
 
-## Workflow
+## Usage
+
+Two user-invokable skills drive the workflow:
 
 ```
-Phase 0: Boot (restore context from .ai/sessions/ and .ai/cards/)
-Phase 1: Planning (planner → architect)
-Phase 2: Sprint Loop
-  ├── Sprint contract (runtime-evaluator)
-  ├── Implement (implementer)
-  ├── Verify (test-engineer + Codex review + runtime-evaluator)
-  └── Fix loop (max 3 cycles)
-Phase 3: Completion (final Claude review + session log + knowledge cards)
+/donace:plan <task>     →  interactive Q&A, writes .ai/runs/<id>/plan.md,
+                           runs codex plan review, hands off
+(user reviews plan.md)
+/donace:execute <id>    →  dispatches team-lead to run run_job → verify →
+                           review → document → run_complete
 ```
+
+### 1. Plan
+
+```
+/donace:plan add rate limiting to the notification API
+```
+
+The plan skill:
+- Scans for resumable runs (resume if mid-plan)
+- Clarifies vague briefs with up to 3 targeted questions
+- Calls `run_start` + `write_plan` + `plan` to produce a codex-reviewed plan
+- Hands off with the run-id — does **not** execute
+
+If codex flags the plan (status=REVIEW), the skill loops back with a revision brief.
+
+### 2. Review
+
+Open `.ai/runs/<run-id>/plan.md` in your editor. Sanity-check the stages, dependencies, success criteria.
+
+### 3. Execute
+
+```
+/donace:execute <run-id>
+```
+
+Or omit the run-id — the execute skill auto-picks the newest PASS run. It dispatches `team-lead`, which runs the full pipeline and returns a 3-line summary.
+
+### Revising a plan
+
+Re-invoke `/donace:plan` on the same run-id (the skill detects the existing run and offers resume). `write_plan` treats the new task brief as a revision directive against the existing `plan.md`.
 
 ## Install as Plugin
 
@@ -36,23 +65,15 @@ Phase 3: Completion (final Claude review + session log + knowledge cards)
 /plugin install donace@pricejiang-donace-plugin
 ```
 
-Then use agents with the `donace:` prefix:
-
-```bash
-claude --agent donace:team-lead
-```
+Once installed, use the skills with the `donace:` namespace: `/donace:plan`, `/donace:execute`. Team-lead and the other agents are invoked internally by the skills — you do not normally launch them directly.
 
 ## Install via Symlink (for contributors)
 
 ```bash
 git clone https://github.com/pricejiang/donace-plugin.git
 ln -sf $(pwd)/donace-plugin/agents/*.md ~/.claude/agents/
-```
-
-Then use agents directly:
-
-```bash
-claude --agent team-lead
+ln -sf $(pwd)/donace-plugin/skills/plan ~/.claude/skills/donace-plan
+ln -sf $(pwd)/donace-plugin/skills/execute ~/.claude/skills/donace-execute
 ```
 
 ## Key Design Decisions
