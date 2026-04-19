@@ -18,7 +18,7 @@ Generator-Evaluator agent harness for Claude Code. Sprint-based development work
 
 ## Usage
 
-Two user-invokable skills drive the workflow:
+Three user-invokable skills cover the workflow:
 
 ```
 /donace:plan <task>     →  interactive Q&A, writes .ai/runs/<id>/plan.md,
@@ -26,7 +26,15 @@ Two user-invokable skills drive the workflow:
 (user reviews plan.md)
 /donace:execute <id>    →  dispatches team-lead to run run_job → verify →
                            review → document → run_complete
+
+/donace:chat            →  ad-hoc mode. Direct Edit + Agent-dispatch
+                           subagents for small tasks. Never touches the
+                           orchestrator (no runs, no dashboard, no auto
+                           commits). Escalates to /donace:plan when
+                           complexity grows.
 ```
+
+The `plan → execute` pair is for tracked, verified work. `chat` is the escape hatch for quick fixes and focused subagent passes where the orchestrator ceremony would outweigh the task.
 
 ### 1. Plan
 
@@ -65,7 +73,7 @@ Re-invoke `/donace:plan` on the same run-id (the skill detects the existing run 
 /plugin install donace@pricejiang-donace-plugin
 ```
 
-Once installed, use the skills with the `donace:` namespace: `/donace:plan`, `/donace:execute`. Team-lead and the other agents are invoked internally by the skills — you do not normally launch them directly.
+Once installed, use the skills with the `donace:` namespace: `/donace:plan`, `/donace:execute`, `/donace:chat`. Team-lead and the other agents are invoked internally by the skills — you do not normally launch them directly.
 
 ## Install via Symlink (for contributors)
 
@@ -74,6 +82,7 @@ git clone https://github.com/pricejiang/donace-plugin.git
 ln -sf $(pwd)/donace-plugin/agents/*.md ~/.claude/agents/
 ln -sf $(pwd)/donace-plugin/skills/plan ~/.claude/skills/donace-plan
 ln -sf $(pwd)/donace-plugin/skills/execute ~/.claude/skills/donace-execute
+ln -sf $(pwd)/donace-plugin/skills/chat ~/.claude/skills/donace-chat
 ```
 
 ## Key Design Decisions
