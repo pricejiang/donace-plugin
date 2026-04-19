@@ -15,5 +15,9 @@
     "agents/ios-reviewer.md",
     "agents/qa.md",
     "agents/documenter.md"
+  ],
+  "skills": [
+    "skills/plan/SKILL.md",
+    "skills/execute/SKILL.md"
   ]
 }
