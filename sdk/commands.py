@@ -1017,13 +1017,11 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
     States:
       completed    — result.json exists (cmd_run_complete ran)
       in_progress  — at least one *.lock has a live pid
-      incomplete   — execute attempted (run_job:* entry in jobs_completed
-                     or a stale lock) but no result.json yet; team-lead
-                     may resume OR just run_complete if all stages PASSed
-      not_started  — plan is written (plan.md/plan.json, or only
-                     write_plan/plan jobs in jobs_completed) but no
-                     run_job has been dispatched; `/donace:execute` is
-                     the next step
+      incomplete   — execute attempted (run_job:* entry in jobs_completed),
+                     a stale lock exists, or the plan phase needs attention;
+                     team-lead/plan skill may resume or revise
+      not_started  — a PASS plan is ready but no run_job has been
+                     dispatched; `/donace:execute` is the next step
       empty        — fresh run_start dir with nothing inside yet
 
     `jobs_completed` is a dict mapping label → status ("PASS", "BLOCKED",
@@ -1085,30 +1083,48 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
             else:
                 info["stale_locks"].append(lock_info)
 
+    plan_json_path = run_dir / "plan.json"
+    plan_json_ready = False
+    if plan_json_path.exists():
+        try:
+            plan_data_for_state = json.loads(plan_json_path.read_text())
+            codex_review = plan_data_for_state.get("codex_review") or {}
+            stages = plan_data_for_state.get("stages") or []
+            plan_json_ready = bool(stages) and not codex_review.get("has_major_issues")
+        except (json.JSONDecodeError, OSError):
+            plan_json_ready = False
+
+    jobs_completed = info["jobs_completed"]
+    plan_status = jobs_completed.get("plan")
+    write_plan_status = jobs_completed.get("write_plan")
+    has_run_job = any(k.startswith("run_job:") for k in jobs_completed)
+    has_plan_material = (
+        plan_status is not None
+        or write_plan_status is not None
+        or (run_dir / "plan.md").exists()
+        or plan_json_path.exists()
+    )
+    plan_ready = plan_status == "PASS" or plan_json_ready
+    plan_needs_attention = (
+        (plan_status is not None and plan_status != "PASS")
+        or (write_plan_status is not None and write_plan_status != "PASS")
+        or (has_plan_material and not plan_ready)
+    )
+
     # Override state based on observed live/stale activity.
     #
-    # The split between `incomplete` and `not_started` hinges on whether
-    # execute has been attempted:
-    #   - any `run_job:*` entry in jobs_completed → execute was dispatched
-    #   - a stale lock      → a process crashed mid-run (execute or plan)
-    #
-    # Either of those → `incomplete` (needs resume triage).
-    # Plan-only artifacts (plan.md, plan.json, or write_plan/plan jobs)
-    # without any execute attempt → `not_started` (just needs /donace:execute).
+    # `not_started` means the plan phase PASSed and execute has not been
+    # attempted. Plan-only failures and half-finished plan phases are
+    # `incomplete` so `/donace:plan` can resume or revise them.
     if info["state"] != "completed":
         if info["live_locks"]:
             info["state"] = "in_progress"
-        elif info["stale_locks"] or any(
-            k.startswith("run_job:") for k in info["jobs_completed"]
-        ):
+        elif info["stale_locks"] or has_run_job or plan_needs_attention:
             info["state"] = "incomplete"
-        elif info["jobs_completed"] \
-                or (run_dir / "plan.md").exists() \
-                or (run_dir / "plan.json").exists():
+        elif plan_ready:
             info["state"] = "not_started"
 
     # Progress: how much of the plan actually happened?
-    plan_json_path = run_dir / "plan.json"
     stages_total = 0
     current_plan_stage_ids: set[str] = set()
     if plan_json_path.exists():

@@ -47,7 +47,7 @@ ORCH="python3 \"${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py\""
 
 | Command | When to use | What it does internally |
 |---------|-------------|------------------------|
-| `list_runs --cwd <dir> [--state incomplete]` | Step 1 resume triage only | Scans `.ai/runs/` and reports each run's state. |
+| `list_runs --cwd <dir> [--state not_started,incomplete]` | Step 1 resume triage only | Scans `.ai/runs/` and reports each run's state. |
 | `run_job --stage-id <id> --plan <path> --run-id <id> --cwd <dir>` | Execute one stage | implement → test → codex → (runtime) → fix loop. On PASS, attempts a stage-only commit with message `[<stage-id>] <stage-name>` and records `pre_stage_sha`, `auto_commit`, and `commit_sha` when committed. Codex review during this stage uses `pre_stage_sha` as the diff base, so run stages serially to keep review scope accurate. |
 | `verify --run-id <id> --cwd <dir> --agents "test,codex"` | After all stages pass | Runs full verification (read-only) |
 | `review --run-id <id> --cwd <dir> --reviewer typescript` | Code review | Dispatches reviewer agent |
@@ -99,8 +99,8 @@ in `jobs_completed`** — always read the latter to know what actually ran.
 | `in_progress` | Some `*.lock` has a live pid — **another process is running this run right now** | Do NOT start executing. Warn user; maybe wait. |
 | `completed` | `result.json` exists — run was formally closed | Report to user; nothing to do. |
 | `empty` | Fresh run_start dir, no jobs yet | Report to user that `/donace:plan` needs to finish. |
-| `not_started` | plan.md/plan.json written (or write_plan/plan jobs logged) but no `run_job:*` has dispatched yet | **This is the normal post-plan state** — proceed to Step 2 and dispatch every stage in plan.json. |
-| `incomplete` | At least one `run_job:*` entry or stale lock present, `result.json` missing | Inspect `progress` to decide (next table) |
+| `not_started` | Plan phase PASSed (`jobs_completed.plan == "PASS"`, or `plan.json` has stages with no `has_major_issues`), and no `run_job:*` has dispatched | **This is the normal post-plan state** — proceed to Step 2 and dispatch every stage in plan.json. |
+| `incomplete` | At least one `run_job:*` entry, a stale lock, OR the plan phase is not PASS (REVIEW / ERROR / write_plan didn't finish) | Inspect `progress` + `jobs_completed` to decide (next table). If the plan itself is broken, abort and tell user to run `/donace:plan <run-id>`. |
 
 ### `incomplete` sub-cases — read `progress` + `jobs_completed["plan"]` to decide
 

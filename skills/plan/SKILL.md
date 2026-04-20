@@ -23,16 +23,19 @@ python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" health --cwd "<project>"
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs --cwd "<project>" --state incomplete,not_started
 ```
 
-The `--state` flag accepts comma-separated values — both `not_started` (plan ready, awaiting execute) and `incomplete` (plan/execute started but unfinished) are surfaced in one pass.
+The `--state` flag accepts comma-separated values — both `not_started` (PASS plan ready, awaiting execute) and `incomplete` (plan/execute started but unfinished) are surfaced in one pass.
 
 **State meanings** (parsed from `list_runs` output):
-- `not_started` = plan is ready, just waiting for `/donace:execute`. **Not a plan-skill concern** — do NOT offer to resume these. The user should run `/donace:execute <run-id>` instead.
+- `not_started` = plan has PASSed codex review and is waiting for `/donace:execute`. **Not a plan-skill concern** — do NOT offer to resume these. The user should run `/donace:execute <run-id>` instead.
 - `incomplete` with `jobs_completed.plan == "REVIEW"` = codex flagged the plan; this IS plan-skill territory (revision).
 - `incomplete` with `jobs_completed.write_plan == "ERROR"` = write_plan crashed before producing a plan.md; also plan-skill territory (retry).
+- `incomplete` with `jobs_completed.write_plan == "PASS"` and no `jobs_completed.plan` = planner wrote `plan.md` but codex plan review did not finish; resume at Step 5.
 
 For each `incomplete` run matching the REVIEW or ERROR cases above, use `AskUserQuestion` to offer:
 - **Resume** that run (skip to Step 4 with its run-id — `write_plan` auto-detects the existing plan.md and treats the new brief as a revision directive)
 - **Start fresh** (continue to Step 2 with a new run-id)
+
+If an `incomplete` run has `write_plan == "PASS"` but no plan verdict yet, offer to resume review and skip directly to Step 5 with that run-id.
 
 If no resumable run matches, continue to Step 2. `not_started` runs that you find should be surfaced to the user as **"you have an unstarted plan at `.ai/runs/<id>/plan.md` — run `/donace:execute <id>` to execute it, or proceed to write a new plan."** Do not auto-resume them from this skill.
 

@@ -301,6 +301,10 @@ _SUBCOMMANDS = frozenset({
     "verify", "review", "document", "health",
 })
 
+_RUN_STATES = frozenset({
+    "completed", "in_progress", "incomplete", "not_started", "empty",
+})
+
 
 def _looks_like_legacy_task_invocation(argv: list[str]) -> bool:
     """True iff argv has a top-level --task (legacy shape) rather than a
@@ -316,6 +320,22 @@ def _looks_like_legacy_task_invocation(argv: list[str]) -> bool:
         if tok == "--task" or tok.startswith("--task="):
             return True
     return False
+
+
+def _parse_state_filter(value: str) -> str:
+    """Validate a single or comma-separated list_runs state filter."""
+    states = [s.strip() for s in value.split(",") if s.strip()]
+    if not states:
+        raise argparse.ArgumentTypeError("must include at least one state")
+
+    invalid = [s for s in states if s not in _RUN_STATES]
+    if invalid:
+        allowed = ", ".join(sorted(_RUN_STATES))
+        bad = ", ".join(invalid)
+        raise argparse.ArgumentTypeError(
+            f"invalid state(s): {bad}. Choose from: {allowed}"
+        )
+    return ",".join(states)
 
 
 def main() -> None:
@@ -359,15 +379,16 @@ def main() -> None:
     p = subparsers.add_parser(
         "list_runs",
         help="List runs in this project with state (completed / in_progress / "
-             "incomplete / empty). Team-lead uses this at session startup to "
-             "detect incomplete runs that may need to be resumed.",
+             "not_started / incomplete / empty). Team-lead uses this at "
+             "session startup to detect runs that may need to be resumed.",
     )
     p.add_argument("--cwd", type=str, default=os.getcwd())
     p.add_argument("--include-archived", action="store_true",
                    help="Also list runs that have been compressed into .ai/archive/")
-    p.add_argument("--state", type=str, default=None,
-                   choices=["completed", "in_progress", "incomplete", "empty"],
-                   help="Only show runs matching this state")
+    p.add_argument("--state", type=_parse_state_filter, default=None,
+                   help="Only show runs matching this state. Accepts a single "
+                        "state or comma-separated list, e.g. "
+                        "not_started,incomplete")
 
     # --- mark ---
     p = subparsers.add_parser(
