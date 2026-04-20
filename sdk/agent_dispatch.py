@@ -1204,6 +1204,8 @@ class AgentDispatcher:
                 "output": "",
                 "reason": "codex review timed out after 180 seconds",
             }
+        except RateLimitError:
+            raise
         except Exception as e:
             return {
                 "status": "skipped",
@@ -1328,6 +1330,8 @@ class AgentDispatcher:
                 "output": "",
                 "reason": "codex plan review timed out after 240 seconds",
             }
+        except RateLimitError:
+            raise
         except Exception as exc:
             return {
                 "status": "skipped",

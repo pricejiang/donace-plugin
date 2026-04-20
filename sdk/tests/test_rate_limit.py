@@ -15,7 +15,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from sdk.agent_dispatch import RateLimitError, _detect_rate_limit  # noqa: E402
+from sdk.agent_dispatch import AgentDispatcher, RateLimitError, _detect_rate_limit  # noqa: E402
 from sdk.job_runner import JobResult, run_job  # noqa: E402
 from sdk.events import EventBus, Stage  # noqa: E402
 
@@ -72,6 +72,45 @@ class RateLimitErrorTests(unittest.TestCase):
     def test_is_runtime_error_subclass(self):
         # So existing `except RuntimeError` paths still catch it if they want.
         self.assertTrue(issubclass(RateLimitError, RuntimeError))
+
+
+class CodexRateLimitPropagationTests(unittest.TestCase):
+    """Codex wrapper paths must not downgrade rate limits to skipped results."""
+
+    def _make_dispatcher(self) -> AgentDispatcher:
+        dispatcher = AgentDispatcher(
+            agents_dir=str(_REPO_ROOT / "agents"),
+            cwd=str(_REPO_ROOT),
+            bus=EventBus(run_id="test-run"),
+            codex_review_base="HEAD",
+        )
+        dispatcher._resolve_codex_companion = lambda: ("plugin-root", Path("companion.mjs"), None)  # type: ignore[method-assign]
+        return dispatcher
+
+    def _run(self, coro):
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    def test_codex_review_propagates_rate_limit(self):
+        dispatcher = self._make_dispatcher()
+
+        async def rate_limited_command(cmd, codex_plugin_root):
+            raise RateLimitError("You've hit your limit \u00b7 resets 1am")
+
+        dispatcher._run_codex_command = rate_limited_command  # type: ignore[method-assign]
+
+        with self.assertRaises(RateLimitError):
+            self._run(dispatcher.run_codex_review())
+
+    def test_codex_plan_review_propagates_rate_limit(self):
+        dispatcher = self._make_dispatcher()
+
+        async def rate_limited_command(cmd, codex_plugin_root):
+            raise RateLimitError("You've hit your limit \u00b7 resets 1am")
+
+        dispatcher._run_codex_command = rate_limited_command  # type: ignore[method-assign]
+
+        with self.assertRaises(RateLimitError):
+            self._run(dispatcher.run_codex_plan_review("## Plan"))
 
 
 class JobRunnerRateLimitTests(unittest.TestCase):
