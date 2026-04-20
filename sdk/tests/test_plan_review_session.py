@@ -27,8 +27,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from sdk.agent_dispatch import AgentDispatcher  # noqa: E402
-from sdk.commands import _prior_codex_thread_id  # noqa: E402
-from sdk.events import EventBus  # noqa: E402
+from sdk.commands import _prior_codex_thread_id, cmd_plan  # noqa: E402
+from sdk.events import EventBus, Stage  # noqa: E402
 
 
 class _CapturedCmd:
@@ -105,6 +105,38 @@ class PlanReviewSessionTests(unittest.TestCase):
         assert capture.cmd is not None
         self.assertIn("--resume-last", capture.cmd)
 
+    def test_resume_thread_id_adds_flag_when_candidate_matches(self):
+        dispatcher = self._make_dispatcher()
+        capture = _CapturedCmd(self._valid_task_payload())
+        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        dispatcher._codex_task_resume_candidate_thread_id = (  # type: ignore[method-assign]
+            lambda companion_script: asyncio.sleep(0, result="thread-abc123")
+        )
+
+        self._run(dispatcher.run_codex_plan_review(
+            "## Plan\n\n### Stage 1",
+            resume_thread_id="thread-abc123",
+        ))
+
+        assert capture.cmd is not None
+        self.assertIn("--resume-last", capture.cmd)
+
+    def test_resume_thread_id_mismatch_skips_flag(self):
+        dispatcher = self._make_dispatcher()
+        capture = _CapturedCmd(self._valid_task_payload())
+        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        dispatcher._codex_task_resume_candidate_thread_id = (  # type: ignore[method-assign]
+            lambda companion_script: asyncio.sleep(0, result="thread-other")
+        )
+
+        self._run(dispatcher.run_codex_plan_review(
+            "## Plan\n\n### Stage 1",
+            resume_thread_id="thread-abc123",
+        ))
+
+        assert capture.cmd is not None
+        self.assertNotIn("--resume-last", capture.cmd)
+
     def test_response_surfaces_thread_id(self):
         # Callers need thread_id so they can persist it in plan.json and
         # pass resume_last=True on the next revision.
@@ -180,6 +212,52 @@ class PriorThreadIdDetectionTests(unittest.TestCase):
             "codex_review": {"status": "completed", "thread_id": ""},
         }))
         self.assertIsNone(_prior_codex_thread_id(self.run_dir))
+
+
+class CmdPlanResumeThreadTests(unittest.TestCase):
+    """cmd_plan should pass the saved plan-review thread id through unchanged."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmpdir.name)
+        self.run_id = "run-123"
+        self.run_dir = self.cwd / ".ai" / "runs" / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "plan.md").write_text("## Placeholder plan\n")
+        (self.run_dir / "plan.json").write_text(json.dumps({
+            "codex_review": {"status": "completed", "thread_id": "thread-prev"},
+        }))
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _run(self, coro):
+        return asyncio.new_event_loop().run_until_complete(coro)
+
+    def test_cmd_plan_passes_saved_thread_id(self):
+        seen: dict[str, object] = {}
+
+        class FakeDispatcher:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def run_codex_plan_review(self, plan_text: str, *, resume_last: bool = False, resume_thread_id: str | None = None) -> dict:
+                seen["resume_last"] = resume_last
+                seen["resume_thread_id"] = resume_thread_id
+                return {
+                    "status": "completed",
+                    "has_major_issues": False,
+                    "thread_id": "thread-prev",
+                }
+
+        with patch("sdk.orchestrator._parse_plan_stages", return_value=[
+            Stage(name="Stage 1", has_user_facing_changes=False, files=["apps/web/x.ts"]),
+        ]), patch("sdk.agent_dispatch.AgentDispatcher", FakeDispatcher):
+            self._run(cmd_plan(str(self.cwd), self.run_id, None))
+
+        self.assertEqual(seen.get("resume_thread_id"), "thread-prev")
+        self.assertFalse(bool(seen.get("resume_last")))
 
 
 if __name__ == "__main__":

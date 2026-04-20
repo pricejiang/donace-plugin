@@ -1657,7 +1657,7 @@ async def cmd_plan(
                 dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
                 codex_review = await dispatcher.run_codex_plan_review(
                     plan_content,
-                    resume_last=bool(prior_thread_id),
+                    resume_thread_id=prior_thread_id,
                 )
             except Exception as exc:
                 codex_review = {

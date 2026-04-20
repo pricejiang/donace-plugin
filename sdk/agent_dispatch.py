@@ -1403,7 +1403,13 @@ class AgentDispatcher:
                 "reason": f"codex review failed: {e}",
             }
 
-    async def run_codex_plan_review(self, plan_text: str, *, resume_last: bool = False) -> dict:
+    async def run_codex_plan_review(
+        self,
+        plan_text: str,
+        *,
+        resume_last: bool = False,
+        resume_thread_id: str | None = None,
+    ) -> dict:
         """Run Codex against a staged plan and return structured findings.
 
         Wraps the inner work with AgentStarted/AgentCompleted emits so the
@@ -1412,17 +1418,23 @@ class AgentDispatcher:
         so none of the tool-level events would otherwise surface — the
         run just appears frozen until codex returns minutes later.
 
-        `resume_last=True` passes `--resume-last` to codex-companion's `task`
-        subcommand so the rev-chain review (rev1 → rev2 → rev3 on the same
-        plan) stays in the same codex thread. Codex can then reference
-        prior findings ("my earlier concern about X is addressed; new
-        issue Y") instead of re-deriving everything from scratch.
+        `resume_last=True` preserves the legacy "resume whichever task thread
+        Codex thinks is latest" behavior.
+
+        `resume_thread_id` is stricter: we only pass `--resume-last` when the
+        companion's current resumable-task candidate matches that saved thread
+        id. If some unrelated Codex task ran more recently, we fall back to a
+        fresh plan review instead of resuming the wrong conversation.
         """
         await self.bus.emit(AgentStarted(agent="codex-plan-review", model="haiku"))
         t0 = time.time()
         result: dict = {"status": "skipped", "has_major_issues": False}
         try:
-            result = await self._run_codex_plan_review_inner(plan_text, resume_last=resume_last)
+            result = await self._run_codex_plan_review_inner(
+                plan_text,
+                resume_last=resume_last,
+                resume_thread_id=resume_thread_id,
+            )
             return result
         finally:
             summary_parts: list[str] = [f"status={result.get('status', 'unknown')}"]
@@ -1434,7 +1446,13 @@ class AgentDispatcher:
                 result_summary=" ".join(summary_parts),
             ))
 
-    async def _run_codex_plan_review_inner(self, plan_text: str, *, resume_last: bool = False) -> dict:
+    async def _run_codex_plan_review_inner(
+        self,
+        plan_text: str,
+        *,
+        resume_last: bool = False,
+        resume_thread_id: str | None = None,
+    ) -> dict:
         """Actual codex plan review body — emit wrapping is handled by the public method."""
         codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
         if not codex_plugin_root or not companion_script:
@@ -1460,6 +1478,13 @@ class AgentDispatcher:
                 handle.write(_build_codex_plan_review_prompt(plan_text))
                 prompt_path = handle.name
 
+            should_resume = False
+            if resume_thread_id:
+                candidate_thread_id = await self._codex_task_resume_candidate_thread_id(companion_script)
+                should_resume = candidate_thread_id == resume_thread_id
+            elif resume_last:
+                should_resume = True
+
             cmd_parts = [
                 f"node {shlex.quote(str(companion_script))}",
                 "task",
@@ -1467,7 +1492,7 @@ class AgentDispatcher:
                 f"--cwd {shlex.quote(self.cwd)}",
                 f"--prompt-file {shlex.quote(prompt_path)}",
             ]
-            if resume_last:
+            if should_resume:
                 cmd_parts.append("--resume-last")
             cmd = " ".join(cmd_parts)
             payload_raw = await asyncio.wait_for(
@@ -1557,6 +1582,48 @@ class AgentDispatcher:
                     Path(prompt_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    async def _codex_task_resume_candidate_thread_id(self, companion_script: Path) -> str | None:
+        """Return codex-companion's current resumable task thread id, if any.
+
+        This mirrors the companion's `task-resume-candidate --json` lookup and
+        lets plan review verify that `--resume-last` would continue the same
+        saved thread we persisted in plan.json. On any failure, return None and
+        let the caller fall back to a fresh review.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "node",
+                str(companion_script),
+                "task-resume-candidate",
+                "--json",
+                "--cwd",
+                self.cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except (asyncio.TimeoutError, OSError):
+            return None
+
+        if proc.returncode != 0:
+            return None
+
+        try:
+            payload = json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+        candidate = payload.get("candidate")
+        if not isinstance(candidate, dict):
+            return None
+        thread_id = candidate.get("threadId")
+        if isinstance(thread_id, str):
+            cleaned = thread_id.strip()
+            if cleaned:
+                return cleaned
+        return None
 
     async def _run_codex_command(self, cmd: str, codex_plugin_root: str) -> str:
         """Execute a codex companion command via Agent SDK and return raw output."""
