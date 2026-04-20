@@ -65,6 +65,30 @@ async def _teardown(emitter: WebSocketEmitter | None) -> None:
         await emitter.disconnect()
 
 
+def _prior_codex_thread_id(run_dir: Path) -> str | None:
+    """Return the codex thread_id from the run's prior plan.json, if any.
+
+    Signals "this is a plan revision, not a fresh plan" so the caller
+    can ask codex to resume the thread instead of re-ingesting the full
+    plan. Returns None on first plan, corrupt JSON, missing thread_id
+    (older companion versions), or any read error — safe to always call.
+    """
+    plan_json_path = run_dir / "plan.json"
+    if not plan_json_path.exists():
+        return None
+    try:
+        data = json.loads(plan_json_path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    review = data.get("codex_review")
+    if not isinstance(review, dict):
+        return None
+    thread_id = review.get("thread_id")
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+    return None
+
+
 def _write_job_result(cwd: str, run_id: str, job_id: str, result: dict) -> Path:
     """Persist job result to .ai/runs/{run_id}/jobs/{job_id}.json."""
     jobs_dir = Path(cwd) / ".ai" / "runs" / run_id / "jobs"
@@ -1620,13 +1644,21 @@ async def cmd_plan(
                 f"and **Status** fields. See agents/team-lead.md for the template."
             )
 
-        # Optional codex plan review — the one LLM call in this pipeline
+        # Optional codex plan review — the one LLM call in this pipeline.
+        # Resume the prior codex thread when we can: the rev1→rev2→rev3
+        # loop (user iterates on the same plan.md) then stays in one
+        # session, so codex references its earlier findings instead of
+        # re-deriving everything from a 26KB plan every round.
+        prior_thread_id = _prior_codex_thread_id(run_dir)
         codex_review: dict[str, Any] = {"status": "skipped", "has_major_issues": False}
         if not skip_codex:
             try:
                 from sdk.agent_dispatch import AgentDispatcher
                 dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
-                codex_review = await dispatcher.run_codex_plan_review(plan_content)
+                codex_review = await dispatcher.run_codex_plan_review(
+                    plan_content,
+                    resume_last=bool(prior_thread_id),
+                )
             except Exception as exc:
                 codex_review = {
                     "status": "error",

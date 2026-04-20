@@ -1403,7 +1403,7 @@ class AgentDispatcher:
                 "reason": f"codex review failed: {e}",
             }
 
-    async def run_codex_plan_review(self, plan_text: str) -> dict:
+    async def run_codex_plan_review(self, plan_text: str, *, resume_last: bool = False) -> dict:
         """Run Codex against a staged plan and return structured findings.
 
         Wraps the inner work with AgentStarted/AgentCompleted emits so the
@@ -1411,12 +1411,18 @@ class AgentDispatcher:
         underlying codex call goes through `sdk_query` (not `self.query`),
         so none of the tool-level events would otherwise surface — the
         run just appears frozen until codex returns minutes later.
+
+        `resume_last=True` passes `--resume-last` to codex-companion's `task`
+        subcommand so the rev-chain review (rev1 → rev2 → rev3 on the same
+        plan) stays in the same codex thread. Codex can then reference
+        prior findings ("my earlier concern about X is addressed; new
+        issue Y") instead of re-deriving everything from scratch.
         """
         await self.bus.emit(AgentStarted(agent="codex-plan-review", model="haiku"))
         t0 = time.time()
         result: dict = {"status": "skipped", "has_major_issues": False}
         try:
-            result = await self._run_codex_plan_review_inner(plan_text)
+            result = await self._run_codex_plan_review_inner(plan_text, resume_last=resume_last)
             return result
         finally:
             summary_parts: list[str] = [f"status={result.get('status', 'unknown')}"]
@@ -1428,7 +1434,7 @@ class AgentDispatcher:
                 result_summary=" ".join(summary_parts),
             ))
 
-    async def _run_codex_plan_review_inner(self, plan_text: str) -> dict:
+    async def _run_codex_plan_review_inner(self, plan_text: str, *, resume_last: bool = False) -> dict:
         """Actual codex plan review body — emit wrapping is handled by the public method."""
         codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
         if not codex_plugin_root or not companion_script:
@@ -1454,11 +1460,16 @@ class AgentDispatcher:
                 handle.write(_build_codex_plan_review_prompt(plan_text))
                 prompt_path = handle.name
 
-            cmd = (
-                f"node {shlex.quote(str(companion_script))} task --json "
-                f"--cwd {shlex.quote(self.cwd)} "
-                f"--prompt-file {shlex.quote(prompt_path)}"
-            )
+            cmd_parts = [
+                f"node {shlex.quote(str(companion_script))}",
+                "task",
+                "--json",
+                f"--cwd {shlex.quote(self.cwd)}",
+                f"--prompt-file {shlex.quote(prompt_path)}",
+            ]
+            if resume_last:
+                cmd_parts.append("--resume-last")
+            cmd = " ".join(cmd_parts)
             payload_raw = await asyncio.wait_for(
                 self._run_codex_command(cmd, codex_plugin_root),
                 timeout=240,
@@ -1502,7 +1513,12 @@ class AgentDispatcher:
             findings = _format_plan_review_findings(parsed.get("findings", []))
             next_steps = parsed.get("next_steps", [])
 
-            return {
+            # Surface codex's threadId so the caller can persist it and
+            # pass resume_last=True on the next revision. None if the
+            # companion doesn't report one (older versions, or if codex
+            # failed to start a thread).
+            thread_id = payload.get("threadId")
+            result = {
                 "status": "completed",
                 "has_major_issues": verdict == "needs-attention",
                 "summary": summary,
@@ -1510,6 +1526,11 @@ class AgentDispatcher:
                 "next_steps": next_steps if isinstance(next_steps, list) else [],
                 "output": raw_output,
             }
+            if thread_id:
+                result["thread_id"] = str(thread_id)
+            else:
+                result["thread_id"] = None
+            return result
         except asyncio.TimeoutError:
             return {
                 "status": "skipped",
