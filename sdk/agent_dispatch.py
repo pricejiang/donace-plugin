@@ -116,6 +116,36 @@ class RateLimitError(RuntimeError):
     """
 
 
+# ---------------------------------------------------------------------------
+# File-scope normalization
+# ---------------------------------------------------------------------------
+# plan.json stores file paths as markdown code spans: "`apps/web/x.ts`".
+# Unstripped, the literal-string comparison in the Write/Edit hook and
+# _bash_writes_outside_scope never matches the real relative path — every
+# in-scope write gets denied. Stage-2 of run-phase3-reader-24c1c0260e85
+# hit this 6+ times on files that were explicitly listed in the plan.
+def _normalize_file_scope(scope: list[str] | None) -> list[str] | None:
+    """Strip markdown backticks, whitespace, and trailing slashes.
+
+    None passes through (means "no scope restriction"). Empty/all-whitespace
+    entries are dropped rather than preserved as a broken match key.
+    """
+    if scope is None:
+        return None
+    cleaned: list[str] = []
+    for raw in scope:
+        if raw is None:
+            continue
+        s = raw.strip()
+        # Peel balanced outer backticks (`apps/x.ts` → apps/x.ts), not inner ones.
+        while s.startswith("`") and s.endswith("`") and len(s) >= 2:
+            s = s[1:-1].strip()
+        s = s.rstrip("/")
+        if s:
+            cleaned.append(s)
+    return cleaned
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     """Extract the first JSON object embedded in text."""
     decoder = json.JSONDecoder()
@@ -419,6 +449,44 @@ _SED_PERL_INPLACE_RE = re.compile(r"\b(?:sed|perl)\s+(?:-\S+\s+)*-(?:p)?i\b")
 _SHELL_OPS = frozenset({"|", ";", "&&", "||", "&", "|&", ">", ">>", "<"})
 
 
+def _blank_quoted_regions(command: str) -> str:
+    """Replace content inside "...", '...', `...` with same-length spaces.
+
+    `_REDIR_RE` runs over the raw command and can't distinguish `>` in a
+    shell redirect from `>` inside a quoted string (e.g. `node -e "c=>d"`
+    where the arrow function matched as redirect target `d`). Since shell
+    redirects can never appear inside quotes, blanking quoted regions
+    removes the false positives without dropping any real detections.
+    Positions are preserved so regex offsets still map to the original.
+    """
+    out = list(command)
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2  # escaped char, keep both positions untouched
+            continue
+        if ch in ('"', "'", "`"):
+            quote = ch
+            j = i + 1
+            while j < n:
+                if command[j] == "\\" and j + 1 < n:
+                    out[j] = " "
+                    out[j + 1] = " "
+                    j += 2
+                    continue
+                if command[j] == quote:
+                    break
+                out[j] = " "
+                j += 1
+            # Skip past closing quote if we found one; otherwise bail out.
+            i = j + 1
+            continue
+        i += 1
+    return "".join(out)
+
+
 def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) -> str | None:
     """Detect bash commands that write files outside `file_scope`.
 
@@ -427,6 +495,11 @@ def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) ->
     sandbox — unknown write patterns are allowed. Returns a reason string
     if blocked, None if the command is safe (or unrecognized).
     """
+    # Normalize scope once — plan.json uses markdown code spans
+    # ("`apps/x.ts`") which the literal-string comparison below won't
+    # match against the hook's rel_path ("apps/x.ts").
+    file_scope = _normalize_file_scope(file_scope) or []
+
     # 1. Mass-mutators walk trees — reject outright under file_scope
     for needle in _MASS_MUTATORS:
         if needle in command:
@@ -437,8 +510,10 @@ def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) ->
 
     write_targets: list[tuple[str, str]] = []  # (target, kind)
 
-    # 2a. Shell redirection
-    for m in _REDIR_RE.finditer(command):
+    # 2a. Shell redirection — scan with quoted regions blanked out so
+    # JS / Perl / HTML fragments inside -e "..." don't register as writes.
+    command_for_redir = _blank_quoted_regions(command)
+    for m in _REDIR_RE.finditer(command_for_redir):
         target = m.group(1).strip("\"'")
         if not target or target.startswith("&") or target.startswith("/dev/"):
             continue
@@ -615,7 +690,10 @@ class AgentDispatcher:
         self.agents_dir = agents_dir
         self.cwd = cwd
         self.bus = bus
-        self.file_scope = file_scope  # If set, Write/Edit restricted to these paths
+        # Strip markdown backticks / trailing slashes once at construction so
+        # every downstream string compare (Write/Edit hook, bash redirect
+        # checker) gets clean paths. Plan.json stores files as code spans.
+        self.file_scope = _normalize_file_scope(file_scope)
         # Explicit codex review base SHA. When set (typically to the pre-stage
         # HEAD captured by cmd_run_job), codex diffs this stage only, not the
         # cumulative merge-base..HEAD range. Left None for verify flows and
