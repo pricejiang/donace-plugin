@@ -4,21 +4,5 @@
   "description": "Generator-Evaluator agent harness with sprint-based development workflow, cross-model review (Claude + Codex), and knowledge persistence",
   "author": {
     "name": "Minghao Jiang"
-  },
-  "agents": [
-    "agents/team-lead.md",
-    "agents/planner.md",
-    "agents/implementer.md",
-    "agents/ui-designer.md",
-    "agents/test-engineer.md",
-    "agents/typescript-reviewer.md",
-    "agents/ios-reviewer.md",
-    "agents/qa.md",
-    "agents/documenter.md"
-  ],
-  "skills": [
-    "skills/plan/SKILL.md",
-    "skills/execute/SKILL.md",
-    "skills/chat/SKILL.md"
-  ]
+  }
 }
