@@ -69,6 +69,53 @@ def _resolve_model(short: str) -> str:
     return MODEL_MAP.get(short, short)
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit detection
+# ---------------------------------------------------------------------------
+# Claude Code surfaces quota hits via AssistantMessage text right before
+# closing the stream with an empty-errors ResultMessage. Without parsing
+# those chunks, job_runner sees `agent error: unknown` and treats the
+# throttle like a plan failure (counts against 3-strike retry budget,
+# trips repeated_stage_failure validation). We want infra throttles to
+# pause-and-resume, not block the run.
+_RATE_LIMIT_PATTERNS = (
+    re.compile(r"hit\s+(?:your\s+)?(?:rate\s+)?limit", re.I),
+    re.compile(r"rate[\s-]*limit(?:ed|ing)?(?:\s+exceeded)?", re.I),
+    re.compile(r"quota\s+(?:exceeded|exhausted|reached)", re.I),
+    re.compile(r"usage\s+(?:cap|limit)\s+(?:reached|exceeded)", re.I),
+    re.compile(r"resets?\s+(?:at\s+)?\d", re.I),  # "resets 1am", "resets at 11pm"
+)
+
+
+def _detect_rate_limit(text: str | None) -> str | None:
+    """Return the cleaned rate-limit snippet if `text` mentions one, else None.
+
+    Narrow regex set — generic 'limit' words won't match ('size limit',
+    'retry limit'). We require a phrase tying 'limit/quota/cap/resets' to
+    throttling semantics.
+    """
+    if not text:
+        return None
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    for pattern in _RATE_LIMIT_PATTERNS:
+        if pattern.search(cleaned):
+            return cleaned
+    return None
+
+
+class RateLimitError(RuntimeError):
+    """Raised when a Claude Code harness throttle is detected mid-stream.
+
+    Subclass of RuntimeError so existing `except RuntimeError` paths still
+    catch it, but specific enough for job_runner to treat it as INTERRUPTED
+    (pause + resume) rather than BLOCKED (counts against retry budget).
+    """
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     """Extract the first JSON object embedded in text."""
     decoder = json.JSONDecoder()
@@ -908,11 +955,18 @@ class AgentDispatcher:
         await client.connect(prompt=prompt)
 
         final_text = ""
+        # Track the most recent assistant text so we can inspect it when
+        # the stream closes with an error — the Claude Code harness
+        # delivers rate-limit notices as an AssistantMessage first, then
+        # an empty-errors ResultMessage, so the error itself is useless
+        # without the preceding chunk.
+        last_assistant_text = ""
         try:
             async for message in client.receive_messages():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
+                            last_assistant_text = block.text
                             await self.bus.emit(AgentMessage(
                                 agent=agent,
                                 role="assistant",
@@ -922,6 +976,9 @@ class AgentDispatcher:
                 if isinstance(message, ResultMessage):
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", []) or []
+                        rate_msg = _detect_rate_limit(last_assistant_text)
+                        if rate_msg:
+                            raise RateLimitError(rate_msg)
                         raise RuntimeError(f"agent error: {'; '.join(errors) if errors else 'unknown'}")
                     final_text = getattr(message, "result", "") or ""
                     usage = getattr(message, "usage", None)
@@ -1307,15 +1364,20 @@ class AgentDispatcher:
         )
 
         all_text: list[str] = []
+        last_assistant_text = ""
         async for message in sdk_query(prompt=prompt, options=options):
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock) and block.text.strip():
+                        last_assistant_text = block.text
                         all_text.append(block.text)
             elif isinstance(message, ResultMessage):
                 # Check for errors in the result
                 if getattr(message, "is_error", False):
                     errors = getattr(message, "errors", []) or []
+                    rate_msg = _detect_rate_limit(last_assistant_text)
+                    if rate_msg:
+                        raise RateLimitError(rate_msg)
                     raise RuntimeError(f"codex agent error: {'; '.join(errors) if errors else 'unknown'}")
                 result_text = getattr(message, "result", "") or ""
                 if result_text.strip():

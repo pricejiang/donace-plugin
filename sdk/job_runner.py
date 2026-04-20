@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+from sdk.agent_dispatch import RateLimitError
 from sdk.events import (
     EventBus,
     FixLoopExhausted,
@@ -202,6 +203,16 @@ async def run_job(
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
         impl_output = await query(agent="implementer", prompt=impl_prompt, model="sonnet")
+    except RateLimitError as exc:
+        # Infra throttle, not a plan failure. INTERRUPTED pauses the run
+        # and keeps stage-1 eligible for resume — BLOCKED would count
+        # against the 3-strike retry budget.
+        return JobResult(
+            status="INTERRUPTED",
+            unresolved=[f"rate_limited: {exc}"],
+            interrupted_at="implement",
+            completed_steps=completed_steps,
+        )
     except Exception as exc:
         return JobResult(
             status="BLOCKED",
@@ -248,6 +259,18 @@ async def run_job(
         # emits its own AgentStarted/Completed via dispatcher.query (or
         # the codex-review wrapper). No manual emits needed here.
         raw_results = await asyncio.gather(*verify_coros, return_exceptions=True)
+
+        # Rate limit on any verifier → pause the run. Don't collapse it
+        # into a {"status": "error"} dict — that routes to _collect_failures
+        # as a verifier crash and counts against retries.
+        for r in raw_results:
+            if isinstance(r, RateLimitError):
+                return JobResult(
+                    status="INTERRUPTED",
+                    unresolved=[f"rate_limited: {r}"],
+                    interrupted_at="verify",
+                    completed_steps=completed_steps,
+                )
 
         for i, name in enumerate(verify_names):
             r = raw_results[i]
@@ -308,6 +331,17 @@ async def run_job(
             fix_output = await query(
                 agent="implementer", prompt=fix_prompt, model="sonnet", role="fix",
             )
+        except RateLimitError as exc:
+            return JobResult(
+                status="INTERRUPTED",
+                test_result=test_result,
+                codex_result=codex_result,
+                runtime_result=runtime_result,
+                fix_attempts=fix_attempts,
+                unresolved=[f"rate_limited: {exc}"],
+                interrupted_at="fix_loop",
+                completed_steps=completed_steps,
+            )
         except Exception:
             break
 
@@ -333,6 +367,17 @@ async def run_job(
         if "test" not in skip_agents:
             try:
                 test_result = await run_test_engineer(stage)
+            except RateLimitError as exc:
+                return JobResult(
+                    status="INTERRUPTED",
+                    test_result=test_result,
+                    codex_result=codex_result,
+                    runtime_result=runtime_result,
+                    fix_attempts=fix_attempts,
+                    unresolved=[f"rate_limited: {exc}"],
+                    interrupted_at="fix_loop",
+                    completed_steps=completed_steps,
+                )
             except Exception:
                 break
 
