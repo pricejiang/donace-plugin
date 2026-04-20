@@ -116,6 +116,20 @@ class BashRedirectFalsePositiveTests(unittest.TestCase):
             msg="'>' inside '...' should not count as redirect",
         )
 
+    def test_redirect_in_backtick_command_substitution_is_detected(self):
+        cmd = "echo `echo hello > /tmp/out`"
+        reason = _bash_writes_outside_scope(cmd, self.scope, self.cwd)
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("redirection", reason.lower())
+
+    def test_redirect_in_double_quoted_backtick_substitution_is_detected(self):
+        cmd = 'echo "prefix `echo hello > /tmp/out`"'
+        reason = _bash_writes_outside_scope(cmd, self.scope, self.cwd)
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("redirection", reason.lower())
+
     def test_real_redirect_still_detected(self):
         # Spaces around `>` — canonical shell redirect outside any quoting.
         cmd = "echo hello > /etc/passwd"
@@ -130,6 +144,30 @@ class BashRedirectFalsePositiveTests(unittest.TestCase):
             cmd, ["apps/backend/x.ts"], self.cwd,
         )
         self.assertIsNotNone(reason)
+
+    def test_double_quoted_redirect_target_still_caught(self):
+        # Codex P1: blanking quotes ate the target too. A legal shell
+        # redirect to a quoted path must still scope-check against the
+        # unquoted content.
+        cmd = 'echo hi > "apps/outside-scope.ts"'
+        reason = _bash_writes_outside_scope(cmd, self.scope, self.cwd)
+        self.assertIsNotNone(reason, msg="out-of-scope quoted target must be flagged")
+        assert reason is not None
+        self.assertIn("apps/outside-scope.ts", reason)
+
+    def test_single_quoted_redirect_target_still_caught(self):
+        cmd = "echo hi > 'apps/outside-scope.ts'"
+        reason = _bash_writes_outside_scope(cmd, self.scope, self.cwd)
+        self.assertIsNotNone(reason)
+        assert reason is not None
+        self.assertIn("apps/outside-scope.ts", reason)
+
+    def test_quoted_in_scope_target_still_allowed(self):
+        # Symmetry: legitimate in-scope writes with quoted paths must pass.
+        cmd = 'echo hi > "apps/in-scope.ts"'
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, ["apps/in-scope.ts"], self.cwd),
+        )
 
 
 class DispatcherConstructorTests(unittest.TestCase):

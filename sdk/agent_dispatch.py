@@ -450,25 +450,60 @@ _SHELL_OPS = frozenset({"|", ";", "&&", "||", "&", "|&", ">", ">>", "<"})
 
 
 def _blank_quoted_regions(command: str) -> str:
-    """Replace content inside "...", '...', `...` with same-length spaces.
+    """Replace inert quoted content with same-length spaces.
 
     `_REDIR_RE` runs over the raw command and can't distinguish `>` in a
     shell redirect from `>` inside a quoted string (e.g. `node -e "c=>d"`
-    where the arrow function matched as redirect target `d`). Since shell
-    redirects can never appear inside quotes, blanking quoted regions
-    removes the false positives without dropping any real detections.
-    Positions are preserved so regex offsets still map to the original.
+    where the arrow function matched as redirect target `d`).
+
+    Backticks are command substitutions, not inert quotes. Preserve their
+    bodies so nested writes like ``echo `echo hi > /tmp/out` `` still get
+    caught by the redirect scanner. Positions are preserved so regex
+    offsets still map to the original.
     """
     out = list(command)
     i = 0
     n = len(command)
+
+    def blank_quote(start: int, quote: str) -> int:
+        j = start + 1
+        while j < n:
+            if command[j] == "\\" and j + 1 < n:
+                out[j] = " "
+                out[j + 1] = " "
+                j += 2
+                continue
+            if command[j] == quote:
+                break
+            out[j] = " "
+            j += 1
+        return j + 1
+
+    def scan_backtick_substitution(start: int) -> int:
+        j = start + 1
+        while j < n:
+            if command[j] == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if command[j] == "`":
+                break
+            if command[j] in ("'", '"'):
+                # Quotes inside the nested command are inert for redirect
+                # detection, just like quotes in the outer command.
+                j = blank_quote(j, command[j])
+                continue
+            j += 1
+        return j + 1
+
     while i < n:
         ch = command[i]
         if ch == "\\" and i + 1 < n:
             i += 2  # escaped char, keep both positions untouched
             continue
-        if ch in ('"', "'", "`"):
-            quote = ch
+        if ch == "'":
+            i = blank_quote(i, ch)
+            continue
+        if ch == '"':
             j = i + 1
             while j < n:
                 if command[j] == "\\" and j + 1 < n:
@@ -476,15 +511,84 @@ def _blank_quoted_regions(command: str) -> str:
                     out[j + 1] = " "
                     j += 2
                     continue
-                if command[j] == quote:
+                if command[j] == '"':
                     break
+                if command[j] == "`":
+                    j = scan_backtick_substitution(j)
+                    continue
                 out[j] = " "
                 j += 1
-            # Skip past closing quote if we found one; otherwise bail out.
             i = j + 1
+            continue
+        if ch == "`":
+            i = scan_backtick_substitution(i)
             continue
         i += 1
     return "".join(out)
+
+
+_SHELL_WORD_STOP = frozenset(" \t\n|;&<>()`")
+
+
+def _extract_shell_word(command: str, start: int) -> str:
+    """Parse one shell word from `command[start:]`, unquoting as the shell would.
+
+    Companion to `_blank_quoted_regions`: the blanker erases quoted content
+    so `_REDIR_RE` doesn't mis-read `>` inside strings, but it also erased
+    legitimate quoted redirect targets (`cmd > "apps/x.ts"` → target became
+    empty). We find the operator via the blanked text, then re-extract the
+    target from the original with quote handling so scope checks work.
+
+    Handles:
+    - Leading whitespace (tabs/spaces) skipped
+    - Single-quoted segments preserved verbatim
+    - Double-quoted segments with `\\"` / `\\\\` / `\\$` / `` \\` `` escapes
+    - Backslash escapes outside quotes
+    - Adjacent quoted + unquoted concatenation (`"pre"suffix` → `presuffix`)
+    - Stops at whitespace or any shell operator byte
+    """
+    i = start
+    n = len(command)
+    while i < n and command[i] in " \t":
+        i += 1
+    if i >= n:
+        return ""
+    buf: list[str] = []
+    while i < n:
+        ch = command[i]
+        if ch in _SHELL_WORD_STOP:
+            break
+        if ch == "'":
+            i += 1
+            while i < n and command[i] != "'":
+                buf.append(command[i])
+                i += 1
+            if i < n:
+                i += 1
+            continue
+        if ch == '"':
+            i += 1
+            while i < n and command[i] != '"':
+                if (
+                    command[i] == "\\"
+                    and i + 1 < n
+                    and command[i + 1] in ('"', "\\", "$", "`")
+                ):
+                    buf.append(command[i + 1])
+                    i += 2
+                    continue
+                buf.append(command[i])
+                i += 1
+            if i < n:
+                i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        buf.append(ch)
+        i += 1
+    return "".join(buf)
 
 
 def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) -> str | None:
@@ -510,11 +614,18 @@ def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) ->
 
     write_targets: list[tuple[str, str]] = []  # (target, kind)
 
-    # 2a. Shell redirection — scan with quoted regions blanked out so
-    # JS / Perl / HTML fragments inside -e "..." don't register as writes.
+    # 2a. Shell redirection — scan the blanked command so JS / Perl / HTML
+    # fragments inside -e "..." don't register as redirect operators, but
+    # re-extract the target from the ORIGINAL command so quoted paths
+    # (`cmd > "apps/x.ts"`) scope-check against their real content instead
+    # of the blanked-out placeholder.
     command_for_redir = _blank_quoted_regions(command)
     for m in _REDIR_RE.finditer(command_for_redir):
-        target = m.group(1).strip("\"'")
+        matched = m.group(0)
+        # Last `>` in the match is the redirect operator; the target starts
+        # immediately after (possibly with intervening whitespace).
+        op_end = m.start(0) + matched.rfind(">") + 1
+        target = _extract_shell_word(command, op_end)
         if not target or target.startswith("&") or target.startswith("/dev/"):
             continue
         write_targets.append((target, "redirection"))
