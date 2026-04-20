@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -704,11 +705,15 @@ async def cmd_list_runs(
     Output format (list of dicts, printed as JSON to stdout):
       {
         "run_id": str,
-        "state": "completed" | "in_progress" | "incomplete" | "empty",
+        "state": "completed" | "in_progress" | "incomplete" | "not_started" | "empty",
         "started_at": str (ISO-8601 UTC, "" if unknown),
         "archived": bool,
         ...state-specific fields...
       }
+
+    `state_filter` may be a single state or a comma-separated list
+    (e.g. "incomplete,not_started") — runs matching any listed state
+    are kept.
 
     Sorted by started_at descending (newest first). Dashboard-ordering
     compatible.
@@ -748,9 +753,13 @@ async def cmd_list_runs(
                     "archive_path": str(f.relative_to(cwd) if f.is_relative_to(cwd) else f),
                 })
 
-    # Filter by state if requested
+    # Filter by state if requested. Accepts comma-separated list so
+    # callers can ask for multiple states in one pass, e.g. "/donace:execute"
+    # wants both `not_started` (plan done, never ran) and `incomplete`
+    # (partially ran, can resume).
     if state_filter:
-        results = [r for r in results if r["state"] == state_filter]
+        allowed = {s.strip() for s in state_filter.split(",") if s.strip()}
+        results = [r for r in results if r["state"] in allowed]
 
     # Sort newest first (empty started_at sorts to the end)
     results.sort(key=lambda r: r.get("started_at") or "", reverse=True)
@@ -999,17 +1008,23 @@ def _pid_alive(pid: int) -> bool:
 # ---------------------------------------------------------------------------
 
 HOT_RUN_LIMIT = 20  # how many completed runs stay uncompressed in .ai/runs/
+STALE_NOT_STARTED_DAYS = 7  # archive plan-only runs older than this
 
 
 def _classify_run_state(run_dir: Path) -> dict[str, Any]:
     """Inspect a single run dir and return {state, jobs_completed, progress, ...}.
 
     States:
-      completed   — result.json exists (cmd_run_complete ran)
-      in_progress — at least one *.lock has a live pid
-      incomplete  — has plan/jobs but no result.json and no live locks;
-                    team-lead may resume OR just run_complete if done
-      empty       — fresh run_start dir with nothing inside yet
+      completed    — result.json exists (cmd_run_complete ran)
+      in_progress  — at least one *.lock has a live pid
+      incomplete   — execute attempted (run_job:* entry in jobs_completed
+                     or a stale lock) but no result.json yet; team-lead
+                     may resume OR just run_complete if all stages PASSed
+      not_started  — plan is written (plan.md/plan.json, or only
+                     write_plan/plan jobs in jobs_completed) but no
+                     run_job has been dispatched; `/donace:execute` is
+                     the next step
+      empty        — fresh run_start dir with nothing inside yet
 
     `jobs_completed` is a dict mapping label → status ("PASS", "BLOCKED",
     etc.) so callers can distinguish successful stages from ones that
@@ -1070,14 +1085,27 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
             else:
                 info["stale_locks"].append(lock_info)
 
-    # Override state based on observed live/stale activity
+    # Override state based on observed live/stale activity.
+    #
+    # The split between `incomplete` and `not_started` hinges on whether
+    # execute has been attempted:
+    #   - any `run_job:*` entry in jobs_completed → execute was dispatched
+    #   - a stale lock      → a process crashed mid-run (execute or plan)
+    #
+    # Either of those → `incomplete` (needs resume triage).
+    # Plan-only artifacts (plan.md, plan.json, or write_plan/plan jobs)
+    # without any execute attempt → `not_started` (just needs /donace:execute).
     if info["state"] != "completed":
         if info["live_locks"]:
             info["state"] = "in_progress"
-        elif info["jobs_completed"] or info["stale_locks"] \
+        elif info["stale_locks"] or any(
+            k.startswith("run_job:") for k in info["jobs_completed"]
+        ):
+            info["state"] = "incomplete"
+        elif info["jobs_completed"] \
                 or (run_dir / "plan.md").exists() \
                 or (run_dir / "plan.json").exists():
-            info["state"] = "incomplete"
+            info["state"] = "not_started"
 
     # Progress: how much of the plan actually happened?
     plan_json_path = run_dir / "plan.json"
@@ -1162,40 +1190,60 @@ def _archive_run(run_dir: Path, archive_dir: Path) -> Path:
     return archive_path
 
 
-def _enforce_run_retention(cwd: str, limit: int = HOT_RUN_LIMIT) -> list[Path]:
-    """Archive oldest completed runs so only `limit` newest stay hot.
+def _enforce_run_retention(
+    cwd: str,
+    limit: int = HOT_RUN_LIMIT,
+    stale_not_started_days: int = STALE_NOT_STARTED_DAYS,
+) -> list[Path]:
+    """Archive stale runs so `.ai/runs/` does not grow unbounded.
 
-    Only completed runs are candidates — in_progress/incomplete/empty never
-    get archived because the user (or team-lead's resume workflow) may
-    still want to touch them. Best-effort: individual archive failures are
-    swallowed so a flaky file doesn't block run_start.
+    Two classes of runs are archived:
+      1. `completed` runs beyond `limit` — keep the `limit` newest hot.
+      2. `not_started` runs older than `stale_not_started_days` — plan
+         was written but never executed; if the user walked away, it
+         should not linger forever.
+
+    Never archived: `in_progress` (live process), `incomplete` (mid-
+    execute, the user may resume), recent `not_started` (may still be
+    headed to /donace:execute), `empty`. Best-effort: individual
+    archive failures are swallowed so a flaky file doesn't block run_start.
     """
     runs_root = Path(cwd) / ".ai" / "runs"
     if not runs_root.exists():
         return []
+    archive_dir = Path(cwd) / ".ai" / "archive"
 
-    completed: list[tuple[float, Path]] = []
+    classified: list[tuple[float, Path, dict[str, Any]]] = []
     for d in runs_root.iterdir():
         if not d.is_dir():
             continue
-        info = _classify_run_state(d)
-        if info["state"] != "completed":
-            continue
-        completed.append((_run_start_time(d), d))
-
-    if len(completed) <= limit:
-        return []
-
-    completed.sort(key=lambda x: -x[0])  # newest first
-    to_archive = completed[limit:]
-    archive_dir = Path(cwd) / ".ai" / "archive"
+        classified.append((_run_start_time(d), d, _classify_run_state(d)))
 
     archived: list[Path] = []
-    for _, d in to_archive:
+
+    # 1. Completed runs beyond the hot-cache cap
+    completed = [(t, d) for t, d, info in classified if info["state"] == "completed"]
+    if len(completed) > limit:
+        completed.sort(key=lambda x: -x[0])  # newest first
+        for _, d in completed[limit:]:
+            try:
+                archived.append(_archive_run(d, archive_dir))
+            except (OSError, Exception):  # noqa: BLE001 — truly best-effort
+                pass
+
+    # 2. Stale not_started runs (plan-only, abandoned)
+    cutoff = time.time() - (stale_not_started_days * 86400)
+    for t, d, info in classified:
+        if info["state"] != "not_started":
+            continue
+        if t <= 0 or t >= cutoff:
+            # Unknown age (t==0) or still fresh → leave alone
+            continue
         try:
             archived.append(_archive_run(d, archive_dir))
-        except (OSError, Exception):  # noqa: BLE001 — truly best-effort
+        except (OSError, Exception):  # noqa: BLE001
             pass
+
     return archived
 
 

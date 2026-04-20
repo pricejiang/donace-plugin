@@ -99,7 +99,8 @@ in `jobs_completed`** — always read the latter to know what actually ran.
 | `in_progress` | Some `*.lock` has a live pid — **another process is running this run right now** | Do NOT start executing. Warn user; maybe wait. |
 | `completed` | `result.json` exists — run was formally closed | Report to user; nothing to do. |
 | `empty` | Fresh run_start dir, no jobs yet | Report to user that `/donace:plan` needs to finish. |
-| `incomplete` | Run started but `result.json` missing | Inspect `progress` to decide (next table) |
+| `not_started` | plan.md/plan.json written (or write_plan/plan jobs logged) but no `run_job:*` has dispatched yet | **This is the normal post-plan state** — proceed to Step 2 and dispatch every stage in plan.json. |
+| `incomplete` | At least one `run_job:*` entry or stale lock present, `result.json` missing | Inspect `progress` to decide (next table) |
 
 ### `incomplete` sub-cases — read `progress` + `jobs_completed["plan"]` to decide
 
@@ -111,7 +112,7 @@ there's no point dispatching run_jobs against a broken plan.
 | `jobs_completed["plan"] == "REVIEW"` | Codex flagged the plan | **Abort — tell the user to run `/donace:plan <run-id>` to revise.** You do NOT revise plans during execute. |
 | `stages_total > 0` and `stages_passed == stages_total` and `stages_blocked == 0` | Every planned stage PASSed but run_complete never ran | Just call `run_complete --run-id <id>`. No re-running stages. |
 | `0 < stages_passed < stages_total` | Prior session died mid-stages | Resume: identify remaining stages from `jobs_completed` keys (format `run_job:<stage_id>`), dispatch `run_job` serially for the ones NOT in that dict. Don't re-run completed ones. |
-| `stages_passed == 0` and `plan_done == true` and plan status is `PASS` | plan.json written, stages not yet started | Dispatch `run_job` serially for every stage in plan.json. |
+| `stages_passed == 0` and `plan_done == true` and plan status is `PASS` | plan.json written, stages not yet started (will show as `not_started` in the state column) | Dispatch `run_job` serially for every stage in plan.json. |
 | `stages_blocked > 0` | Something blocked | Read the blocked job's JSON file (`.ai/runs/<id>/jobs/job-run_job-<stage_id>-*.json`) — its `unresolved` field tells you what's wrong. Decide: re-try (→ `run_job` again), or escalate to user. Do NOT re-plan. |
 | `stages_total == 0` | No plan.json (plan skill didn't finish, or parse failed) | Abort — tell user to run `/donace:plan` to write a plan first. |
 

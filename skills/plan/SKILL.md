@@ -16,22 +16,25 @@ Drive a planning session that produces a codex-reviewed `.ai/runs/<id>/plan.md`.
 
 ## Step 1: Pre-flight
 
-Run health check and scan for resumable runs:
+Run health check and scan for runs that need plan attention:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" health --cwd "<project>"
-python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs --cwd "<project>" --state incomplete
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs --cwd "<project>" --state incomplete,not_started
 ```
 
-Parse `list_runs` output. If any incomplete run has either:
-- `plan_done == false` (planner started but never finished), OR
-- `jobs_completed.plan == "REVIEW"` (codex flagged the plan)
+The `--state` flag accepts comma-separated values — both `not_started` (plan ready, awaiting execute) and `incomplete` (plan/execute started but unfinished) are surfaced in one pass.
 
-... then use `AskUserQuestion` to offer:
-- **Resume** the existing run (skip to Step 4 with that run-id)
+**State meanings** (parsed from `list_runs` output):
+- `not_started` = plan is ready, just waiting for `/donace:execute`. **Not a plan-skill concern** — do NOT offer to resume these. The user should run `/donace:execute <run-id>` instead.
+- `incomplete` with `jobs_completed.plan == "REVIEW"` = codex flagged the plan; this IS plan-skill territory (revision).
+- `incomplete` with `jobs_completed.write_plan == "ERROR"` = write_plan crashed before producing a plan.md; also plan-skill territory (retry).
+
+For each `incomplete` run matching the REVIEW or ERROR cases above, use `AskUserQuestion` to offer:
+- **Resume** that run (skip to Step 4 with its run-id — `write_plan` auto-detects the existing plan.md and treats the new brief as a revision directive)
 - **Start fresh** (continue to Step 2 with a new run-id)
 
-If no resumable run, continue to Step 2.
+If no resumable run matches, continue to Step 2. `not_started` runs that you find should be surfaced to the user as **"you have an unstarted plan at `.ai/runs/<id>/plan.md` — run `/donace:execute <id>` to execute it, or proceed to write a new plan."** Do not auto-resume them from this skill.
 
 ## Step 2: Gather requirements
 

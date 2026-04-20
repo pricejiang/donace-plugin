@@ -21,14 +21,17 @@ Dispatch the `team-lead` agent to execute a validated plan to completion. This s
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs \
-  --cwd "<project>" --state incomplete
+  --cwd "<project>" --state not_started,incomplete
 ```
+
+`not_started` = plan done, execute never dispatched (the common case after `/donace:plan`).
+`incomplete` = execute partially ran — we can resume if the plan is still PASS.
 
 Parse the output. Filter entries where both:
 - `plan_done == true`, AND
 - `jobs_completed.plan == "PASS"`
 
-Pick the newest by `run-id` (uuid hex — either ctime-sorted via the output order, or the entry the orchestrator lists first).
+Pick the newest by `started_at` (the orchestrator already sorts newest-first).
 
 If **no** such run exists, abort with:
 
@@ -93,10 +96,10 @@ When team-lead returns, print its 3-line summary verbatim, plus a final `list_ru
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" list_runs \
-  --cwd "<project>" --state incomplete
+  --cwd "<project>" --state not_started,incomplete,completed
 ```
 
-If the run has moved to `completed` state (no longer in `--state incomplete`), run without the filter to show its final row.
+Filter the result to just this run's entry (by `run_id`) and show its final state.
 
 If any stage is BLOCKED or wrap phase has errors, tell the user where to look:
 - BLOCKED job JSON: `.ai/runs/<id>/jobs/job-run_job-<stage-id>-*.json` (look at `unresolved`)
