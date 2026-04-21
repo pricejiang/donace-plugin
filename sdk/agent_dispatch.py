@@ -117,6 +117,36 @@ class RateLimitError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Plan review: background launch + poll tuning
+# ---------------------------------------------------------------------------
+# run-phase4-create-fork-a6ca720da361 showed codex genuinely takes 10+ min
+# on mid-sized plans (1.3M input tokens, mostly cached). Foreground waits
+# with a tight cap threw away real findings. We launch in background and
+# poll, capping client-side at 600s. On timeout, codex keeps running and
+# team-lead can finalize via cmd_plan_status.
+_PLAN_REVIEW_TIMEOUT_S: float = 600.0
+_PLAN_REVIEW_POLL_INTERVAL_S: float = 3.0
+
+
+def _skipped_plan_review(reason: str) -> dict:
+    """Default-shape result dict for any early-abort plan review path.
+
+    Missing job_id / thread_id keys intentionally — callers that have them
+    add them after this returns. Keeps the 7-field-with-reason pattern
+    consistent across every skip site.
+    """
+    return {
+        "status": "skipped",
+        "has_major_issues": False,
+        "summary": "",
+        "findings": [],
+        "next_steps": [],
+        "output": "",
+        "reason": reason,
+    }
+
+
+# ---------------------------------------------------------------------------
 # File-scope normalization
 # ---------------------------------------------------------------------------
 # plan.json stores file paths as markdown code spans: "`apps/web/x.ts`".
@@ -1453,17 +1483,22 @@ class AgentDispatcher:
         resume_last: bool = False,
         resume_thread_id: str | None = None,
     ) -> dict:
-        """Actual codex plan review body — emit wrapping is handled by the public method."""
+        """Launch codex plan review in background, poll until done or timeout.
+
+        run-phase4-create-fork-a6ca720da361 showed codex genuinely needs
+        10+ minutes on a mid-sized plan (1.3M input tokens, most cached).
+        Foreground mode with a 240s cap threw away real findings. Now we:
+
+        1. Launch via `task --background --json` — returns jobId in <1s
+        2. Poll `status <job-id> --json` every few seconds until terminal
+           state or _PLAN_REVIEW_TIMEOUT_S hits
+        3. On client timeout: return status="running" with job_id so
+           team-lead's cmd_plan_status can finalize later. DON'T cancel
+           codex — its thread keeps advancing, findings aren't lost.
+        """
         codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
         if not codex_plugin_root or not companion_script:
-            return {
-                "status": "skipped",
-                "has_major_issues": False,
-                "summary": "",
-                "findings": [],
-                "output": "",
-                "reason": reason or "codex plugin not found",
-            }
+            return _skipped_plan_review(reason or "codex plugin not found")
 
         prompt_path: str | None = None
         try:
@@ -1485,103 +1520,249 @@ class AgentDispatcher:
             elif resume_last:
                 should_resume = True
 
-            cmd_parts = [
-                f"node {shlex.quote(str(companion_script))}",
-                "task",
+            task_args = [
                 "--json",
-                f"--cwd {shlex.quote(self.cwd)}",
-                f"--prompt-file {shlex.quote(prompt_path)}",
+                "--background",
+                "--cwd", self.cwd,
+                "--prompt-file", prompt_path,
             ]
             if should_resume:
-                cmd_parts.append("--resume-last")
-            cmd = " ".join(cmd_parts)
-            payload_raw = await asyncio.wait_for(
-                self._run_codex_command(cmd, codex_plugin_root),
-                timeout=240,
+                task_args.append("--resume-last")
+
+            launch = await self._run_codex_json_subcommand(
+                companion_script, "task", task_args, timeout_s=30.0,
             )
-            payload = _extract_json_object(payload_raw)
-            if not payload:
+            if not launch or not launch.get("jobId"):
+                return _skipped_plan_review("codex background launch failed")
+
+            job_id = str(launch["jobId"])
+            launch_thread_id = launch.get("threadId")
+
+            job, terminal = await self._poll_codex_job(companion_script, job_id)
+            job_state = job.get("status") if job else None
+            thread_id = (job.get("threadId") if job else None) or launch_thread_id
+
+            if not terminal:
+                # Client cap hit — codex still running. Persist state,
+                # don't cancel. team-lead's cmd_plan_status recovers.
+                return {
+                    "status": "running",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "next_steps": [],
+                    "output": "",
+                    "reason": f"codex plan review still running after {int(_PLAN_REVIEW_TIMEOUT_S)} seconds",
+                    "job_id": job_id,
+                    "thread_id": str(thread_id) if thread_id else None,
+                }
+
+            if job_state in ("failed", "cancelled"):
+                err = (job.get("error") if job else None) or (job.get("failureMessage") if job else None) or ""
                 return {
                     "status": "skipped",
                     "has_major_issues": False,
                     "summary": "",
                     "findings": [],
-                    "output": payload_raw,
-                    "reason": "codex plan review returned invalid JSON payload",
+                    "next_steps": [],
+                    "output": "",
+                    "reason": f"codex plan review {job_state}" + (f": {err}" if err else ""),
+                    "job_id": job_id,
+                    "thread_id": str(thread_id) if thread_id else None,
                 }
 
-            payload_status = payload.get("status", 0)
-            if payload_status not in (0, "0", None):
-                return {
-                    "status": "skipped",
-                    "has_major_issues": False,
-                    "summary": "",
-                    "findings": [],
-                    "output": str(payload.get("rawOutput", "") or payload_raw),
-                    "reason": f"codex plan review task exited with status {payload_status}",
-                }
-
-            raw_output = str(payload.get("rawOutput", "") or "")
-            parsed = _extract_json_object(raw_output)
-            if not parsed:
-                return {
-                    "status": "skipped",
-                    "has_major_issues": False,
-                    "summary": "",
-                    "findings": [],
-                    "output": raw_output or payload_raw,
-                    "reason": "codex plan review did not return structured JSON",
-                }
-
-            verdict = str(parsed.get("verdict", "")).strip().lower()
-            summary = str(parsed.get("summary", "")).strip()
-            findings = _format_plan_review_findings(parsed.get("findings", []))
-            next_steps = parsed.get("next_steps", [])
-
-            # Surface codex's threadId so the caller can persist it and
-            # pass resume_last=True on the next revision. None if the
-            # companion doesn't report one (older versions, or if codex
-            # failed to start a thread).
-            thread_id = payload.get("threadId")
-            result = {
-                "status": "completed",
-                "has_major_issues": verdict == "needs-attention",
-                "summary": summary,
-                "findings": findings,
-                "next_steps": next_steps if isinstance(next_steps, list) else [],
-                "output": raw_output,
-            }
-            if thread_id:
-                result["thread_id"] = str(thread_id)
-            else:
-                result["thread_id"] = None
-            return result
-        except asyncio.TimeoutError:
-            return {
-                "status": "skipped",
-                "has_major_issues": False,
-                "summary": "",
-                "findings": [],
-                "output": "",
-                "reason": "codex plan review timed out after 240 seconds",
-            }
+            return await self._parse_completed_plan_review(companion_script, job_id, thread_id)
         except RateLimitError:
             raise
         except Exception as exc:
-            return {
-                "status": "skipped",
-                "has_major_issues": False,
-                "summary": "",
-                "findings": [],
-                "output": "",
-                "reason": f"codex plan review failed: {exc}",
-            }
+            return _skipped_plan_review(f"codex plan review failed: {exc}")
         finally:
             if prompt_path:
                 try:
                     Path(prompt_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    async def _poll_codex_job(
+        self, companion_script: Path, job_id: str,
+    ) -> tuple[dict | None, bool]:
+        """Poll status until terminal or _PLAN_REVIEW_TIMEOUT_S.
+
+        Returns (last job dict, terminal bool). terminal=False means we
+        timed out while codex was still running.
+        """
+        deadline = time.monotonic() + _PLAN_REVIEW_TIMEOUT_S
+        last_job: dict | None = None
+        while time.monotonic() < deadline:
+            status_payload = await self._run_codex_json_subcommand(
+                companion_script, "status",
+                [job_id, "--json", "--cwd", self.cwd],
+                timeout_s=10.0,
+            )
+            if status_payload is not None:
+                last_job = status_payload.get("job") or {}
+                state = last_job.get("status")
+                if state in ("completed", "failed", "cancelled"):
+                    return last_job, True
+            await asyncio.sleep(_PLAN_REVIEW_POLL_INTERVAL_S)
+        return last_job, False
+
+    async def _parse_completed_plan_review(
+        self, companion_script: Path, job_id: str, thread_id: str | None,
+    ) -> dict:
+        """Fetch `result <job-id>`, parse rawOutput JSON, shape result dict.
+
+        Shared by the inline-wait path (_run_codex_plan_review_inner) and
+        the async finalize path (fetch_codex_plan_review_result used by
+        team-lead's cmd_plan_status).
+        """
+        result_payload = await self._run_codex_json_subcommand(
+            companion_script, "result",
+            [job_id, "--json", "--cwd", self.cwd],
+            timeout_s=10.0,
+        )
+        thread_id_str = str(thread_id) if thread_id else None
+
+        if not result_payload:
+            return {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "next_steps": [],
+                "output": "",
+                "reason": "codex plan review completed but result fetch failed",
+                "job_id": job_id,
+                "thread_id": thread_id_str,
+            }
+
+        stored_job = result_payload.get("storedJob") or {}
+        stored_result = stored_job.get("result") or {}
+        raw_output = str(
+            stored_result.get("finalMessage")
+            or stored_result.get("rawOutput")
+            or ""
+        )
+
+        parsed = _extract_json_object(raw_output)
+        if not parsed:
+            return {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "next_steps": [],
+                "output": raw_output,
+                "reason": "codex plan review did not return structured JSON",
+                "job_id": job_id,
+                "thread_id": thread_id_str,
+            }
+
+        verdict = str(parsed.get("verdict", "")).strip().lower()
+        summary = str(parsed.get("summary", "")).strip()
+        findings = _format_plan_review_findings(parsed.get("findings", []))
+        next_steps = parsed.get("next_steps", [])
+
+        return {
+            "status": "completed",
+            "has_major_issues": verdict == "needs-attention",
+            "summary": summary,
+            "findings": findings,
+            "next_steps": next_steps if isinstance(next_steps, list) else [],
+            "output": raw_output,
+            "job_id": job_id,
+            "thread_id": thread_id_str,
+        }
+
+    async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
+        """Query codex for a previously-launched plan review job.
+
+        Used by cmd_plan_status to finalize a review that timed out
+        client-side. Returns the same result shape as run_codex_plan_review:
+        status in {completed, running, skipped}, with job_id/thread_id
+        for state persistence.
+        """
+        codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
+        if not codex_plugin_root or not companion_script:
+            result = _skipped_plan_review(reason or "codex plugin not found")
+            result["job_id"] = job_id
+            return result
+
+        status_payload = await self._run_codex_json_subcommand(
+            companion_script, "status",
+            [job_id, "--json", "--cwd", self.cwd],
+            timeout_s=10.0,
+        )
+        if not status_payload:
+            result = _skipped_plan_review("codex status lookup failed")
+            result["job_id"] = job_id
+            return result
+
+        job = status_payload.get("job") or {}
+        state = job.get("status")
+        thread_id = job.get("threadId")
+        thread_id_str = str(thread_id) if thread_id else None
+
+        if state == "running":
+            return {
+                "status": "running",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "next_steps": [],
+                "output": "",
+                "reason": "codex plan review still running",
+                "job_id": job_id,
+                "thread_id": thread_id_str,
+            }
+        if state in ("failed", "cancelled"):
+            err = job.get("error") or job.get("failureMessage") or ""
+            return {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "next_steps": [],
+                "output": "",
+                "reason": f"codex plan review {state}" + (f": {err}" if err else ""),
+                "job_id": job_id,
+                "thread_id": thread_id_str,
+            }
+        return await self._parse_completed_plan_review(companion_script, job_id, thread_id)
+
+    async def _run_codex_json_subcommand(
+        self,
+        companion_script: Path,
+        subcommand: str,
+        args: list[str],
+        *,
+        timeout_s: float = 10.0,
+    ) -> dict | None:
+        """Run `node <companion> <subcommand> <args...>` and parse JSON stdout.
+
+        Single seam for all codex-companion subprocess calls so tests can
+        inject fakes without touching asyncio.create_subprocess_exec.
+        Returns None on any failure — subprocess error, timeout, non-zero
+        exit, or non-JSON output — so callers degrade gracefully.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "node", str(companion_script), subcommand, *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except (asyncio.TimeoutError, OSError):
+            return None
+
+        if proc.returncode != 0:
+            return None
+
+        try:
+            return json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
 
     async def _codex_task_resume_candidate_thread_id(self, companion_script: Path) -> str | None:
         """Return codex-companion's current resumable task thread id, if any.

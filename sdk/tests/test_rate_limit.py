@@ -101,16 +101,10 @@ class CodexRateLimitPropagationTests(unittest.TestCase):
         with self.assertRaises(RateLimitError):
             self._run(dispatcher.run_codex_review())
 
-    def test_codex_plan_review_propagates_rate_limit(self):
-        dispatcher = self._make_dispatcher()
-
-        async def rate_limited_command(cmd, codex_plugin_root):
-            raise RateLimitError("You've hit your limit \u00b7 resets 1am")
-
-        dispatcher._run_codex_command = rate_limited_command  # type: ignore[method-assign]
-
-        with self.assertRaises(RateLimitError):
-            self._run(dispatcher.run_codex_plan_review("## Plan"))
+    # Plan review's rate-limit path was removed when we migrated it to
+    # background subprocess mode (no Haiku wrapper → no RateLimitError
+    # surface). Any codex-companion failure now returns skipped. Code
+    # review still goes through _run_codex_command and keeps this test.
 
 
 class JobRunnerRateLimitTests(unittest.TestCase):

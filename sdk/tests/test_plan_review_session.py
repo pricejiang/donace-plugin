@@ -31,16 +31,45 @@ from sdk.commands import _prior_codex_thread_id, cmd_plan  # noqa: E402
 from sdk.events import EventBus, Stage  # noqa: E402
 
 
-class _CapturedCmd:
-    """Records the cmd that would have been sent to codex."""
+class _FakeCodexSeam:
+    """Records calls to _run_codex_json_subcommand and returns canned per-subcommand
+    responses. Plan review now goes through this seam exclusively (background launch
+    → status poll → result fetch), so tests install it to observe the task args
+    (--background, --resume-last, etc.) without spawning real subprocesses.
+    """
 
-    def __init__(self, payload: dict):
-        self.cmd: str | None = None
-        self.payload = payload
+    def __init__(
+        self,
+        job_id: str = "task-abc123",
+        thread_id: str | None = "thread-abc123",
+        finding_json: str = '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+    ):
+        self.calls: list[tuple[str, list[str]]] = []
+        self.job_id = job_id
+        self.thread_id = thread_id
+        self.finding_json = finding_json
 
-    async def __call__(self, cmd: str, codex_plugin_root: str) -> str:
-        self.cmd = cmd
-        return json.dumps(self.payload)
+    async def __call__(self, companion_script, subcommand, args, **_kw):
+        self.calls.append((subcommand, list(args)))
+        if subcommand == "task":
+            payload: dict = {"jobId": self.job_id, "status": "queued"}
+            if self.thread_id is not None:
+                payload["threadId"] = self.thread_id
+            return payload
+        if subcommand == "status":
+            job: dict = {"id": self.job_id, "status": "completed"}
+            if self.thread_id is not None:
+                job["threadId"] = self.thread_id
+            return {"job": job}
+        if subcommand == "result":
+            return {"storedJob": {"result": {"finalMessage": self.finding_json}}}
+        return None
+
+    def first_task_args(self) -> list[str] | None:
+        for sub, args in self.calls:
+            if sub == "task":
+                return args
+        return None
 
 
 class PlanReviewSessionTests(unittest.TestCase):
@@ -65,50 +94,37 @@ class PlanReviewSessionTests(unittest.TestCase):
     def _run(self, coro):
         return asyncio.new_event_loop().run_until_complete(coro)
 
-    # --- JSON response used by the fake _run_codex_command ---
-    def _valid_task_payload(self, thread_id: str = "thread-abc123") -> dict:
-        inner = {
-            "verdict": "approve",
-            "summary": "looks good",
-            "findings": [],
-            "next_steps": [],
-        }
-        return {
-            "status": 0,
-            "threadId": thread_id,
-            "rawOutput": json.dumps(inner),
-        }
-
     def test_default_does_not_request_resume(self):
         dispatcher = self._make_dispatcher()
-        capture = _CapturedCmd(self._valid_task_payload())
-        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        seam = _FakeCodexSeam()
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
 
         self._run(dispatcher.run_codex_plan_review("## Plan\n\n### Stage 1"))
 
-        self.assertIsNotNone(capture.cmd)
-        assert capture.cmd is not None
-        self.assertIn("task", capture.cmd)
-        self.assertNotIn("--resume-last", capture.cmd)
-        self.assertNotIn("--resume", capture.cmd)
+        task_args = seam.first_task_args()
+        self.assertIsNotNone(task_args)
+        assert task_args is not None
+        self.assertIn("--background", task_args)
+        self.assertNotIn("--resume-last", task_args)
 
     def test_resume_last_adds_flag(self):
         dispatcher = self._make_dispatcher()
-        capture = _CapturedCmd(self._valid_task_payload())
-        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        seam = _FakeCodexSeam()
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
 
         self._run(dispatcher.run_codex_plan_review(
             "## Plan\n\n### Stage 1",
             resume_last=True,
         ))
 
-        assert capture.cmd is not None
-        self.assertIn("--resume-last", capture.cmd)
+        task_args = seam.first_task_args()
+        assert task_args is not None
+        self.assertIn("--resume-last", task_args)
 
     def test_resume_thread_id_adds_flag_when_candidate_matches(self):
         dispatcher = self._make_dispatcher()
-        capture = _CapturedCmd(self._valid_task_payload())
-        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        seam = _FakeCodexSeam()
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
         dispatcher._codex_task_resume_candidate_thread_id = (  # type: ignore[method-assign]
             lambda companion_script: asyncio.sleep(0, result="thread-abc123")
         )
@@ -118,13 +134,14 @@ class PlanReviewSessionTests(unittest.TestCase):
             resume_thread_id="thread-abc123",
         ))
 
-        assert capture.cmd is not None
-        self.assertIn("--resume-last", capture.cmd)
+        task_args = seam.first_task_args()
+        assert task_args is not None
+        self.assertIn("--resume-last", task_args)
 
     def test_resume_thread_id_mismatch_skips_flag(self):
         dispatcher = self._make_dispatcher()
-        capture = _CapturedCmd(self._valid_task_payload())
-        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        seam = _FakeCodexSeam()
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
         dispatcher._codex_task_resume_candidate_thread_id = (  # type: ignore[method-assign]
             lambda companion_script: asyncio.sleep(0, result="thread-other")
         )
@@ -134,15 +151,16 @@ class PlanReviewSessionTests(unittest.TestCase):
             resume_thread_id="thread-abc123",
         ))
 
-        assert capture.cmd is not None
-        self.assertNotIn("--resume-last", capture.cmd)
+        task_args = seam.first_task_args()
+        assert task_args is not None
+        self.assertNotIn("--resume-last", task_args)
 
     def test_response_surfaces_thread_id(self):
         # Callers need thread_id so they can persist it in plan.json and
-        # pass resume_last=True on the next revision.
+        # pass resume_thread_id on the next revision.
         dispatcher = self._make_dispatcher()
-        capture = _CapturedCmd(self._valid_task_payload("thread-xyz-789"))
-        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        seam = _FakeCodexSeam(thread_id="thread-xyz-789")
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
 
         result = self._run(dispatcher.run_codex_plan_review("## Plan"))
 
@@ -152,10 +170,8 @@ class PlanReviewSessionTests(unittest.TestCase):
         # Older companion versions / edge cases may omit threadId. Caller
         # can detect missing-id state and fall back to fresh mode.
         dispatcher = self._make_dispatcher()
-        payload = self._valid_task_payload()
-        payload.pop("threadId", None)
-        capture = _CapturedCmd(payload)
-        dispatcher._run_codex_command = capture  # type: ignore[method-assign]
+        seam = _FakeCodexSeam(thread_id=None)
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
 
         result = self._run(dispatcher.run_codex_plan_review("## Plan"))
 

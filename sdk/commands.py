@@ -1718,6 +1718,87 @@ async def cmd_plan(
 
 
 # ---------------------------------------------------------------------------
+# plan_status — finalize a background codex plan review
+# ---------------------------------------------------------------------------
+# When cmd_plan's client-side poll caps out (600s) while codex is still
+# working, plan.json's codex_review carries {"status": "running", "job_id":
+# ..., "thread_id": ...}. team-lead calls this before /donace:execute to
+# pull the real findings from codex once they exist.
+
+async def cmd_plan_status(
+    cwd: str,
+    run_id: str,
+    dashboard_url: str | None,
+) -> dict:
+    """Check + finalize a background codex plan review.
+
+    Behavior:
+    - No plan.json, or codex_review already terminal → no-op
+    - codex_review.status == "running" → poll codex; if completed, update
+      plan.json with findings; if still running, leave as-is
+
+    Returns {"status": "no-op" | "updated" | "still-running" | "error", ...}.
+    Prints the result JSON so team-lead can parse stdout.
+    """
+    run_dir = Path(cwd) / ".ai" / "runs" / run_id
+    plan_json_path = run_dir / "plan.json"
+    if not plan_json_path.exists():
+        result = {"status": "no-op", "reason": "no plan.json"}
+        print(json.dumps(result, indent=2))
+        return result
+    try:
+        plan_json = json.loads(plan_json_path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        result = {"status": "error", "reason": f"plan.json unreadable: {exc}"}
+        print(json.dumps(result, indent=2))
+        return result
+
+    review = plan_json.get("codex_review") or {}
+    review_state = review.get("status")
+    if review_state != "running":
+        result = {"status": "no-op", "reason": f"codex_review.status={review_state}"}
+        print(json.dumps(result, indent=2))
+        return result
+
+    job_id = review.get("job_id")
+    if not job_id:
+        result = {"status": "error", "reason": "codex_review.status=running but no job_id"}
+        print(json.dumps(result, indent=2))
+        return result
+
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=f"job-plan-status-{uuid.uuid4().hex[:8]}", cwd=cwd)
+    try:
+        from sdk.agent_dispatch import AgentDispatcher
+        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
+        updated_review = await dispatcher.fetch_codex_plan_review_result(str(job_id))
+    finally:
+        await _teardown(emitter)
+
+    new_state = updated_review.get("status")
+    if new_state == "running":
+        result = {
+            "status": "still-running",
+            "job_id": job_id,
+            "thread_id": updated_review.get("thread_id"),
+            "reason": updated_review.get("reason", ""),
+        }
+        print(json.dumps(result, indent=2))
+        return result
+
+    plan_json["codex_review"] = updated_review
+    plan_json_path.write_text(json.dumps(plan_json, indent=2))
+    result = {
+        "status": "updated",
+        "codex_status": new_state,
+        "has_major_issues": bool(updated_review.get("has_major_issues")),
+        "job_id": job_id,
+        "thread_id": updated_review.get("thread_id"),
+    }
+    print(json.dumps(result, indent=2))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # run_job
 # ---------------------------------------------------------------------------
 

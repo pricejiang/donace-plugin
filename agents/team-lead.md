@@ -122,6 +122,32 @@ there's no point dispatching run_jobs against a broken plan.
 - Always cross-reference `jobs_completed` against plan.json's stage list — stages in plan but NOT in `jobs_completed` with status=PASS are the ones still to run.
 - If `jobs_completed` shows a stage with status BLOCKED / PARTIAL / ERROR, that's a prior failure — read the job JSON for `unresolved` before deciding to retry.
 
+## Step 1.5: Finalize any running plan review (before Step 2)
+
+Plan review runs in a codex background task. If `cmd_plan`'s 600s
+client-side wait capped out while codex was still thinking,
+`plan.json` carries `codex_review.status == "running"` with a
+`job_id`. Before dispatching stages, pull the real findings:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" plan_status \
+  --run-id <id> --cwd <project>
+```
+
+Interpret the printed JSON:
+
+- `status: "no-op"` → nothing to do (review was already terminal)
+- `status: "updated"` + `codex_status: "completed"` → plan.json now
+  has real findings. Re-read it. If `has_major_issues: true`,
+  **abort** and tell user to run `/donace:plan <run-id>` to revise,
+  same as the `REVIEW` verdict handling above.
+- `status: "still-running"` → codex hasn't finished yet. Options:
+  wait a few minutes and re-invoke `plan_status`, or proceed with
+  the plan you have (noting findings are pending).
+- `status: "error"` → log, escalate to user; don't silently proceed.
+
+Always run this once before Step 2 on any resumed run.
+
 ## Step 2: Execute stages (run_job loop)
 
 1. Read `.ai/runs/<id>/plan.json` for stages, files, dependencies.

@@ -465,6 +465,18 @@ def main() -> None:
     p.add_argument("--run-id", required=True)
     p.add_argument("--dashboard-url", default=None)
 
+    # --- plan_status ---
+    p = subparsers.add_parser(
+        "plan_status",
+        help="Finalize a background codex plan review. "
+             "Queries codex for the job id saved in plan.json; "
+             "if done, updates plan.json with real findings. No-op on "
+             "completed/skipped reviews.",
+    )
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+
     # --- health ---
     p = subparsers.add_parser(
         "health", help="Smoke-test orchestrator reachability and deps",
@@ -483,7 +495,7 @@ def main() -> None:
     from sdk.commands import (
         cmd_run_start, cmd_run_complete, cmd_plan, cmd_run_job,
         cmd_verify, cmd_review, cmd_document, cmd_mark, cmd_write_plan,
-        cmd_list_runs,
+        cmd_list_runs, cmd_plan_status,
     )
 
     if args.command == "run_start":
@@ -536,6 +548,11 @@ def main() -> None:
         ))
     elif args.command == "document":
         asyncio.run(cmd_document(
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+        ))
+    elif args.command == "plan_status":
+        asyncio.run(cmd_plan_status(
             cwd=args.cwd, run_id=args.run_id,
             dashboard_url=args.dashboard_url,
         ))
