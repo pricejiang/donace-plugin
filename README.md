@@ -49,7 +49,11 @@ The plan skill:
 - Calls `run_start` + `write_plan` + `plan` to produce a codex-reviewed plan
 - Hands off with the run-id — does **not** execute
 
-If codex flags the plan (status=REVIEW), the skill loops back with a revision brief.
+Codex plan review runs in the background (up to 600s client-side). If codex is
+still working when the wait caps, the plan job ends as `PENDING` with a
+`job_id` persisted in `plan.json`. Team-lead runs `plan_status` before
+dispatching stages to finalize the review. If codex flags major issues
+(`REVIEW`), the skill loops back with a revision brief.
 
 ### 2. Review
 
@@ -93,6 +97,12 @@ ln -sf $(pwd)/donace-plugin/skills/chat ~/.claude/skills/donace-chat
 - **Claude reviewer at ship time** — deep stack-specific review runs once at the end, not every sprint (saves tokens)
 - **Knowledge persistence** — `.ai/cards/` for reusable insights, `.ai/sessions/` for session logs
 - **Ralph Loop compatible** — resumption check skips re-planning on restart
+
+## Contributing
+
+See [`CLAUDE.md`](CLAUDE.md) for project conventions (commands, status
+semantics, hook guardrails, test patterns). Recent behavioral changes
+are logged in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
