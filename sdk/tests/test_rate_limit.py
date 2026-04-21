@@ -88,7 +88,11 @@ class CodexRateLimitPropagationTests(unittest.TestCase):
         return dispatcher
 
     def _run(self, coro):
-        return asyncio.new_event_loop().run_until_complete(coro)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def test_codex_review_propagates_rate_limit(self):
         dispatcher = self._make_dispatcher()
@@ -123,7 +127,11 @@ class JobRunnerRateLimitTests(unittest.TestCase):
         )
 
     def _run(self, coro):
-        return asyncio.new_event_loop().run_until_complete(coro)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def test_rate_limit_in_implementer_is_interrupted_not_blocked(self):
         stage = self._make_stage()

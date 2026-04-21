@@ -1703,7 +1703,7 @@ class AgentDispatcher:
         thread_id = job.get("threadId")
         thread_id_str = str(thread_id) if thread_id else None
 
-        if state == "running":
+        if state in ("queued", "running"):
             return {
                 "status": "running",
                 "has_major_issues": False,
@@ -1711,7 +1711,7 @@ class AgentDispatcher:
                 "findings": [],
                 "next_steps": [],
                 "output": "",
-                "reason": "codex plan review still running",
+                "reason": f"codex plan review still {state}",
                 "job_id": job_id,
                 "thread_id": thread_id_str,
             }

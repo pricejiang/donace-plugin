@@ -89,6 +89,17 @@ def _prior_codex_thread_id(run_dir: Path) -> str | None:
     return None
 
 
+_PLAN_REVIEW_IN_PROGRESS_STATES = {"queued", "running"}
+
+
+def _plan_status_from_codex_review(codex_review: dict[str, Any]) -> str:
+    if codex_review.get("has_major_issues"):
+        return "REVIEW"
+    if codex_review.get("status") in _PLAN_REVIEW_IN_PROGRESS_STATES:
+        return "PENDING"
+    return "PASS"
+
+
 def _write_job_result(cwd: str, run_id: str, job_id: str, result: dict) -> Path:
     """Persist job result to .ai/runs/{run_id}/jobs/{job_id}.json."""
     jobs_dir = Path(cwd) / ".ai" / "runs" / run_id / "jobs"
@@ -1109,12 +1120,20 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
 
     plan_json_path = run_dir / "plan.json"
     plan_json_ready = False
+    plan_review_in_progress = False
     if plan_json_path.exists():
         try:
             plan_data_for_state = json.loads(plan_json_path.read_text())
             codex_review = plan_data_for_state.get("codex_review") or {}
             stages = plan_data_for_state.get("stages") or []
-            plan_json_ready = bool(stages) and not codex_review.get("has_major_issues")
+            plan_review_in_progress = (
+                codex_review.get("status") in _PLAN_REVIEW_IN_PROGRESS_STATES
+            )
+            plan_json_ready = (
+                bool(stages)
+                and not codex_review.get("has_major_issues")
+                and not plan_review_in_progress
+            )
         except (json.JSONDecodeError, OSError):
             plan_json_ready = False
 
@@ -1128,7 +1147,7 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
         or (run_dir / "plan.md").exists()
         or plan_json_path.exists()
     )
-    plan_ready = plan_status == "PASS" or plan_json_ready
+    plan_ready = (plan_status == "PASS" and not plan_review_in_progress) or plan_json_ready
     plan_needs_attention = (
         (plan_status is not None and plan_status != "PASS")
         or (write_plan_status is not None and write_plan_status != "PASS")
@@ -1686,9 +1705,9 @@ async def cmd_plan(
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "plan.json").write_text(json.dumps(plan_json, indent=2))
 
-        # Status reflects codex verdict: PASS if clean, REVIEW if issues flagged.
-        # Team-lead decides whether to revise or proceed.
-        status = "REVIEW" if codex_review.get("has_major_issues") else "PASS"
+        # Status reflects codex verdict. A still-running review is not a
+        # PASS: plan_status must finalize it before execute can proceed.
+        status = _plan_status_from_codex_review(codex_review)
         await bus.emit(JobCompleted(
             job_id=job_id, command="plan", status=status,
             result_summary=f"{len(stages)} stages, codex: {codex_review.get('status', 'skipped')}",
@@ -1766,7 +1785,8 @@ async def cmd_plan_status(
         print(json.dumps(result, indent=2))
         return result
 
-    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=f"job-plan-status-{uuid.uuid4().hex[:8]}", cwd=cwd)
+    status_job_id = f"job-plan-status-{uuid.uuid4().hex[:8]}"
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=status_job_id, cwd=cwd)
     try:
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
@@ -1787,10 +1807,23 @@ async def cmd_plan_status(
 
     plan_json["codex_review"] = updated_review
     plan_json_path.write_text(json.dumps(plan_json, indent=2))
+    finalized_plan_status = _plan_status_from_codex_review(updated_review)
+    _write_job_result(
+        cwd,
+        run_id,
+        status_job_id,
+        {
+            "command": "plan",
+            "status": finalized_plan_status,
+            "plan": plan_json,
+        },
+    )
+    _supersede_prior_jobs(cwd, run_id, "plan", status_job_id)
     result = {
         "status": "updated",
         "codex_status": new_state,
         "has_major_issues": bool(updated_review.get("has_major_issues")),
+        "plan_status": finalized_plan_status,
         "job_id": job_id,
         "thread_id": updated_review.get("thread_id"),
     }

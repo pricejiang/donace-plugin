@@ -92,7 +92,11 @@ class PlanReviewSessionTests(unittest.TestCase):
         return dispatcher
 
     def _run(self, coro):
-        return asyncio.new_event_loop().run_until_complete(coro)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def test_default_does_not_request_resume(self):
         dispatcher = self._make_dispatcher()
@@ -249,7 +253,11 @@ class CmdPlanResumeThreadTests(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def _run(self, coro):
-        return asyncio.new_event_loop().run_until_complete(coro)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def test_cmd_plan_passes_saved_thread_id(self):
         seen: dict[str, object] = {}

@@ -30,12 +30,16 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from sdk.agent_dispatch import AgentDispatcher  # noqa: E402
-from sdk.commands import cmd_plan_status  # noqa: E402
-from sdk.events import EventBus  # noqa: E402
+from sdk.commands import _classify_run_state, cmd_plan, cmd_plan_status  # noqa: E402
+from sdk.events import EventBus, Stage  # noqa: E402
 
 
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 def _make_dispatcher() -> AgentDispatcher:
@@ -236,6 +240,28 @@ class PollAndResultTests(unittest.TestCase):
         self.assertEqual(result.get("job_id"), "task-fail")
         self.assertIn("failed", result.get("reason", "").lower())
 
+    def test_fetch_queued_job_keeps_running_state(self):
+        dispatcher = _make_dispatcher()
+        subcommands: list[str] = []
+
+        async def fake(companion_script, subcommand, args, **_kw):
+            subcommands.append(subcommand)
+            if subcommand == "status":
+                return {"job": {"status": "queued", "threadId": "thread-queued"}}
+            if subcommand == "result":
+                return {"storedJob": {"result": {"finalMessage": '{"verdict":"approve"}'}}}
+            return None
+
+        _install_subcommand_fake(dispatcher, fake)
+
+        result = _run(dispatcher.fetch_codex_plan_review_result("task-queued"))
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["job_id"], "task-queued")
+        self.assertEqual(result["thread_id"], "thread-queued")
+        self.assertIn("queued", result.get("reason", ""))
+        self.assertNotIn("result", subcommands)
+
 
 class CmdPlanStatusTests(unittest.TestCase):
     """team-lead invokes cmd_plan_status to finalize a running plan review."""
@@ -279,6 +305,12 @@ class CmdPlanStatusTests(unittest.TestCase):
             "job_id": "task-xyz",
             "thread_id": "thread-xyz",
         })
+        jobs_dir = self.run_dir / "jobs"
+        jobs_dir.mkdir()
+        (jobs_dir / "job-plan-old.json").write_text(json.dumps({
+            "command": "plan",
+            "status": "PENDING",
+        }))
 
         # Patch the dispatcher used by cmd_plan_status so we don't spawn
         # real node subprocesses.
@@ -314,6 +346,8 @@ class CmdPlanStatusTests(unittest.TestCase):
         self.assertEqual(data["codex_review"]["status"], "completed")
         self.assertTrue(data["codex_review"]["has_major_issues"])
         self.assertEqual(data["codex_review"]["summary"], "finally finished")
+        classified = _classify_run_state(self.run_dir)
+        self.assertEqual(classified["jobs_completed"]["plan"], "REVIEW")
 
     def test_still_running_keeps_state(self):
         self._write_plan_json({
@@ -345,6 +379,111 @@ class CmdPlanStatusTests(unittest.TestCase):
         # plan.json unchanged state-wise
         data = json.loads((self.run_dir / "plan.json").read_text())
         self.assertEqual(data["codex_review"]["status"], "running")
+
+    def test_completed_clean_review_promotes_pending_plan_to_pass(self):
+        self._write_plan_json({
+            "status": "running",
+            "has_major_issues": False,
+            "job_id": "task-clean",
+            "thread_id": "thread-clean",
+        })
+        jobs_dir = self.run_dir / "jobs"
+        jobs_dir.mkdir()
+        (jobs_dir / "job-plan-old.json").write_text(json.dumps({
+            "command": "plan",
+            "status": "PENDING",
+        }))
+
+        class FakeDispatcher:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
+                return {
+                    "status": "completed",
+                    "has_major_issues": False,
+                    "summary": "clean",
+                    "findings": [],
+                    "next_steps": [],
+                    "output": "{}",
+                    "job_id": job_id,
+                    "thread_id": "thread-clean",
+                }
+
+        with patch("sdk.agent_dispatch.AgentDispatcher", FakeDispatcher):
+            result = _run(cmd_plan_status(str(self.cwd), self.run_id, None))
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(result["plan_status"], "PASS")
+        classified = _classify_run_state(self.run_dir)
+        self.assertEqual(classified["jobs_completed"]["plan"], "PASS")
+        self.assertEqual(classified["state"], "not_started")
+
+
+class CmdPlanPendingGateTests(unittest.TestCase):
+    """cmd_plan must not publish a PASS plan while codex review is pending."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        self.run_id = "run-pending"
+        self.run_dir = self.cwd / ".ai" / "runs" / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "plan.md").write_text("## Placeholder plan\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_running_plan_review_records_pending_not_pass(self):
+        class FakeDispatcher:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def run_codex_plan_review(self, plan_text: str, *, resume_thread_id=None) -> dict:
+                return {
+                    "status": "running",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "next_steps": [],
+                    "output": "",
+                    "job_id": "task-pending",
+                    "thread_id": "thread-pending",
+                }
+
+        with patch("sdk.orchestrator._parse_plan_stages", return_value=[
+            Stage(name="Stage 1", has_user_facing_changes=False, files=["apps/web/x.ts"]),
+        ]), patch("sdk.agent_dispatch.AgentDispatcher", FakeDispatcher):
+            _run(cmd_plan(str(self.cwd), self.run_id, None))
+
+        classified = _classify_run_state(self.run_dir)
+        self.assertEqual(classified["jobs_completed"]["plan"], "PENDING")
+        self.assertEqual(classified["state"], "incomplete")
+
+        plan_json = json.loads((self.run_dir / "plan.json").read_text())
+        self.assertEqual(plan_json["codex_review"]["status"], "running")
+
+    def test_running_plan_review_blocks_legacy_pass_job(self):
+        (self.run_dir / "plan.json").write_text(json.dumps({
+            "plan_file": ".ai/runs/run-pending/plan.md",
+            "stages": [{"id": "stage-1", "name": "Stage 1"}],
+            "codex_review": {
+                "status": "running",
+                "has_major_issues": False,
+                "job_id": "task-old",
+            },
+        }))
+        jobs_dir = self.run_dir / "jobs"
+        jobs_dir.mkdir()
+        (jobs_dir / "job-plan-old.json").write_text(json.dumps({
+            "command": "plan",
+            "status": "PASS",
+        }))
+
+        classified = _classify_run_state(self.run_dir)
+
+        self.assertEqual(classified["jobs_completed"]["plan"], "PASS")
+        self.assertEqual(classified["state"], "incomplete")
 
 
 if __name__ == "__main__":
