@@ -370,11 +370,16 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         while (state.stages.length < ev.total_stages) state.stages.push({ name: '', status: 'pending' });
         if (ev.stage_index < state.stages.length) {
           const existing = state.stages[ev.stage_index];
-          if (!existing.name) {
-            state.stages[ev.stage_index] = { name: ev.stage_name, status: 'pending', estimatedTurns: ev.estimated_turns || 0, actualTurns: 0 };
-          } else {
-            state.stages[ev.stage_index] = { ...existing, name: ev.stage_name, status: 'active' };
-          }
+          // stage.changed marks this stage starting — always set it active.
+          // Preserve a prior terminal status (done/failed/skipped from
+          // stage.completed) so a retry doesn't erase the history.
+          const keepTerminal = existing && (existing.status === 'done' || existing.status === 'skipped');
+          state.stages[ev.stage_index] = {
+            name: ev.stage_name,
+            status: keepTerminal ? existing.status : 'active',
+            estimatedTurns: ev.estimated_turns || (existing && existing.estimatedTurns) || 0,
+            actualTurns: (existing && existing.actualTurns) || 0,
+          };
         }
         break;
       case 'agent.tool_use':

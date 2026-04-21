@@ -29,6 +29,7 @@ from sdk.events import (
     RunValidation,
     Stage,
     StageChanged,
+    StageCompleted,
 )
 from sdk.emitter import WebSocketEmitter
 
@@ -60,7 +61,9 @@ async def _setup_bus(
     return bus, emitter
 
 
-async def _teardown(emitter: WebSocketEmitter | None) -> None:
+async def _teardown(emitter: WebSocketEmitter | None, bus: EventBus | None = None) -> None:
+    if bus:
+        await bus.drain()
     if emitter:
         await emitter.disconnect()
 
@@ -709,11 +712,16 @@ async def cmd_run_start(run_id: str, cwd: str, dashboard_url: str | None) -> dic
     bus, emitter = await _setup_bus(run_id, dashboard_url)
     try:
         await bus.emit(RunStarted(task="", cwd=cwd, interactive=False))
+        # Dashboard phase bar: boot is whatever run_start does (dir creation,
+        # retention, dashboard URL persistence). No long work happens here,
+        # so we bracket it with a started/completed pair emitted back-to-back.
+        await bus.emit(PhaseStarted(phase="boot"))
+        await bus.emit(PhaseCompleted(phase="boot"))
         result = {"status": "started", "run_id": run_id, "run_dir": str(run_dir)}
         print(json.dumps(result, indent=2))
         return result
     finally:
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +866,10 @@ async def cmd_write_plan(
             job_id=job_id, command="write_plan", pid=os.getpid(),
         ))
         await bus.emit(JobStarted(job_id=job_id, command="write_plan"))
+        # Dashboard phase bar: plan is active until cmd_plan's codex review
+        # lands a terminal verdict. Idempotent — a revision loop that re-runs
+        # write_plan just keeps phases[plan]='active'.
+        await bus.emit(PhaseStarted(phase="plan"))
 
         # If a prior plan exists (e.g. revision after codex review), hand
         # it to the planner so it can revise rather than rewrite blind.
@@ -967,7 +979,7 @@ async def cmd_write_plan(
         raise
     finally:
         _unregister_job(lock_path)
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -1010,7 +1022,7 @@ async def cmd_mark(
         print(json.dumps(result, indent=2))
         return result
     finally:
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -1549,13 +1561,20 @@ async def cmd_run_complete(run_id: str, cwd: str, dashboard_url: str | None) -> 
 
     bus, emitter = await _setup_bus(run_id, dashboard_url, cwd=cwd)
     try:
+        # Dashboard phase bar: make sure sprint is closed and wrap is open
+        # before the run-completion bundle lands. Idempotent — verify/review/
+        # document may have already emitted these.
+        await bus.emit(PhaseCompleted(phase="sprint"))
+        await bus.emit(PhaseStarted(phase="wrap"))
         if validation_dict is not None and validation_dict.get("status") != "error":
             await bus.emit(RunValidation(validation=validation_dict))
         await bus.emit(RunCompleted(result_summary=json.dumps(summary)))
+        # Wrap is done once run.completed is emitted.
+        await bus.emit(PhaseCompleted(phase="wrap"))
         print(json.dumps(result, indent=2))
         return result
     finally:
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 def _cleanup_after_run(cwd: str, run_id: str) -> None:
@@ -1712,6 +1731,11 @@ async def cmd_plan(
             job_id=job_id, command="plan", status=status,
             result_summary=f"{len(stages)} stages, codex: {codex_review.get('status', 'skipped')}",
         ))
+        # Dashboard phase bar: terminal verdict (PASS/REVIEW) closes the plan
+        # phase. PENDING (codex still running) leaves it active — plan_status
+        # will emit the completion when codex lands.
+        if status != "PENDING":
+            await bus.emit(PhaseCompleted(phase="plan"))
         _supersede_prior_jobs(cwd, run_id, "plan", job_id)
         _write_job_result(cwd, run_id, job_id, {"command": "plan", "status": status, "plan": plan_json})
 
@@ -1733,7 +1757,7 @@ async def cmd_plan(
         raise
     finally:
         _unregister_job(lock_path)
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -1791,19 +1815,23 @@ async def cmd_plan_status(
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
         updated_review = await dispatcher.fetch_codex_plan_review_result(str(job_id))
-    finally:
-        await _teardown(emitter)
 
-    new_state = updated_review.get("status")
-    if new_state == "running":
-        result = {
-            "status": "still-running",
-            "job_id": job_id,
-            "thread_id": updated_review.get("thread_id"),
-            "reason": updated_review.get("reason", ""),
-        }
-        print(json.dumps(result, indent=2))
-        return result
+        new_state = updated_review.get("status")
+        if new_state == "running":
+            result = {
+                "status": "still-running",
+                "job_id": job_id,
+                "thread_id": updated_review.get("thread_id"),
+                "reason": updated_review.get("reason", ""),
+            }
+            print(json.dumps(result, indent=2))
+            return result
+
+        # Dashboard phase bar: codex landed a terminal verdict — close the
+        # plan phase. Emit before teardown so the event reaches the bus.
+        await bus.emit(PhaseCompleted(phase="plan"))
+    finally:
+        await _teardown(emitter, bus)
 
     plan_json["codex_review"] = updated_review
     plan_json_path.write_text(json.dumps(plan_json, indent=2))
@@ -1863,6 +1891,9 @@ async def cmd_run_job(
             job_id=job_id, command="run_job", stage_id=stage_id, pid=os.getpid(),
         ))
         await bus.emit(JobStarted(job_id=job_id, command="run_job"))
+        # Dashboard phase bar: sprint is active whenever any stage is running.
+        # Idempotent — re-emitting just keeps phases[sprint]='active'.
+        await bus.emit(PhaseStarted(phase="sprint"))
 
         # Load plan and find stage (resolve relative paths against cwd)
         resolved_plan = Path(plan_path) if Path(plan_path).is_absolute() else Path(cwd) / plan_path
@@ -1937,10 +1968,16 @@ async def cmd_run_job(
                 job_id=job_id, command="run_job", reason=bus.cancel_reason,
                 completed_steps=result.completed_steps, interrupted_at=result.interrupted_at,
             ))
+            # No StageCompleted — the stage isn't finished, it's paused and may resume.
         else:
             await bus.emit(JobCompleted(
                 job_id=job_id, command="run_job", status=result.status,
                 result_summary=f"{stage.name}: {result.status}",
+            ))
+            # Dashboard stage row: flip this stage out of pending/active. "PASS"
+            # → done (✓), "SKIPPED" → skipped (—), everything else → failed (✗).
+            await bus.emit(StageCompleted(
+                stage_name=stage.name, status=result.status,
             ))
 
         # Build result dict
@@ -1996,7 +2033,7 @@ async def cmd_run_job(
         return error_result
     finally:
         _unregister_job(lock_path)
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -2019,6 +2056,11 @@ async def cmd_verify(
     try:
         await bus.emit(JobRegistered(job_id=job_id, command="verify", pid=os.getpid()))
         await bus.emit(JobStarted(job_id=job_id, command="verify"))
+        # Dashboard phase bar: verify is the first wrap-phase command. Close
+        # sprint, open wrap. Both emits are idempotent — safe to re-emit from
+        # review/document/run_complete.
+        await bus.emit(PhaseCompleted(phase="sprint"))
+        await bus.emit(PhaseStarted(phase="wrap"))
 
         # Snapshot of the working tree BEFORE verify runs — used for a
         # post-run dirty check. A mutated tree means verify leaked writes
@@ -2103,7 +2145,7 @@ async def cmd_verify(
         raise
     finally:
         _unregister_job(lock_path)
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -2124,6 +2166,9 @@ async def cmd_review(
     try:
         await bus.emit(JobRegistered(job_id=job_id, command="review", pid=os.getpid()))
         await bus.emit(JobStarted(job_id=job_id, command="review"))
+        # Dashboard phase bar: wrap phase — see cmd_verify for rationale.
+        await bus.emit(PhaseCompleted(phase="sprint"))
+        await bus.emit(PhaseStarted(phase="wrap"))
 
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
@@ -2158,7 +2203,7 @@ async def cmd_review(
         raise
     finally:
         _unregister_job(lock_path)
-        await _teardown(emitter)
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------
@@ -2205,6 +2250,9 @@ async def cmd_document(
     try:
         await bus.emit(JobRegistered(job_id=job_id, command="document", pid=os.getpid()))
         await bus.emit(JobStarted(job_id=job_id, command="document"))
+        # Dashboard phase bar: wrap phase — see cmd_verify for rationale.
+        await bus.emit(PhaseCompleted(phase="sprint"))
+        await bus.emit(PhaseStarted(phase="wrap"))
 
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
@@ -2318,4 +2366,4 @@ async def cmd_document(
         raise
     finally:
         _unregister_job(lock_path)
-        await _teardown(emitter)
+        await _teardown(emitter, bus)

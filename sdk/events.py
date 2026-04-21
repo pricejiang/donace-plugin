@@ -520,6 +520,7 @@ class EventBus:
         self._current_phase: str | None = None
         self._current_stage: str | None = None
         self._event_log: list[dict[str, Any]] = []
+        self._subscriber_tasks: set[asyncio.Task[None]] = set()
         self._cancelled = False
         self._cancel_reason = ""
 
@@ -550,7 +551,22 @@ class EventBus:
 
         # Fan out
         for handler in self._subscribers:
-            asyncio.create_task(handler(event))
+            task = asyncio.create_task(handler(event))
+            self._subscriber_tasks.add(task)
+            task.add_done_callback(self._consume_subscriber_task)
+
+    def _consume_subscriber_task(self, task: asyncio.Task[None]) -> None:
+        self._subscriber_tasks.discard(task)
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    async def drain(self, timeout_s: float = 2.0) -> None:
+        """Wait briefly for pending subscriber sends before closing resources."""
+        if not self._subscriber_tasks:
+            return
+        await asyncio.wait(list(self._subscriber_tasks), timeout=timeout_s)
 
     def get_events(self) -> list[dict[str, Any]]:
         """Return all events emitted during this run (for run validation)."""
