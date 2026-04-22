@@ -1946,12 +1946,10 @@ async def cmd_run_job(
         pre_stage_dirty_files = _git_dirty_paths(cwd, stage_files)
 
         # Dispatch — file_scope limits Write/Edit to this stage's files.
-        from sdk.agent_dispatch import AgentDispatcher
-        from sdk.job_runner import run_job
+        from sdk.agent_dispatch import AgentDispatcher, RateLimitError
+        from sdk.job_runner import JobResult, run_job
 
         file_scope = stage_files or None
-        if not file_scope:
-            print(f"Warning: stage '{stage_id}' has no files list — file-scope restriction disabled", file=sys.stderr)
         dispatcher = AgentDispatcher(
             agents_dir=_agents_dir(),
             cwd=cwd,
@@ -1965,18 +1963,60 @@ async def cmd_run_job(
             total_stages=len(stages_data),
             estimated_turns=stage.estimated_turns,
         ))
-        result = await run_job(
-            stage=stage,
-            cwd=cwd,
-            bus=bus,
-            query=dispatcher.query,
-            run_test_engineer=dispatcher.run_test_engineer,
-            run_codex_review=dispatcher.run_codex_review,
-            run_runtime_verifier=dispatcher.run_runtime_verifier if "runtime" not in skip else None,
-            task_context=task_context,
-            skip_agents=skip,
-            max_fix_attempts=max_fix_attempts,
-        )
+        if not stage_files:
+            # Verify-only stage: no files to modify → skip implementer (who
+            # would raise NEEDS_CONTEXT), skip test-engineer / codex (they
+            # need a diff to review), and route straight to runtime-verifier.
+            # Matches the Stage 8 ('Typecheck, Lint, QA') pattern that used
+            # to waste a 900s implementer dispatch.
+            try:
+                runtime_result = await dispatcher.run_runtime_verifier(stage.name, task_context)
+            except RateLimitError as exc:
+                result = JobResult(
+                    status="INTERRUPTED",
+                    unresolved=[f"rate_limited: {exc}"],
+                    interrupted_at="verify",
+                )
+            except Exception as exc:
+                runtime_result = {"status": "error", "error": str(exc)}
+                result = JobResult(
+                    status="BLOCKED",
+                    runtime_result=runtime_result,
+                    unresolved=[f"runtime-verifier crashed: {exc}"],
+                    completed_steps=["verify"],
+                )
+            else:
+                if runtime_result.get("status") == "PASS":
+                    result = JobResult(
+                        status="PASS",
+                        runtime_result=runtime_result,
+                        completed_steps=["verify", "done"],
+                    )
+                else:
+                    unresolved = (
+                        runtime_result.get("output")
+                        or runtime_result.get("error")
+                        or "Runtime verification failed"
+                    )
+                    result = JobResult(
+                        status="BLOCKED",
+                        runtime_result=runtime_result,
+                        unresolved=[unresolved],
+                        completed_steps=["verify"],
+                    )
+        else:
+            result = await run_job(
+                stage=stage,
+                cwd=cwd,
+                bus=bus,
+                query=dispatcher.query,
+                run_test_engineer=dispatcher.run_test_engineer,
+                run_codex_review=dispatcher.run_codex_review,
+                run_runtime_verifier=dispatcher.run_runtime_verifier if "runtime" not in skip else None,
+                task_context=task_context,
+                skip_agents=skip,
+                max_fix_attempts=max_fix_attempts,
+            )
 
         # Emit completion
         if result.status == "INTERRUPTED":

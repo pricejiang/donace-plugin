@@ -68,6 +68,13 @@ names are load-bearing:
   runtime-verifier needs exact shapes, status codes, error messages.
 - **Files to modify**: include annotations `(new)` / `(modify)` so
   downstream tools can tell when scaffolding is needed.
+- **Verify-only stages**: if a stage has no code to write — typically a
+  final "run typecheck/lint + manual QA" gate — set `Files to modify: None`
+  and make every Success Criterion a concrete runtime check (HTTP
+  response, DB state, tsc/lint exit code). The orchestrator routes
+  these straight to runtime-verifier, skipping implementer entirely.
+  Don't use this for stages that have any file changes mixed in —
+  split those into an implementation stage + a verify-only stage.
 
 ## Scope discipline
 

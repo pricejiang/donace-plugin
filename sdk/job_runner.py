@@ -68,8 +68,14 @@ def _collect_failures(
 
     Verifier crashes (status=="error") are treated as blocking errors —
     a silent crash used to return PASS, which masked real failures.
-    Test failures are always error. Codex/runtime failures are warnings,
-    but their crashes are errors (we never saw the verdict).
+
+    Severity rules:
+    - test-engineer failures: error. Tests are the deterministic truth.
+    - runtime-verifier FAIL: error. The verifier runs the live app against
+      the plan's Success Criteria; a FAIL means a must-pass criterion is
+      broken — functionally the same as a failing test.
+    - codex review has_issues: warning. Codex findings are reviewer
+      opinions that can be subjective; treat as advisory, not blocking.
     """
     failures: list[dict[str, Any]] = []
 
@@ -113,7 +119,7 @@ def _collect_failures(
             failures.append({
                 "source": "runtime-verifier",
                 "description": runtime_result.get("output", "Runtime verification failed"),
-                "severity": "warning",
+                "severity": "error",
             })
 
     return failures
@@ -362,8 +368,10 @@ async def run_job(
                 completed_steps=completed_steps,
             )
 
-        # Re-verify: only tests (codex/runtime don't change between fix iterations).
-        # run_test_engineer emits its own lifecycle via dispatcher.query.
+        rerun_runtime = any(f["source"] == "runtime-verifier" for f in error_failures)
+
+        # Re-verify the failing surfaces. run_test_engineer and
+        # run_runtime_verifier emit their own lifecycle via dispatcher.query.
         if "test" not in skip_agents:
             try:
                 test_result = await run_test_engineer(stage)
@@ -380,6 +388,23 @@ async def run_job(
                 )
             except Exception:
                 break
+
+        if rerun_runtime and "runtime" not in skip_agents and run_runtime_verifier:
+            try:
+                runtime_result = await run_runtime_verifier(stage.name, task_context)
+            except RateLimitError as exc:
+                return JobResult(
+                    status="INTERRUPTED",
+                    test_result=test_result,
+                    codex_result=codex_result,
+                    runtime_result=runtime_result,
+                    fix_attempts=fix_attempts,
+                    unresolved=[f"rate_limited: {exc}"],
+                    interrupted_at="fix_loop",
+                    completed_steps=completed_steps,
+                )
+            except Exception as exc:
+                runtime_result = {"status": "error", "error": str(exc)}
 
         failures = _collect_failures(test_result, codex_result, runtime_result)
         error_failures = [f for f in failures if f["severity"] == "error"]
