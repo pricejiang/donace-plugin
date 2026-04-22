@@ -30,6 +30,7 @@ from sdk.events import (
     Stage,
     StageChanged,
     StageCompleted,
+    StagesAnnounced,
 )
 from sdk.emitter import WebSocketEmitter
 
@@ -1723,6 +1724,20 @@ async def cmd_plan(
 
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "plan.json").write_text(json.dumps(plan_json, indent=2))
+
+        # Dashboard stage row: broadcast the whole plan so every slot shows
+        # its real name before any run_job has started. Without this, future
+        # slots render as "Stage" until team-lead walks down to them.
+        await bus.emit(StagesAnnounced(
+            stages=[
+                {
+                    "index": i,
+                    "name": s.name,
+                    "estimated_turns": s.estimated_turns,
+                }
+                for i, s in enumerate(stages)
+            ],
+        ))
 
         # Status reflects codex verdict. A still-running review is not a
         # PASS: plan_status must finalize it before execute can proceed.

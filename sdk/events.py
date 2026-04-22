@@ -246,6 +246,22 @@ class AgentSkipped(Event):
 # ---------------------------------------------------------------------------
 
 @dataclass
+class StagesAnnounced(Event):
+    """Broadcast the full stage list up front so the dashboard can render
+    every name with status=pending before any stage actually starts.
+
+    Sprint loop used to do this implicitly by emitting StageChanged for
+    every stage at sprint entry; with team-lead driving run_job serially
+    the dashboard otherwise only learns a stage's name when that stage
+    begins, so future stages render as generic "Stage".
+    """
+    stages: list[dict] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.type = "stages.announced"
+
+
+@dataclass
 class StageChanged(Event):
     stage_name: str = ""
     stage_index: int = 0
@@ -488,6 +504,7 @@ _register("agent.started", AgentStarted)
 _register("agent.completed", AgentCompleted)
 _register("agent.failed", AgentFailed)
 _register("agent.skipped", AgentSkipped)
+_register("stages.announced", StagesAnnounced)
 _register("stage.changed", StageChanged)
 _register("stage.completed", StageCompleted)
 _register("fix_loop.started", FixLoopStarted)

@@ -262,6 +262,70 @@ class PlanPhaseEventsTests(unittest.TestCase):
         self.assertEqual(self._plan_completed_phases(captured[0]), ["plan"])
 
 
+class StagesAnnouncedTests(unittest.TestCase):
+    """cmd_plan broadcasts the full stage list so the dashboard can render
+    every slot with its real name before any run_job starts.
+
+    Regression: sprint_loop used to batch-emit StageChanged for every stage
+    at sprint entry. After sprint_loop was deleted the dashboard only
+    learned stage names as team-lead reached them, so future slots showed
+    up as generic "Stage".
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = Path(self._tmp.name)
+        self.run_id = "run-announce-test"
+        self.run_dir = self.cwd / ".ai" / "runs" / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "plan.md").write_text("## Plan\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_cmd_plan_emits_full_stage_list(self):
+        class FakeDispatcher:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def run_codex_plan_review(self, plan_text, *, resume_thread_id=None):
+                return {
+                    "status": "completed",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "next_steps": [],
+                    "output": "{}",
+                }
+
+        planned_stages = [
+            Stage(name="Backend Owner Enforcement", has_user_facing_changes=False,
+                  files=["a.ts"], estimated_turns=18),
+            Stage(name="SSE Parser Library", has_user_facing_changes=False,
+                  files=["b.ts"], estimated_turns=12),
+            Stage(name="useGenerateChapter Hook", has_user_facing_changes=True,
+                  files=["c.ts"], estimated_turns=17),
+        ]
+
+        patch_obj, captured = _capture_bus_patch()
+        with patch_obj, \
+             patch("sdk.orchestrator._parse_plan_stages", return_value=planned_stages), \
+             patch("sdk.agent_dispatch.AgentDispatcher", FakeDispatcher):
+            _run(cmd_plan(str(self.cwd), self.run_id, None))
+
+        self.assertTrue(captured)
+        events = _events_of_type(captured[0], "stages.announced")
+        self.assertEqual(len(events), 1, "expected exactly one stages.announced")
+        stages = events[0]["stages"]
+        self.assertEqual(len(stages), 3)
+        self.assertEqual([s["index"] for s in stages], [0, 1, 2])
+        self.assertEqual(
+            [s["name"] for s in stages],
+            ["Backend Owner Enforcement", "SSE Parser Library", "useGenerateChapter Hook"],
+        )
+        self.assertEqual([s["estimated_turns"] for s in stages], [18, 12, 17])
+
+
 # ---------------------------------------------------------------------------
 # cmd_run_job — sprint phase + StageCompleted
 # ---------------------------------------------------------------------------

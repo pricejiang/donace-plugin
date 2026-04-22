@@ -365,6 +365,27 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         }
         break;
       }
+      case 'stages.announced': {
+        // cmd_plan broadcasts the full stage list so every slot renders its
+        // real name before team-lead walks down to it. Without this, slots
+        // past the current one show as generic "Stage" until their own
+        // stage.changed fires. Preserve any slot that already progressed
+        // past pending (replay case, or plan re-announce mid-run).
+        const announced = Array.isArray(ev.stages) ? ev.stages : [];
+        while (state.stages.length < announced.length) state.stages.push({ name: '', status: 'pending' });
+        for (const s of announced) {
+          if (typeof s.index !== 'number' || s.index < 0 || s.index >= state.stages.length) continue;
+          const existing = state.stages[s.index];
+          const keep = existing && existing.status && existing.status !== 'pending';
+          state.stages[s.index] = {
+            name: s.name || (existing && existing.name) || '',
+            status: keep ? existing.status : 'pending',
+            estimatedTurns: s.estimated_turns || (existing && existing.estimatedTurns) || 0,
+            actualTurns: (existing && existing.actualTurns) || 0,
+          };
+        }
+        break;
+      }
       case 'stage.changed':
         state.currentStage = ev.stage_name;
         while (state.stages.length < ev.total_stages) state.stages.push({ name: '', status: 'pending' });
