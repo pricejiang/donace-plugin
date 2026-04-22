@@ -1732,10 +1732,11 @@ async def cmd_plan(
             stages=[
                 {
                     "index": i,
-                    "name": s.name,
-                    "estimated_turns": s.estimated_turns,
+                    "id": stage_def["id"],
+                    "name": stage_def["name"],
+                    "estimated_turns": stage_def["estimated_turns"],
                 }
-                for i, s in enumerate(stages)
+                for i, stage_def in enumerate(plan_json["stages"])
             ],
         ))
 

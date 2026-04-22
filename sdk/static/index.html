@@ -293,6 +293,72 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
     renderHistory();
   }
 
+  function generatedStageId(id) {
+    return typeof id === 'string' && /^stage-\d+$/.test(id);
+  }
+
+  function uniqueStageMap(stages, keyFn) {
+    const counts = new Map();
+    for (const stage of stages) {
+      const key = keyFn(stage);
+      if (key) counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const byKey = new Map();
+    for (const stage of stages) {
+      const key = keyFn(stage);
+      if (key && counts.get(key) === 1) byKey.set(key, stage);
+    }
+    return byKey;
+  }
+
+  function matchingExistingStage(existingStages, announcedStage, byStableId, byName) {
+    const announcedId = typeof announcedStage.id === 'string' ? announcedStage.id : '';
+    const announcedName = typeof announcedStage.name === 'string' ? announcedStage.name : '';
+    if (announcedId && !generatedStageId(announcedId)) {
+      const idMatch = byStableId.get(announcedId);
+      if (idMatch) return idMatch;
+    }
+    if (announcedName) {
+      const nameMatch = byName.get(announcedName);
+      if (nameMatch) return nameMatch;
+    }
+    const indexMatch = existingStages[announcedStage.index];
+    return indexMatch && indexMatch.name === announcedName ? indexMatch : null;
+  }
+
+  function applyStagesAnnounced(ev) {
+    // Rebuild from the announced full plan so deleted stages disappear and
+    // inserted/reordered stages do not inherit stale status by index.
+    const announced = Array.isArray(ev.stages) ? ev.stages : [];
+    const existingStages = Array.isArray(state.stages) ? state.stages : [];
+    const byStableId = uniqueStageMap(existingStages, (s) => {
+      const id = typeof s.id === 'string' ? s.id : '';
+      return id && !generatedStageId(id) ? id : '';
+    });
+    const byName = uniqueStageMap(existingStages, (s) => typeof s.name === 'string' ? s.name : '');
+    const nextStages = announced.map(() => ({ id: '', name: '', status: 'pending', estimatedTurns: 0, actualTurns: 0 }));
+
+    for (const s of announced) {
+      if (!Number.isInteger(s.index) || s.index < 0 || s.index >= nextStages.length) continue;
+      const existing = matchingExistingStage(existingStages, s, byStableId, byName);
+      const keepProgress = existing && existing.status && existing.status !== 'pending';
+      const estimatedTurns = typeof s.estimated_turns === 'number'
+        ? s.estimated_turns
+        : (existing && existing.estimatedTurns) || 0;
+      nextStages[s.index] = {
+        id: typeof s.id === 'string' ? s.id : (existing && existing.id) || '',
+        name: s.name || (existing && existing.name) || '',
+        status: keepProgress ? existing.status : 'pending',
+        estimatedTurns,
+        actualTurns: keepProgress ? ((existing && existing.actualTurns) || 0) : 0,
+      };
+    }
+    state.stages = nextStages;
+    if (state.currentStage && !state.stages.some((s) => s.name === state.currentStage)) {
+      state.currentStage = null;
+    }
+  }
+
   function processEvent(ev) {
     switch (ev.type) {
       case 'run.started': $runId.textContent = ev.run_id; resetState(); break;
@@ -369,21 +435,8 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
         // cmd_plan broadcasts the full stage list so every slot renders its
         // real name before team-lead walks down to it. Without this, slots
         // past the current one show as generic "Stage" until their own
-        // stage.changed fires. Preserve any slot that already progressed
-        // past pending (replay case, or plan re-announce mid-run).
-        const announced = Array.isArray(ev.stages) ? ev.stages : [];
-        while (state.stages.length < announced.length) state.stages.push({ name: '', status: 'pending' });
-        for (const s of announced) {
-          if (typeof s.index !== 'number' || s.index < 0 || s.index >= state.stages.length) continue;
-          const existing = state.stages[s.index];
-          const keep = existing && existing.status && existing.status !== 'pending';
-          state.stages[s.index] = {
-            name: s.name || (existing && existing.name) || '',
-            status: keep ? existing.status : 'pending',
-            estimatedTurns: s.estimated_turns || (existing && existing.estimatedTurns) || 0,
-            actualTurns: (existing && existing.actualTurns) || 0,
-          };
-        }
+        // stage.changed fires.
+        applyStagesAnnounced(ev);
         break;
       }
       case 'stage.changed':
@@ -396,9 +449,10 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
           // stage.completed) so a retry doesn't erase the history.
           const keepTerminal = existing && (existing.status === 'done' || existing.status === 'skipped');
           state.stages[ev.stage_index] = {
+            id: (existing && existing.id) || '',
             name: ev.stage_name,
             status: keepTerminal ? existing.status : 'active',
-            estimatedTurns: ev.estimated_turns || (existing && existing.estimatedTurns) || 0,
+            estimatedTurns: typeof ev.estimated_turns === 'number' ? ev.estimated_turns : (existing && existing.estimatedTurns) || 0,
             actualTurns: (existing && existing.actualTurns) || 0,
           };
         }

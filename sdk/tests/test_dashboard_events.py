@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -319,11 +321,69 @@ class StagesAnnouncedTests(unittest.TestCase):
         stages = events[0]["stages"]
         self.assertEqual(len(stages), 3)
         self.assertEqual([s["index"] for s in stages], [0, 1, 2])
+        self.assertEqual([s["id"] for s in stages], ["stage-1", "stage-2", "stage-3"])
         self.assertEqual(
             [s["name"] for s in stages],
             ["Backend Owner Enforcement", "SSE Parser Library", "useGenerateChapter Hook"],
         )
         self.assertEqual([s["estimated_turns"] for s in stages], [18, 12, 17])
+
+
+class DashboardStageMergeTests(unittest.TestCase):
+    """Front-end regression coverage for stages.announced plan revisions."""
+
+    @unittest.skipUnless(shutil.which("node"), "node is required for dashboard JS regression coverage")
+    def test_reannounce_rebuilds_list_and_preserves_only_matching_stage_progress(self):
+        script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const html = fs.readFileSync(process.argv[1], 'utf8');
+const match = html.match(/  function generatedStageId[\s\S]*?\n  function processEvent/);
+if (!match) throw new Error('dashboard stage helpers not found');
+const helpers = match[0].replace(/\n  function processEvent$/, '');
+const state = {
+  stages: [
+    { id: 'stage-1', name: 'Old Removed', status: 'done', estimatedTurns: 4, actualTurns: 4 },
+    { id: 'stage-2', name: 'Keep Me', status: 'active', estimatedTurns: 8, actualTurns: 3 },
+    { id: 'stage-3', name: 'Dropped Tail', status: 'failed', estimatedTurns: 10, actualTurns: 9 },
+  ],
+  currentStage: 'Keep Me',
+};
+const sandbox = { state, Map, Array, Number, console };
+vm.runInNewContext(helpers, sandbox);
+sandbox.applyStagesAnnounced({
+  stages: [
+    { index: 0, id: 'stage-1', name: 'Inserted New', estimated_turns: 5 },
+    { index: 1, id: 'stage-2', name: 'Keep Me', estimated_turns: 0 },
+  ],
+});
+function assert(cond, message) {
+  if (!cond) throw new Error(message);
+}
+assert(state.stages.length === 2, 'reannounce must shrink stale tail stages');
+assert(state.stages[0].name === 'Inserted New', 'new first stage should render');
+assert(state.stages[0].status === 'pending', 'new first stage must not inherit old done status by generated id');
+assert(state.stages[0].actualTurns === 0, 'new first stage must not inherit old turns');
+assert(state.stages[1].name === 'Keep Me', 'matching stage should survive reorder/reannounce');
+assert(state.stages[1].status === 'active', 'matching stage should preserve active status');
+assert(state.stages[1].estimatedTurns === 0, 'matching stage should accept revised zero estimate');
+assert(state.stages[1].actualTurns === 3, 'matching stage should preserve turns');
+assert(state.currentStage === 'Keep Me', 'current stage should remain when still announced');
+sandbox.applyStagesAnnounced({
+  stages: [
+    { index: 0, id: 'stage-1', name: 'Only New', estimated_turns: 2 },
+  ],
+});
+assert(state.stages.length === 1, 'second reannounce must shrink again');
+assert(state.currentStage === null, 'current stage should clear when it disappears from plan');
+"""
+        result = subprocess.run(
+            ["node", "-e", script, str(_REPO_ROOT / "sdk" / "static" / "index.html")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 # ---------------------------------------------------------------------------
