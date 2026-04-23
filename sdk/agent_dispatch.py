@@ -127,6 +127,43 @@ class RateLimitError(RuntimeError):
 _PLAN_REVIEW_TIMEOUT_S: float = 600.0
 _PLAN_REVIEW_POLL_INTERVAL_S: float = 3.0
 
+# Per-stage codex review uses the Haiku wrapper (rate-limit aware) with a
+# hard asyncio.wait_for cap. 180s — the original budget — was too tight:
+# run-phase5-runA stages 4 and 6 both hit it and dropped their reviews
+# silently. Match the plan-review client budget (600s) so larger stage
+# diffs still land a verdict. Rate limits propagate as RateLimitError →
+# INTERRUPTED in job_runner, so extending the wait doesn't mask throttle.
+_PER_STAGE_REVIEW_TIMEOUT_S: int = 600
+
+
+async def _git_touched_files(cwd: str) -> list[str]:
+    """Return working-tree-modified paths vs HEAD in `cwd`. Empty on any error.
+
+    Used by the query() timeout path so a hung implementer's partial writes
+    surface in the BLOCKED result — otherwise 'auto_commit skipped — no
+    git-visible changes' on the retry is the only hint that anything landed.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "status", "--porcelain",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=cwd,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        if proc.returncode != 0:
+            return []
+        files: list[str] = []
+        for line in stdout.decode(errors="replace").splitlines():
+            # porcelain format is "XY path" where XY is a 2-char status code.
+            # Skip the status + separator (3 chars); rename lines ("R  old -> new")
+            # keep the `->` form in the path, which is still legible.
+            if len(line) > 3:
+                files.append(line[3:].strip())
+        return files
+    except Exception:
+        return []
+
 
 def _skipped_plan_review(reason: str) -> dict:
     """Default-shape result dict for any early-abort plan review path.
@@ -490,6 +527,12 @@ def _blank_quoted_regions(command: str) -> str:
     bodies so nested writes like ``echo `echo hi > /tmp/out` `` still get
     caught by the redirect scanner. Positions are preserved so regex
     offsets still map to the original.
+
+    Shell comments (`#` at BOF or after unquoted whitespace, running to
+    the next newline) are blanked too. Without this, a comment containing
+    an apostrophe — `# Check if it's rendering...` — flips the quote
+    tracker on `'` in `it's`, so every subsequent `>` inside legitimate
+    single-quoted tr args is misread as a redirect target.
     """
     out = list(command)
     i = 0
@@ -530,6 +573,16 @@ def _blank_quoted_regions(command: str) -> str:
         if ch == "\\" and i + 1 < n:
             i += 2  # escaped char, keep both positions untouched
             continue
+        if ch == "#":
+            # A `#` starts a comment only at the beginning of a command
+            # word — i.e. at BOF, after a newline, or after whitespace.
+            # `file#backup` (mid-word) is just a literal filename.
+            at_word_start = i == 0 or command[i - 1] in " \t\n"
+            if at_word_start:
+                while i < n and command[i] != "\n":
+                    out[i] = " "
+                    i += 1
+                continue
         if ch == "'":
             i = blank_quote(i, ch)
             continue
@@ -621,13 +674,24 @@ def _extract_shell_word(command: str, start: int) -> str:
     return "".join(buf)
 
 
-def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) -> str | None:
+def _bash_writes_outside_scope(
+    command: str,
+    file_scope: list[str],
+    cwd: str,
+    *,
+    allowed_outside_roots: tuple[str, ...] = (),
+) -> str | None:
     """Detect bash commands that write files outside `file_scope`.
 
     Catches the common escape patterns — redirection, sed/perl -i, tee,
     cp/mv destinations, and known mass-mutating formatters. Not a full
     sandbox — unknown write patterns are allowed. Returns a reason string
     if blocked, None if the command is safe (or unrecognized).
+
+    `allowed_outside_roots` is an absolute-path allowlist for agents that
+    legitimately need to write outside the project (e.g. runtime-verifier
+    stashing temp shell vars in /tmp). Targets under any listed root are
+    exempt from both the project-dir boundary AND the file_scope check.
     """
     # Normalize scope once — plan.json uses markdown code spans
     # ("`apps/x.ts`") which the literal-string comparison below won't
@@ -705,6 +769,7 @@ def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) ->
     # Note: Bash does NOT go through the Read/Write/Edit path-boundary
     # check, so we also have to reject writes escaping cwd here.
     cwd_abs = os.path.abspath(cwd)
+    allowed_roots = tuple(os.path.abspath(r) for r in allowed_outside_roots)
     for target, kind in write_targets:
         if target.startswith("/dev/"):
             continue
@@ -712,6 +777,13 @@ def _bash_writes_outside_scope(command: str, file_scope: list[str], cwd: str) ->
             os.path.normpath(target) if os.path.isabs(target)
             else os.path.normpath(os.path.join(cwd_abs, target))
         )
+        # Allowlisted outside roots (e.g. /tmp for runtime-verifier) bypass
+        # both the project-dir boundary and the file_scope check.
+        if any(
+            abs_path == root or abs_path.startswith(root.rstrip("/") + "/")
+            for root in allowed_roots
+        ):
+            continue
         # Escape from the project root — Bash would otherwise slip through
         if not (abs_path == cwd_abs or abs_path.startswith(cwd_abs + os.sep)):
             return (
@@ -892,7 +964,17 @@ class AgentDispatcher:
                 # `is not None` (not truthy) so empty list = "no files in scope"
                 # = readonly mode where every write is blocked.
                 if self.file_scope is not None:
-                    scope_reason = _bash_writes_outside_scope(command, self.file_scope, cwd)
+                    # runtime-verifier routinely curls endpoints and stashes
+                    # session cookies / response bodies in /tmp. Those writes
+                    # never touch the project tree, so the file_scope check
+                    # shouldn't apply to them.
+                    allowed_outside: tuple[str, ...] = ()
+                    if agent_name == "runtime-verifier":
+                        allowed_outside = ("/tmp",)
+                    scope_reason = _bash_writes_outside_scope(
+                        command, self.file_scope, cwd,
+                        allowed_outside_roots=allowed_outside,
+                    )
                     if scope_reason:
                         return await deny(scope_reason)
 
@@ -1153,7 +1235,16 @@ class AgentDispatcher:
                 await client.disconnect()
             except Exception:
                 pass
+            touched = await _git_touched_files(self.cwd)
             error_msg = f"agent={agent} timed out after {timeout}s"
+            if touched:
+                # Cap the list — porcelain output can be long if a hung
+                # implementer touched many files; the first handful is
+                # the actionable signal for team-lead / humans.
+                preview = ", ".join(touched[:10])
+                if len(touched) > 10:
+                    preview += f", … +{len(touched) - 10} more"
+                error_msg += f" (partial writes: {preview})"
             await self.bus.emit(AgentFailed(agent=agent, error=error_msg))
             raise RuntimeError(error_msg)
         except Exception as exc:
@@ -1406,7 +1497,7 @@ class AgentDispatcher:
         try:
             output = await asyncio.wait_for(
                 self._run_codex_command(cmd, codex_plugin_root),
-                timeout=180,  # 3 minutes hard cap — codex should not take longer
+                timeout=_PER_STAGE_REVIEW_TIMEOUT_S,
             )
             has_issues = bool(output.strip()) and any(
                 marker in output for marker in ("[P0]", "[P1]", "[P2]", "[CRITICAL]", "[WARNING]")
@@ -1421,7 +1512,7 @@ class AgentDispatcher:
                 "status": "skipped",
                 "has_issues": False,
                 "output": "",
-                "reason": "codex review timed out after 180 seconds",
+                "reason": f"codex review timed out after {_PER_STAGE_REVIEW_TIMEOUT_S} seconds",
             }
         except RateLimitError:
             raise

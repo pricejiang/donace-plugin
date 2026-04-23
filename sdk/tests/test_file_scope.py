@@ -169,6 +169,46 @@ class BashRedirectFalsePositiveTests(unittest.TestCase):
             _bash_writes_outside_scope(cmd, ["apps/in-scope.ts"], self.cwd),
         )
 
+    def test_shell_comment_with_apostrophe_does_not_break_quote_tracking(self):
+        # run-phase5-runA stage-5 false positive: a comment line containing
+        # an apostrophe ("# Check if it's rendering...") let the blanker's
+        # quote tracker latch onto the comment's `'`, flip state, and
+        # MIS-treat every subsequent `>` inside legitimate single-quoted
+        # tr args as a redirect target. The flagged target was a literal
+        # space character from the comment.
+        cmd = (
+            "cat /tmp/write_mode.html | wc -c\n"
+            "# Check if it's rendering the standard reader or write mode\n"
+            "cat /tmp/write_mode.html | tr '>' '>\\n' | head -60"
+        )
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="# ... apostrophe should be treated as comment, not opening quote",
+        )
+
+    def test_leading_hash_line_is_a_comment(self):
+        cmd = "# plain comment with > redirect-looking text\necho ok"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="everything after leading # on a line is a comment",
+        )
+
+    def test_hash_inside_word_is_not_a_comment(self):
+        # Regression guard: `file#backup` is just a word. The comment
+        # handler must not fire mid-token.
+        cmd = "echo file#backup > apps/backend/src/app/api/v1/projects/route.ts"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="'#' mid-word is not a comment; the redirect target is in-scope",
+        )
+
+    def test_hash_inside_quotes_is_literal(self):
+        cmd = "echo '# not a comment > here' > apps/backend/src/app/api/v1/projects/route.ts"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="'#' inside quotes is literal, and the real redirect target is in-scope",
+        )
+
 
 class DispatcherConstructorTests(unittest.TestCase):
     """Dispatcher.file_scope should be clean the moment the object exists,
@@ -208,6 +248,76 @@ class BashScopeBacktickTests(unittest.TestCase):
         self.assertIsNone(
             _bash_writes_outside_scope(cmd, scope_with_backticks, cwd),
             msg="file listed in plan.json (with markdown backticks) should be in scope",
+        )
+
+
+class PerStageReviewTimeoutTests(unittest.TestCase):
+    """Per-stage codex review should have enough headroom to not drop reviews
+    on medium-size stage diffs. run-phase5-runA stages 4 and 6 both hit the
+    old 180s cap and were skipped silently."""
+
+    def test_timeout_matches_plan_review_budget(self):
+        from sdk.agent_dispatch import (
+            _PER_STAGE_REVIEW_TIMEOUT_S,
+            _PLAN_REVIEW_TIMEOUT_S,
+        )
+        self.assertGreaterEqual(
+            _PER_STAGE_REVIEW_TIMEOUT_S,
+            _PLAN_REVIEW_TIMEOUT_S,
+            msg="per-stage review budget must at least match plan review (600s)",
+        )
+
+
+class AllowedOutsideRootsTests(unittest.TestCase):
+    """runtime-verifier legitimately needs to stash temp shell vars in /tmp.
+
+    run-phase5-runA stage-6 showed verifier trying `curl ... > /tmp/stg6_env`
+    and getting blocked because the project-dir boundary rejects anything
+    outside cwd. Agents that run the live app need a tmp sandbox.
+    """
+
+    def setUp(self):
+        self.cwd = str(_REPO_ROOT)
+        self.scope = ["apps/backend/x.ts"]
+
+    def test_tmp_redirect_denied_by_default(self):
+        # No allowlist = current strict behavior, keeps the default tight.
+        cmd = "curl http://localhost:3000/api > /tmp/response.json"
+        reason = _bash_writes_outside_scope(cmd, self.scope, self.cwd)
+        self.assertIsNotNone(reason, msg="without allowlist, /tmp writes must still deny")
+
+    def test_tmp_redirect_allowed_with_allowlist(self):
+        cmd = "curl http://localhost:3000/api > /tmp/response.json"
+        self.assertIsNone(
+            _bash_writes_outside_scope(
+                cmd, self.scope, self.cwd, allowed_outside_roots=("/tmp",),
+            ),
+            msg="/tmp in allowed_outside_roots permits the redirect",
+        )
+
+    def test_tmp_subdir_redirect_allowed(self):
+        cmd = "echo data > /tmp/donace/session.json"
+        self.assertIsNone(
+            _bash_writes_outside_scope(
+                cmd, self.scope, self.cwd, allowed_outside_roots=("/tmp",),
+            ),
+        )
+
+    def test_etc_write_still_denied_even_with_tmp_allowlist(self):
+        # Allowlist is prefix-specific. /etc/... is not covered by /tmp.
+        cmd = "echo x > /etc/passwd"
+        reason = _bash_writes_outside_scope(
+            cmd, self.scope, self.cwd, allowed_outside_roots=("/tmp",),
+        )
+        self.assertIsNotNone(reason)
+
+    def test_allowlist_does_not_leak_into_scope_check(self):
+        # An in-scope redirect unaffected by allowlist, regression guard.
+        cmd = "echo x > apps/backend/x.ts"
+        self.assertIsNone(
+            _bash_writes_outside_scope(
+                cmd, self.scope, self.cwd, allowed_outside_roots=("/tmp",),
+            ),
         )
 
 
