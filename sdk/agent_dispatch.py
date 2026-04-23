@@ -17,7 +17,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sdk.events import (
     AgentCompleted,
@@ -1230,28 +1230,27 @@ class AgentDispatcher:
         except Exception:
             pass  # best-effort backfill, don't crash on parse errors
 
-    # Per-agent timeout (seconds) and max turns.
-    AGENT_TIMEOUT: dict[str, int] = {
-        # Planner writes .ai/runs/<id>/plan.md. It invokes the
-        # superpowers:writing-plans skill for non-trivial tasks, reads
-        # a handful of files for context, and produces a structured
-        # plan. 600s covers the skill invocation plus small context
-        # gathering; longer plans should still fit comfortably.
-        "planner": 600,
-        "implementer": 900,
-        "test-engineer": 600,
-        "runtime-verifier": 900,
-        "typescript-reviewer": 300,
-        "ios-reviewer": 300,
-        # Documenter touches 5-7 files (README, CLAUDE.md, CHANGELOG,
-        # plan.md status, session log). 300s was too tight — observed runs
-        # timed out mid-way through knowledge cards. cmd_document splits
-        # core docs and cards into two phases; each gets the full budget.
-        "documenter": 600,
+    # Per-agent idle threshold (seconds). Replaces the old AGENT_TIMEOUT
+    # wallclock cap: run-phase5-runB-6e7f3779bc67 killed implementer at
+    # 900s wallclock with 5 partial files still mid-edit — the agent was
+    # productive, we just ran out of budget. With idle semantics, an
+    # agent may run indefinitely as long as it emits SDK stream activity
+    # (tool call, text chunk) at least every threshold seconds.
+    #
+    # Per-agent overrides exist for known-silent phases: planner
+    # dispatches Explore subagents whose work is invisible in the parent
+    # stream until tool_result returns, so its budget is looser.
+    AGENT_IDLE_TIMEOUT: dict[str, int] = {
+        "planner": 300,
     }
-    DEFAULT_TIMEOUT = 300  # 5 minutes
+    DEFAULT_IDLE_TIMEOUT = 180  # 3 minutes of silence
 
-    # No max_turns limit — timeout is the safety valve.
+    # How often the watchdog checks last_activity. Smaller = faster kill
+    # after threshold; larger = less asyncio overhead. Kill latency
+    # beyond the threshold is bounded by this interval.
+    IDLE_CHECK_INTERVAL = 15.0
+
+    # No max_turns limit — the idle watchdog is the safety valve.
     # Subscription plan doesn't charge per token, so turns are not a cost concern.
 
     # Token budget hint per agent (injected into prompt). Not enforced — just guidance.
@@ -1286,7 +1285,7 @@ class AgentDispatcher:
         """
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
-        timeout = self.AGENT_TIMEOUT.get(agent, self.DEFAULT_TIMEOUT)
+        idle_threshold = self.AGENT_IDLE_TIMEOUT.get(agent, self.DEFAULT_IDLE_TIMEOUT)
 
         # Inject token budget hint into prompt (not enforced, just guidance)
         budget = self.AGENT_TOKEN_BUDGET.get(agent)
@@ -1327,24 +1326,56 @@ class AgentDispatcher:
         touched_baseline: dict[str, tuple[str, int, int]] | None = None
         if agent == "implementer":
             touched_baseline = await _git_touched_snapshot(self.cwd)
-        try:
-            result = await asyncio.wait_for(
-                self._run_client(client, agent, prompt, model_id),
-                timeout=timeout,
+
+        loop = asyncio.get_running_loop()
+        last_activity = [loop.time()]
+
+        def _mark_activity() -> None:
+            last_activity[0] = loop.time()
+
+        run_task = asyncio.create_task(
+            self._run_client(
+                client, agent, prompt, model_id, on_activity=_mark_activity,
             )
-        except asyncio.TimeoutError:
+        )
+
+        stalled_idle: float | None = None
+        try:
+            while True:
+                done, _pending = await asyncio.wait(
+                    {run_task}, timeout=self.IDLE_CHECK_INTERVAL,
+                )
+                if run_task in done:
+                    break
+                idle = loop.time() - last_activity[0]
+                if idle >= idle_threshold:
+                    stalled_idle = idle
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except BaseException:
+                        pass
+                    break
+        except asyncio.CancelledError:
+            run_task.cancel()
+            raise
+
+        if stalled_idle is not None:
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            touched = []
+            touched: list[str] = []
             if agent == "implementer":
                 touched = await _git_touched_files(
                     self.cwd,
                     baseline=touched_baseline,
                     file_scope=self.file_scope,
                 )
-            error_msg = f"agent={agent} timed out after {timeout}s"
+            error_msg = (
+                f"agent={agent} timed out "
+                f"(idle {stalled_idle:.0f}s \u2265 {idle_threshold}s threshold)"
+            )
             if touched:
                 # Cap the list — porcelain output can be long if a hung
                 # implementer touched many files; the first handful is
@@ -1355,6 +1386,9 @@ class AgentDispatcher:
                 error_msg += f" (partial writes: {preview})"
             await self.bus.emit(AgentFailed(agent=agent, error=error_msg))
             raise RuntimeError(error_msg)
+
+        try:
+            result = run_task.result()
         except Exception as exc:
             try:
                 await client.disconnect()
@@ -1362,14 +1396,28 @@ class AgentDispatcher:
                 pass
             await self.bus.emit(AgentFailed(agent=agent, error=str(exc)))
             raise
-        else:
-            await self.bus.emit(AgentCompleted(
-                agent=agent, duration_s=round(time.time() - t0, 1),
-            ))
-            return result
 
-    async def _run_client(self, client: Any, agent: str, prompt: str, model_id: str) -> str:
-        """Run an agent via ClaudeSDKClient. Called within wait_for timeout."""
+        await self.bus.emit(AgentCompleted(
+            agent=agent, duration_s=round(time.time() - t0, 1),
+        ))
+        return result
+
+    async def _run_client(
+        self,
+        client: Any,
+        agent: str,
+        prompt: str,
+        model_id: str,
+        *,
+        on_activity: Callable[[], None] | None = None,
+    ) -> str:
+        """Run an agent via ClaudeSDKClient.
+
+        Calls ``on_activity()`` on every SDK message received so the
+        caller's idle watchdog sees a heartbeat. Without heartbeats, the
+        dispatcher would kill any agent whose stream is briefly quiet;
+        with them, only truly stuck agents are killed.
+        """
         await client.connect(prompt=prompt)
 
         final_text = ""
@@ -1381,6 +1429,8 @@ class AgentDispatcher:
         last_assistant_text = ""
         try:
             async for message in client.receive_messages():
+                if on_activity is not None:
+                    on_activity()
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
                         if isinstance(block, TextBlock) and block.text.strip():
