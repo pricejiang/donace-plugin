@@ -136,30 +136,75 @@ _PLAN_REVIEW_POLL_INTERVAL_S: float = 3.0
 _PER_STAGE_REVIEW_TIMEOUT_S: int = 600
 
 
-async def _git_touched_files(cwd: str) -> list[str]:
-    """Return working-tree-modified paths vs HEAD in `cwd`. Empty on any error.
+def _dirty_path_in_scope(path: str, file_scope: list[str] | None) -> bool:
+    if file_scope is None:
+        return True
+    scope = _normalize_file_scope(file_scope) or []
+    return any(path == s or path.startswith(s.rstrip("/") + "/") for s in scope)
 
-    Used by the query() timeout path so a hung implementer's partial writes
-    surface in the BLOCKED result — otherwise 'auto_commit skipped — no
-    git-visible changes' on the retry is the only hint that anything landed.
+
+async def _git_touched_snapshot(cwd: str) -> dict[str, tuple[str, int, int]]:
+    """Return git-visible dirty paths with cheap content identity.
+
+    Values are `(porcelain_status, mtime_ns, size)`. The mtime/size pair
+    lets timeout reporting distinguish a dirty file that existed before
+    an agent ran from one the agent rewrote while keeping the same
+    porcelain status.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "status", "--porcelain",
+            "git", "status", "--porcelain", "-uall", "-z",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=cwd,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         if proc.returncode != 0:
-            return []
-        files: list[str] = []
-        for line in stdout.decode(errors="replace").splitlines():
-            # porcelain format is "XY path" where XY is a 2-char status code.
-            # Skip the status + separator (3 chars); rename lines ("R  old -> new")
-            # keep the `->` form in the path, which is still legible.
-            if len(line) > 3:
-                files.append(line[3:].strip())
+            return {}
+
+        snapshot: dict[str, tuple[str, int, int]] = {}
+        records = stdout.decode(errors="replace").split("\0")
+        i = 0
+        while i < len(records):
+            rec = records[i]
+            i += 1
+            if len(rec) < 4:
+                continue
+            status = rec[:2]
+            path = rec[3:]
+            if status[0] in ("R", "C"):
+                i += 1
+            full_path = Path(cwd) / path
+            try:
+                st = full_path.stat()
+                snapshot[path] = (status, st.st_mtime_ns, st.st_size)
+            except OSError:
+                snapshot[path] = (status, 0, 0)
+        return snapshot
+    except Exception:
+        return {}
+
+
+async def _git_touched_files(
+    cwd: str,
+    *,
+    baseline: dict[str, tuple[str, int, int]] | None = None,
+    file_scope: list[str] | None = None,
+) -> list[str]:
+    """Return dirty paths added/changed since `baseline`. Empty on any error.
+
+    Used by the implementer timeout path so partial writes surface in the
+    BLOCKED result without mislabeling pre-existing user edits as work
+    done by the hung agent.
+    """
+    try:
+        before = baseline or {}
+        after = await _git_touched_snapshot(cwd)
+        files: list[str] = [
+            path
+            for path, identity in after.items()
+            if before.get(path) != identity and _dirty_path_in_scope(path, file_scope)
+        ]
         return files
     except Exception:
         return []
@@ -534,19 +579,20 @@ def _blank_quoted_regions(command: str) -> str:
     tracker on `'` in `it's`, so every subsequent `>` inside legitimate
     single-quoted tr args is misread as a redirect target.
     """
-    out = list(command)
+    comment_blanked = _blank_shell_comments(command)
+    out = list(comment_blanked)
     i = 0
-    n = len(command)
+    n = len(comment_blanked)
 
     def blank_quote(start: int, quote: str) -> int:
         j = start + 1
         while j < n:
-            if command[j] == "\\" and j + 1 < n:
+            if comment_blanked[j] == "\\" and j + 1 < n:
                 out[j] = " "
                 out[j + 1] = " "
                 j += 2
                 continue
-            if command[j] == quote:
+            if comment_blanked[j] == quote:
                 break
             out[j] = " "
             j += 1
@@ -555,48 +601,38 @@ def _blank_quoted_regions(command: str) -> str:
     def scan_backtick_substitution(start: int) -> int:
         j = start + 1
         while j < n:
-            if command[j] == "\\" and j + 1 < n:
+            if comment_blanked[j] == "\\" and j + 1 < n:
                 j += 2
                 continue
-            if command[j] == "`":
+            if comment_blanked[j] == "`":
                 break
-            if command[j] in ("'", '"'):
+            if comment_blanked[j] in ("'", '"'):
                 # Quotes inside the nested command are inert for redirect
                 # detection, just like quotes in the outer command.
-                j = blank_quote(j, command[j])
+                j = blank_quote(j, comment_blanked[j])
                 continue
             j += 1
         return j + 1
 
     while i < n:
-        ch = command[i]
+        ch = comment_blanked[i]
         if ch == "\\" and i + 1 < n:
             i += 2  # escaped char, keep both positions untouched
             continue
-        if ch == "#":
-            # A `#` starts a comment only at the beginning of a command
-            # word — i.e. at BOF, after a newline, or after whitespace.
-            # `file#backup` (mid-word) is just a literal filename.
-            at_word_start = i == 0 or command[i - 1] in " \t\n"
-            if at_word_start:
-                while i < n and command[i] != "\n":
-                    out[i] = " "
-                    i += 1
-                continue
         if ch == "'":
             i = blank_quote(i, ch)
             continue
         if ch == '"':
             j = i + 1
             while j < n:
-                if command[j] == "\\" and j + 1 < n:
+                if comment_blanked[j] == "\\" and j + 1 < n:
                     out[j] = " "
                     out[j + 1] = " "
                     j += 2
                     continue
-                if command[j] == '"':
+                if comment_blanked[j] == '"':
                     break
-                if command[j] == "`":
+                if comment_blanked[j] == "`":
                     j = scan_backtick_substitution(j)
                     continue
                 out[j] = " "
@@ -611,6 +647,68 @@ def _blank_quoted_regions(command: str) -> str:
 
 
 _SHELL_WORD_STOP = frozenset(" \t\n|;&<>()`")
+
+
+def _is_shell_comment_start(command: str, index: int) -> bool:
+    """Return True when `#` starts a shell comment outside quotes."""
+    if command[index] != "#":
+        return False
+    if index == 0:
+        return True
+    # Shell comments start at the beginning of a word. Besides ordinary
+    # whitespace/newline, command separators also create a new word, so
+    # `;# comment` is a comment even without a space after `;`.
+    return command[index - 1] in " \t\n;|&"
+
+
+def _blank_shell_comments(command: str) -> str:
+    """Blank shell comments while preserving positions and quoted content."""
+    out = list(command)
+    i = 0
+    n = len(command)
+
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "#":
+            if _is_shell_comment_start(command, i):
+                while i < n and command[i] != "\n":
+                    out[i] = " "
+                    i += 1
+                continue
+        if ch == "'":
+            i += 1
+            while i < n and command[i] != "'":
+                i += 1
+            if i < n:
+                i += 1
+            continue
+        if ch == '"':
+            i += 1
+            while i < n:
+                if command[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if command[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "`":
+            i += 1
+            while i < n:
+                if command[i] == "\\" and i + 1 < n:
+                    i += 2
+                    continue
+                if command[i] == "`":
+                    i += 1
+                    break
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
 
 
 def _extract_shell_word(command: str, start: int) -> str:
@@ -697,10 +795,11 @@ def _bash_writes_outside_scope(
     # ("`apps/x.ts`") which the literal-string comparison below won't
     # match against the hook's rel_path ("apps/x.ts").
     file_scope = _normalize_file_scope(file_scope) or []
+    command_without_comments = _blank_shell_comments(command)
 
     # 1. Mass-mutators walk trees — reject outright under file_scope
     for needle in _MASS_MUTATORS:
-        if needle in command:
+        if needle in command_without_comments:
             return (
                 f"'{needle.strip()}' can modify many files — "
                 f"disabled when file_scope is active (scope: {file_scope})"
@@ -726,7 +825,7 @@ def _bash_writes_outside_scope(
 
     # Tokenize once for tee/sed/perl/cp/mv
     try:
-        tokens = shlex.split(command, posix=True)
+        tokens = shlex.split(command_without_comments, posix=True)
     except ValueError:
         tokens = []
 
@@ -751,7 +850,7 @@ def _bash_writes_outside_scope(
 
     # 2c. sed -i / perl -i / perl -pi — conventionally the last positional is the target.
     # Look for the last non-flag token that looks like a filepath.
-    if _SED_PERL_INPLACE_RE.search(command):
+    if _SED_PERL_INPLACE_RE.search(command_without_comments):
         for tok in reversed(tokens):
             if tok and not tok.startswith("-") and ("/" in tok or "." in tok):
                 write_targets.append((tok, "sed/perl -i"))
@@ -1225,6 +1324,9 @@ class AgentDispatcher:
         t0 = time.time()
 
         client = ClaudeSDKClient(options=options)
+        touched_baseline: dict[str, tuple[str, int, int]] | None = None
+        if agent == "implementer":
+            touched_baseline = await _git_touched_snapshot(self.cwd)
         try:
             result = await asyncio.wait_for(
                 self._run_client(client, agent, prompt, model_id),
@@ -1235,7 +1337,13 @@ class AgentDispatcher:
                 await client.disconnect()
             except Exception:
                 pass
-            touched = await _git_touched_files(self.cwd)
+            touched = []
+            if agent == "implementer":
+                touched = await _git_touched_files(
+                    self.cwd,
+                    baseline=touched_baseline,
+                    file_scope=self.file_scope,
+                )
             error_msg = f"agent={agent} timed out after {timeout}s"
             if touched:
                 # Cap the list — porcelain output can be long if a hung

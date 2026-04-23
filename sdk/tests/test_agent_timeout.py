@@ -28,7 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from sdk.agent_dispatch import AgentDispatcher  # noqa: E402
+from sdk.agent_dispatch import AgentDispatcher, _git_touched_files  # noqa: E402
 from sdk.events import EventBus  # noqa: E402
 
 
@@ -55,7 +55,16 @@ class TimeoutPartialReturnTests(unittest.TestCase):
         # Force an immediate timeout without a real sleep.
         dispatcher.AGENT_TIMEOUT = {**dispatcher.AGENT_TIMEOUT, "implementer": 0}
 
-        async def fake_touched(cwd: str) -> list[str]:
+        async def fake_snapshot(cwd: str) -> dict[str, tuple[str, int, int]]:
+            return {"apps/web/preexisting.ts": (" M", 1, 1)}
+
+        async def fake_touched(
+            cwd: str,
+            *,
+            baseline: dict[str, tuple[str, int, int]] | None = None,
+            file_scope: list[str] | None = None,
+        ) -> list[str]:
+            self.assertEqual(baseline, {"apps/web/preexisting.ts": (" M", 1, 1)})
             return ["apps/web/a.ts", "apps/web/b.ts"]
 
         async def never_completes(*a, **kw):
@@ -65,6 +74,7 @@ class TimeoutPartialReturnTests(unittest.TestCase):
         mock_client.disconnect = AsyncMock()
 
         with patch("sdk.agent_dispatch.ClaudeSDKClient", return_value=mock_client), \
+             patch("sdk.agent_dispatch._git_touched_snapshot", fake_snapshot), \
              patch("sdk.agent_dispatch._git_touched_files", fake_touched), \
              patch.object(dispatcher, "_run_client", never_completes):
             with self.assertRaises(RuntimeError) as ctx:
@@ -83,7 +93,12 @@ class TimeoutPartialReturnTests(unittest.TestCase):
         dispatcher = self._make_dispatcher()
         dispatcher.AGENT_TIMEOUT = {**dispatcher.AGENT_TIMEOUT, "implementer": 0}
 
-        async def no_files(cwd: str) -> list[str]:
+        async def no_files(
+            cwd: str,
+            *,
+            baseline: dict[str, tuple[str, int, int]] | None = None,
+            file_scope: list[str] | None = None,
+        ) -> list[str]:
             return []
 
         async def never_completes(*a, **kw):
@@ -104,6 +119,56 @@ class TimeoutPartialReturnTests(unittest.TestCase):
         self.assertIn("timed out", msg.lower())
         self.assertNotIn("partial writes", msg)
         self.assertNotIn("()", msg)
+
+    def test_touched_files_are_diffed_against_baseline_and_file_scope(self):
+        baseline = {
+            "apps/web/old.ts": (" M", 10, 100),
+            "apps/web/changed.ts": (" M", 10, 100),
+            "apps/backend/outside.ts": (" M", 10, 100),
+        }
+        after = {
+            "apps/web/old.ts": (" M", 10, 100),
+            "apps/web/changed.ts": (" M", 11, 120),
+            "apps/web/new.ts": ("??", 12, 50),
+            "apps/backend/outside.ts": (" M", 11, 120),
+        }
+
+        async def fake_snapshot(cwd: str) -> dict[str, tuple[str, int, int]]:
+            return after
+
+        with patch("sdk.agent_dispatch._git_touched_snapshot", fake_snapshot):
+            touched = self._run(_git_touched_files(
+                str(_REPO_ROOT),
+                baseline=baseline,
+                file_scope=["apps/web"],
+            ))
+
+        self.assertEqual(touched, ["apps/web/changed.ts", "apps/web/new.ts"])
+
+    def test_non_implementer_timeout_does_not_report_partial_writes(self):
+        dispatcher = self._make_dispatcher()
+        dispatcher.AGENT_TIMEOUT = {**dispatcher.AGENT_TIMEOUT, "runtime-verifier": 0}
+
+        async def fake_touched(*a, **kw):
+            return ["apps/web/a.ts"]
+
+        async def never_completes(*a, **kw):
+            await asyncio.sleep(10)
+
+        mock_client = MagicMock()
+        mock_client.disconnect = AsyncMock()
+
+        with patch("sdk.agent_dispatch.ClaudeSDKClient", return_value=mock_client), \
+             patch("sdk.agent_dispatch._git_touched_files", fake_touched), \
+             patch.object(dispatcher, "_run_client", never_completes):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._run(dispatcher.query(
+                    agent="runtime-verifier", prompt="verify it", model="opus",
+                ))
+
+        msg = str(ctx.exception)
+        self.assertIn("timed out", msg.lower())
+        self.assertNotIn("partial writes", msg)
 
 
 if __name__ == "__main__":

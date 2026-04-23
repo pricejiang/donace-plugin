@@ -193,6 +193,34 @@ class BashRedirectFalsePositiveTests(unittest.TestCase):
             msg="everything after leading # on a line is a comment",
         )
 
+    def test_semicolon_hash_line_is_a_comment(self):
+        cmd = "echo ok;# Check if it's rendering\ncat /tmp/x | tr '>' '>\\n' | head"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg=";# starts a shell comment even without a space after semicolon",
+        )
+
+    def test_comment_tee_is_not_a_write(self):
+        cmd = "# tee /tmp/commented.txt\necho ok"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="commented tee must not feed token-based write detection",
+        )
+
+    def test_comment_cp_is_not_a_write(self):
+        cmd = "# cp apps/backend/x.ts /tmp/commented.txt\necho ok"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="commented cp must not feed token-based write detection",
+        )
+
+    def test_comment_sed_inplace_is_not_a_write(self):
+        cmd = "# sed -i s/a/b/ /tmp/commented.txt\necho ok"
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, self.scope, self.cwd),
+            msg="commented sed -i must not feed token-based write detection",
+        )
+
     def test_hash_inside_word_is_not_a_comment(self):
         # Regression guard: `file#backup` is just a word. The comment
         # handler must not fire mid-token.
