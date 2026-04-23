@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Writes .ai/runs/<run-id>/plan.md for complex tasks, invoking the superpowers:writing-plans skill when appropriate. Dispatched by team-lead via `orchestrator.py write_plan`.
-tools: ["Read", "Grep", "Glob", "Skill", "Write", "Edit"]
+tools: ["Read", "Grep", "Glob", "Skill", "Write", "Edit", "Agent(Explore)"]
 model: opus
 ---
 
