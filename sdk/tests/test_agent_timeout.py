@@ -3,7 +3,7 @@
 Motivation: run-phase5-runB-6e7f3779bc67 killed implementer at 900s
 wallclock with 5 partial files still mid-edit; retry had to redo all of
 it. Wallclock timeouts murder productive agents. `dispatcher.query()`
-now tracks SDK message arrivals via an on_activity heartbeat; only
+now tracks SDK message arrivals plus in-flight tool/subagent work; only
 agents that go silent past ``AGENT_IDLE_TIMEOUT[agent]`` are killed.
 
 The partial-writes signal from run-phase5-runA is still load-bearing
@@ -77,6 +77,77 @@ class IdleWatchdogTests(unittest.TestCase):
              patch.object(dispatcher, "_run_client", active):
             result = self._run(dispatcher.query(
                 agent="implementer", prompt="do it", model="sonnet",
+            ))
+
+        self.assertEqual(result, "ok")
+
+    def test_long_running_tool_execution_is_not_treated_as_idle(self):
+        """A quiet tool run keeps the watchdog paused until the tool returns."""
+        dispatcher = self._make_dispatcher()
+        dispatcher.AGENT_IDLE_TIMEOUT = {"runtime-verifier": 0.05}
+        dispatcher.IDLE_CHECK_INTERVAL = 0.02
+
+        class FakeClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def disconnect(self):
+                return None
+
+        async def long_tool(client, agent, prompt, model_id, *, on_activity=None, **_kw):
+            pre_tool = client.options.hooks["PreToolUse"][0].hooks[0]
+            post_tool = client.options.hooks["PostToolUse"][0].hooks[0]
+            await pre_tool({
+                "tool_name": "Bash",
+                "tool_input": {"command": "npm run dev"},
+            }, None, None)
+            await asyncio.sleep(0.15)
+            await post_tool({
+                "tool_name": "Bash",
+                "tool_response": "server ready",
+            }, None, None)
+            return "ok"
+
+        with patch("sdk.agent_dispatch.ClaudeSDKClient", side_effect=FakeClient), \
+             patch.object(dispatcher, "_run_client", long_tool):
+            result = self._run(dispatcher.query(
+                agent="runtime-verifier", prompt="verify it", model="opus",
+            ))
+
+        self.assertEqual(result, "ok")
+
+    def test_long_running_subagent_execution_is_not_treated_as_idle(self):
+        """A parent agent waiting on a subagent is busy, not idle."""
+        dispatcher = self._make_dispatcher()
+        dispatcher.AGENT_IDLE_TIMEOUT = {"planner": 0.05}
+        dispatcher.IDLE_CHECK_INTERVAL = 0.02
+
+        class FakeClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def disconnect(self):
+                return None
+
+        async def long_subagent(client, agent, prompt, model_id, *, on_activity=None, **_kw):
+            start = client.options.hooks["SubagentStart"][0].hooks[0]
+            stop = client.options.hooks["SubagentStop"][0].hooks[0]
+            await start({
+                "agent_type": "explorer",
+                "agent_id": "sub-1",
+            }, None, None)
+            await asyncio.sleep(0.15)
+            await stop({
+                "agent_type": "explorer",
+                "agent_id": "sub-1",
+                "agent_transcript_path": "",
+            }, None, None)
+            return "ok"
+
+        with patch("sdk.agent_dispatch.ClaudeSDKClient", side_effect=FakeClient), \
+             patch.object(dispatcher, "_run_client", long_subagent):
+            result = self._run(dispatcher.query(
+                agent="planner", prompt="plan it", model="opus",
             ))
 
         self.assertEqual(result, "ok")

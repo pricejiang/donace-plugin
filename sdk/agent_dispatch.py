@@ -1018,16 +1018,40 @@ class AgentDispatcher:
             self._agent_configs[agent_name] = load_agent_config(self.agents_dir, agent_name)
         return self._agent_configs[agent_name]
 
-    def _make_hooks(self, agent_name: str) -> dict:
+    def _make_hooks(
+        self,
+        agent_name: str,
+        *,
+        on_activity: Callable[[], None] | None = None,
+        on_operation_start: Callable[[], None] | None = None,
+        on_operation_stop: Callable[[], None] | None = None,
+    ) -> dict:
         """Build SDK hooks for security checks + EventBus integration."""
         bus = self.bus
         cwd = self.cwd
+
+        def _signal_activity() -> None:
+            if on_activity is not None:
+                on_activity()
+
+        def _signal_operation_start() -> None:
+            if on_operation_start is not None:
+                on_operation_start()
+            else:
+                _signal_activity()
+
+        def _signal_operation_stop() -> None:
+            if on_operation_stop is not None:
+                on_operation_stop()
+            else:
+                _signal_activity()
 
         async def pre_tool_hook(
             hook_input: PreToolUseHookInput,
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
+            _signal_activity()
             tool_name = hook_input["tool_name"]
             tool_input = hook_input.get("tool_input") or {}
 
@@ -1135,6 +1159,7 @@ class AgentDispatcher:
                         )
 
             # --- EventBus: emit tool use event (full content for Raw Log) ---
+            _signal_operation_start()
             target = tool_input.get("file_path") or tool_input.get("command", "")
             await bus.emit(AgentToolUse(
                 agent=agent_name,
@@ -1149,6 +1174,7 @@ class AgentDispatcher:
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
+            _signal_operation_stop()
             response_str = str(hook_input.get("tool_response", ""))
             status = "error" if "[error:" in response_str else "success"
             await bus.emit(AgentToolResult(
@@ -1164,6 +1190,7 @@ class AgentDispatcher:
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
+            _signal_operation_start()
             agent_type = hook_input.get("agent_type", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_type", "")
             agent_id = hook_input.get("agent_id", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_id", "")
             await bus.emit(SubagentStarted(
@@ -1178,6 +1205,7 @@ class AgentDispatcher:
             tool_use_id: str | None,
             context: Any,
         ) -> dict:
+            _signal_operation_stop()
             agent_type = hook_input.get("agent_type", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_type", "")
             agent_id = hook_input.get("agent_id", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_id", "")
             transcript_path = hook_input.get("agent_transcript_path", "") if isinstance(hook_input, dict) else getattr(hook_input, "agent_transcript_path", "")
@@ -1234,8 +1262,9 @@ class AgentDispatcher:
     # wallclock cap: run-phase5-runB-6e7f3779bc67 killed implementer at
     # 900s wallclock with 5 partial files still mid-edit — the agent was
     # productive, we just ran out of budget. With idle semantics, an
-    # agent may run indefinitely as long as it emits SDK stream activity
-    # (tool call, text chunk) at least every threshold seconds.
+    # agent may run indefinitely as long as it keeps making observable
+    # progress: SDK stream activity, or an in-flight tool/subagent that
+    # the dispatcher knows is still running.
     #
     # Per-agent overrides exist for known-silent phases: planner
     # dispatches Explore subagents whose work is invisible in the parent
@@ -1292,6 +1321,24 @@ class AgentDispatcher:
         if budget:
             prompt = f"TOKEN BUDGET: {budget}. Focus on the specific files listed below.\n\n{prompt}"
 
+        loop = asyncio.get_running_loop()
+        last_activity = [loop.time()]
+        # Hooks tell us when a tool or subagent is in flight. While
+        # that counter is non-zero, the agent is busy even if the SDK
+        # stream is quiet waiting for the operation to finish.
+        active_operations = [0]
+
+        def _mark_activity() -> None:
+            last_activity[0] = loop.time()
+
+        def _start_operation() -> None:
+            active_operations[0] += 1
+            _mark_activity()
+
+        def _stop_operation() -> None:
+            active_operations[0] = max(0, active_operations[0] - 1)
+            _mark_activity()
+
         allowed_tools = (tools if tools is not None else config.tools) + ["TodoWrite"]
         # MCP servers are inherited from the user's CLI plugin config. In
         # bypassPermissions mode, any MCP tool the CLI knows about becomes
@@ -1309,7 +1356,12 @@ class AgentDispatcher:
             "disallowed_tools": disallowed_tools,
             "permission_mode": "bypassPermissions",
             "model": model_id,
-            "hooks": self._make_hooks(agent),
+            "hooks": self._make_hooks(
+                agent,
+                on_activity=_mark_activity,
+                on_operation_start=_start_operation,
+                on_operation_stop=_stop_operation,
+            ),
         }
 
         options = ClaudeAgentOptions(**opts)
@@ -1327,12 +1379,6 @@ class AgentDispatcher:
         if agent == "implementer":
             touched_baseline = await _git_touched_snapshot(self.cwd)
 
-        loop = asyncio.get_running_loop()
-        last_activity = [loop.time()]
-
-        def _mark_activity() -> None:
-            last_activity[0] = loop.time()
-
         run_task = asyncio.create_task(
             self._run_client(
                 client, agent, prompt, model_id, on_activity=_mark_activity,
@@ -1347,6 +1393,8 @@ class AgentDispatcher:
                 )
                 if run_task in done:
                     break
+                if active_operations[0] > 0:
+                    continue
                 idle = loop.time() - last_activity[0]
                 if idle >= idle_threshold:
                     stalled_idle = idle
