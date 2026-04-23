@@ -140,7 +140,7 @@ def _dirty_path_in_scope(path: str, file_scope: list[str] | None) -> bool:
     if file_scope is None:
         return True
     scope = _normalize_file_scope(file_scope) or []
-    return any(path == s or path.startswith(s.rstrip("/") + "/") for s in scope)
+    return any(_path_matches_scope_entry(path, s) for s in scope)
 
 
 async def _git_touched_snapshot(cwd: str) -> dict[str, tuple[str, int, int]]:
@@ -258,6 +258,55 @@ def _normalize_file_scope(scope: list[str] | None) -> list[str] | None:
     return cleaned
 
 
+# Placeholders planners use in scope entries when the exact path isn't
+# known yet. Implementer fills in a real value at write-time; we want the
+# scope match to stay satisfied. Observed in run-phase5-runB stage-1: scope
+# had `migrations/<timestamp>_add_thread/migration.sql`, implementer wrote
+# `migrations/20260422000000_add_thread/migration.sql` — literal-string
+# compare denied every write, 5+ retries later team-lead gave up.
+_SCOPE_PLACEHOLDERS: dict[str, str] = {
+    "<timestamp>": r"\d{14}",  # Prisma: YYYYMMDDHHMMSS
+    "<date>": r"\d{8}",        # YYYYMMDD
+}
+
+
+def _scope_entry_to_regex(entry: str) -> str:
+    """Convert a scope entry with optional <timestamp>/<date> placeholders to regex source.
+
+    Literal parts are re.escape'd so dots/dashes don't become regex metachars.
+    Only the exact placeholder tokens listed in _SCOPE_PLACEHOLDERS expand.
+    """
+    parts: list[str] = []
+    i = 0
+    n = len(entry)
+    while i < n:
+        matched = None
+        for placeholder, pattern in _SCOPE_PLACEHOLDERS.items():
+            if entry.startswith(placeholder, i):
+                matched = (placeholder, pattern)
+                break
+        if matched is not None:
+            parts.append(matched[1])
+            i += len(matched[0])
+        else:
+            parts.append(re.escape(entry[i]))
+            i += 1
+    return "".join(parts)
+
+
+def _path_matches_scope_entry(path: str, entry: str) -> bool:
+    """True if ``path`` equals ``entry`` or is inside its subtree.
+
+    Fast path is a literal compare; only engages regex when the entry
+    contains a known placeholder, so the 99% case costs nothing.
+    """
+    entry = entry.rstrip("/")
+    if "<" in entry and any(ph in entry for ph in _SCOPE_PLACEHOLDERS):
+        rx = _scope_entry_to_regex(entry)
+        return re.match(rf"^(?:{rx})(?:/.*)?$", path) is not None
+    return path == entry or path.startswith(entry + "/")
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
     """Extract the first JSON object embedded in text."""
     decoder = json.JSONDecoder()
@@ -368,8 +417,16 @@ _BLOCKED_COMMANDS = [
 
 
 def _is_blocked_command(command: str) -> str | None:
-    """Check if a command matches the blocklist. Returns reason if blocked, None if safe."""
-    cmd_stripped = command.strip()
+    """Check if a command matches the blocklist. Returns reason if blocked, None if safe.
+
+    Scans a sanitized copy with quoted / heredoc bodies and shell comments
+    blanked — keywords inside ``python3 -c "..."``, ``node -e "..."``, or
+    ``cat <<EOF ... EOF`` are literal string data, not executing commands,
+    and false positives there sent run-phase5-runB implementer into retry
+    loops. The blocklist stays strict on raw shell (``psql; DROP TABLE x``
+    outside quotes still blocks).
+    """
+    cmd_stripped = _blank_for_blocklist(command).strip()
     for blocked in _BLOCKED_COMMANDS:
         if blocked in cmd_stripped:
             return f"blocked: '{blocked}' is not allowed in automated execution"
@@ -711,6 +768,74 @@ def _blank_shell_comments(command: str) -> str:
     return "".join(out)
 
 
+# Heredoc opener: `<<`, optional `-` for tab-stripping, optional whitespace,
+# then the delimiter which can be unquoted (`EOF`), single-quoted (`'EOF'`),
+# double-quoted (`"EOF"`), or backslash-escaped (`\EOF`). Quoted/backslashed
+# forms disable expansion in bash but have the same terminator semantics.
+_HEREDOC_START_RE = re.compile(
+    r"<<(-?)\s*"
+    r"(?:'([^']+)'|\"([^\"]+)\"|\\(\w+)|(\w+))"
+)
+
+
+def _blank_heredoc_bodies(command: str) -> str:
+    """Blank the body of ``<<DELIM`` heredocs so substring scans skip inert data.
+
+    run-phase5-runB stage-1 tried ``cat <<EOF\\n-- DELETE FROM things\\nEOF`` —
+    the heredoc content is stdin data for ``cat``, not SQL being executed,
+    but the substring-based blocklist scanner still fired. Blanking the
+    body (preserving newlines so line numbering stays intact) lets the
+    blocklist stay strict on real commands without fighting the agent on
+    inert content.
+    """
+    out = list(command)
+    pos = 0
+    while pos < len(command):
+        m = _HEREDOC_START_RE.search(command, pos)
+        if m is None:
+            break
+        allow_indent = m.group(1) == "-"
+        delim = next(g for g in (m.group(2), m.group(3), m.group(4), m.group(5)) if g)
+        nl = command.find("\n", m.end())
+        if nl < 0:
+            # No body — opener on the final line, nothing to blank.
+            break
+        body_start = nl + 1
+        # Walk lines looking for the terminator.
+        i = body_start
+        terminator_at: int | None = None
+        while i <= len(command):
+            line_end = command.find("\n", i)
+            line = command[i:line_end if line_end >= 0 else len(command)]
+            candidate = line.lstrip("\t") if allow_indent else line
+            if candidate == delim:
+                terminator_at = i
+                break
+            if line_end < 0:
+                break
+            i = line_end + 1
+        # Body spans [body_start, terminator_at) — or end-of-string if
+        # the heredoc never terminates (malformed command; treat the rest
+        # as body so we don't leave keywords exposed).
+        body_end = terminator_at if terminator_at is not None else len(command)
+        for j in range(body_start, body_end):
+            if command[j] != "\n":
+                out[j] = " "
+        pos = body_end
+    return "".join(out)
+
+
+def _blank_for_blocklist(command: str) -> str:
+    """Sanitize a command before running it through the blocklist substring scan.
+
+    Chains the existing blanker helpers so that quoted bodies (``python3 -c
+    "..."``, ``node -e "..."``), shell comments, and heredoc bodies no
+    longer feed the blocklist. Keeps the blocklist honest on real shell
+    invocations outside any quoting.
+    """
+    return _blank_quoted_regions(_blank_heredoc_bodies(command))
+
+
 def _extract_shell_word(command: str, start: int) -> str:
     """Parse one shell word from `command[start:]`, unquoting as the shell would.
 
@@ -890,10 +1015,7 @@ def _bash_writes_outside_scope(
                 f"All writes must stay inside the project."
             )
         rel = os.path.relpath(abs_path, cwd_abs)
-        in_scope = any(
-            rel == s or rel.startswith(s.rstrip("/") + "/")
-            for s in file_scope
-        )
+        in_scope = any(_path_matches_scope_entry(rel, s) for s in file_scope)
         if not in_scope:
             return (
                 f"Bash {kind} writes '{rel}' outside file_scope {file_scope}. "
@@ -1137,7 +1259,7 @@ class AgentDispatcher:
                     elif self.file_scope:
                         # Non-test-engineer agents: restrict to stage files.
                         scope_match = any(
-                            rel_path == s or rel_path.startswith(s.rstrip("/") + "/")
+                            _path_matches_scope_entry(rel_path, s)
                             for s in self.file_scope
                         )
                         if not scope_match:

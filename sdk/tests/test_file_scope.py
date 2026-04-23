@@ -25,7 +25,9 @@ if str(_REPO_ROOT) not in sys.path:
 from sdk.agent_dispatch import (  # noqa: E402
     AgentDispatcher,
     _bash_writes_outside_scope,
+    _is_blocked_command,
     _normalize_file_scope,
+    _path_matches_scope_entry,
 )
 from sdk.events import EventBus  # noqa: E402
 
@@ -346,6 +348,173 @@ class AllowedOutsideRootsTests(unittest.TestCase):
             _bash_writes_outside_scope(
                 cmd, self.scope, self.cwd, allowed_outside_roots=("/tmp",),
             ),
+        )
+
+
+class BlocklistQuotedBodyTests(unittest.TestCase):
+    """`_is_blocked_command` must not match keywords inside inert quoted / heredoc bodies.
+
+    run-phase5-runB-6e7f3779bc67 stage-1: implementer ran
+        python3 -c "content = '''-- migration with DELETE FROM users'''"
+    to build a migration SQL file. The shell command never executed SQL —
+    DELETE FROM is a literal in the Python string — but the substring scan
+    still fired and dumped the implementer into another retry loop. Blocklist
+    scanning must run on a sanitized command where quoted / heredoc bodies
+    are blanked (mirroring what _blank_quoted_regions does for redirects).
+    """
+
+    def test_real_dangerous_command_still_blocked(self):
+        self.assertIn("rm -rf /", _is_blocked_command("rm -rf /") or "")
+
+    def test_real_force_push_still_blocked(self):
+        self.assertIn(
+            "git push --force",
+            _is_blocked_command("git push --force origin main") or "",
+        )
+
+    def test_delete_from_in_double_quoted_body_not_blocked(self):
+        # python3 -c "...DELETE FROM..." — the SQL is inside a Python string.
+        cmd = 'python3 -c "content = \'-- DELETE FROM users table\'"'
+        self.assertIsNone(
+            _is_blocked_command(cmd),
+            msg="DELETE FROM inside a double-quoted body is inert",
+        )
+
+    def test_drop_table_in_node_e_body_not_blocked(self):
+        cmd = 'node -e "const sql = \'DROP TABLE tmp\'"'
+        self.assertIsNone(_is_blocked_command(cmd))
+
+    def test_delete_from_in_heredoc_body_not_blocked(self):
+        cmd = "cat <<EOF\n-- Migration with DELETE FROM users\nEOF"
+        self.assertIsNone(
+            _is_blocked_command(cmd),
+            msg="heredoc body is inert stdin data, not executed SQL",
+        )
+
+    def test_drop_table_in_quoted_heredoc_delim_not_blocked(self):
+        cmd = "cat <<'EOF'\nDROP TABLE users;\nEOF"
+        self.assertIsNone(_is_blocked_command(cmd))
+
+    def test_delete_from_in_indented_heredoc_body_not_blocked(self):
+        cmd = "cat <<-EOF\n\tDELETE FROM things\n\tEOF"
+        self.assertIsNone(_is_blocked_command(cmd))
+
+    def test_delete_from_outside_quotes_still_blocked(self):
+        # A real psql invocation with SQL on the command line — this IS
+        # executing SQL, so the blocklist must still catch it.
+        cmd = "echo stash; DELETE FROM users"
+        self.assertIn(
+            "DELETE FROM",
+            _is_blocked_command(cmd) or "",
+            msg="DELETE FROM in raw shell (outside any quoting) must still block",
+        )
+
+    def test_rm_rf_in_comment_is_allowed(self):
+        # `# rm -rf /` on a commented-out line should pass — the comment
+        # blanker already protects this case, but guard against regressions.
+        cmd = "# rm -rf / is dangerous\necho ok"
+        self.assertIsNone(_is_blocked_command(cmd))
+
+
+class ScopePlaceholderMatchTests(unittest.TestCase):
+    """`_path_matches_scope_entry` supports <timestamp> / <date> placeholders.
+
+    run-phase5-runB-6e7f3779bc67: planner declared scope as
+        apps/backend/prisma/migrations/<timestamp>_add_projectchat_threadid/migration.sql
+    but implementer generated a real timestamp path
+        apps/backend/prisma/migrations/20260422000000_add_projectchat_threadid/migration.sql
+    so literal-string matching denied every write. Scope matching must
+    treat <timestamp> as \\d{14} and <date> as \\d{8}.
+    """
+
+    def test_exact_literal_match(self):
+        self.assertTrue(_path_matches_scope_entry("apps/x.ts", "apps/x.ts"))
+
+    def test_subtree_match(self):
+        self.assertTrue(_path_matches_scope_entry("apps/x/y.ts", "apps/x"))
+
+    def test_trailing_slash_subtree_match(self):
+        self.assertTrue(_path_matches_scope_entry("apps/x/y.ts", "apps/x/"))
+
+    def test_non_match(self):
+        self.assertFalse(_path_matches_scope_entry("apps/y.ts", "apps/x.ts"))
+
+    def test_prefix_but_not_subtree(self):
+        # "apps/xy.ts" shouldn't match "apps/x" — that's prefix but not /-separated
+        self.assertFalse(_path_matches_scope_entry("apps/xy.ts", "apps/x"))
+
+    def test_timestamp_placeholder_matches_real_prisma_migration(self):
+        path = (
+            "apps/backend/prisma/migrations/"
+            "20260422000000_add_projectchat_threadid/migration.sql"
+        )
+        entry = (
+            "apps/backend/prisma/migrations/"
+            "<timestamp>_add_projectchat_threadid/migration.sql"
+        )
+        self.assertTrue(_path_matches_scope_entry(path, entry))
+
+    def test_timestamp_placeholder_rejects_non_digit_segment(self):
+        path = "apps/prisma/migrations/abc_add_thread/migration.sql"
+        entry = "apps/prisma/migrations/<timestamp>_add_thread/migration.sql"
+        self.assertFalse(_path_matches_scope_entry(path, entry))
+
+    def test_timestamp_placeholder_rejects_wrong_digit_count(self):
+        # <timestamp> requires exactly 14 digits (prisma convention).
+        path = "apps/prisma/migrations/123_add_thread/migration.sql"
+        entry = "apps/prisma/migrations/<timestamp>_add_thread/migration.sql"
+        self.assertFalse(_path_matches_scope_entry(path, entry))
+
+    def test_date_placeholder_matches_eight_digits(self):
+        path = "apps/backend/migrations/20260422_init.sql"
+        entry = "apps/backend/migrations/<date>_init.sql"
+        self.assertTrue(_path_matches_scope_entry(path, entry))
+
+    def test_date_placeholder_rejects_shorter_digit_run(self):
+        path = "apps/backend/migrations/2026_init.sql"
+        entry = "apps/backend/migrations/<date>_init.sql"
+        self.assertFalse(_path_matches_scope_entry(path, entry))
+
+    def test_placeholder_subtree_match(self):
+        # Entry points to a migration DIRECTORY; anything under it matches.
+        path = "apps/prisma/migrations/20260422000000_foo/migration.sql"
+        entry = "apps/prisma/migrations/<timestamp>_foo"
+        self.assertTrue(_path_matches_scope_entry(path, entry))
+
+
+class BashScopePlaceholderTests(unittest.TestCase):
+    """`_bash_writes_outside_scope` honours <timestamp> / <date> placeholders too."""
+
+    def setUp(self):
+        self.cwd = str(_REPO_ROOT)
+
+    def test_bash_write_to_placeholder_resolved_path_is_allowed(self):
+        scope = [
+            "apps/backend/prisma/migrations/"
+            "<timestamp>_add_projectchat_threadid/migration.sql",
+        ]
+        cmd = (
+            "echo 'BEGIN;' > "
+            "apps/backend/prisma/migrations/"
+            "20260422000000_add_projectchat_threadid/migration.sql"
+        )
+        self.assertIsNone(
+            _bash_writes_outside_scope(cmd, scope, self.cwd),
+            msg="real-timestamp path should match <timestamp> scope entry",
+        )
+
+    def test_bash_write_to_non_matching_timestamp_path_is_denied(self):
+        scope = [
+            "apps/backend/prisma/migrations/<timestamp>_add_thing/migration.sql",
+        ]
+        cmd = (
+            "echo 'BEGIN;' > "
+            "apps/backend/prisma/migrations/abc_add_thing/migration.sql"
+        )
+        reason = _bash_writes_outside_scope(cmd, scope, self.cwd)
+        self.assertIsNotNone(
+            reason,
+            msg="non-digit prefix must not satisfy <timestamp>",
         )
 
 
