@@ -907,7 +907,15 @@ async def cmd_write_plan(
         )
         await dispatcher.query("planner", prompt, model="opus")
 
-        # Verify the planner actually wrote plan.md
+        # Verify the planner actually wrote plan.md.
+        # On a revision, the prior file is still on disk (and still above the
+        # 100-byte floor), so existence + size can't distinguish "planner
+        # rewrote the plan" from "planner hung silently and left the stale
+        # file untouched". run-phase5-runE-dbeea30dbe6d rounds 7/8 hit the
+        # latter and recycled the stale plan back to codex, producing an
+        # infinite revision loop. Byte-compare against the pre-dispatch
+        # snapshot — mtime isn't reliable (filesystems differ on identical
+        # rewrites) and a no-op touch is just as bad as no touch.
         if not plan_path.exists():
             status = "ERROR"
             error: str | None = (
@@ -918,6 +926,17 @@ async def cmd_write_plan(
             if wrote_size < 100:
                 status = "ERROR"
                 error = f"{plan_rel} is suspiciously small ({wrote_size} bytes)"
+            elif (
+                had_previous_plan
+                and previous_plan_bytes is not None
+                and plan_path.read_bytes() == previous_plan_bytes
+            ):
+                status = "ERROR"
+                error = (
+                    f"planner returned but {plan_rel} was not modified "
+                    f"(prior bytes unchanged — likely a silent session hang; "
+                    f"re-running write_plan will retry with a fresh dispatch)"
+                )
             else:
                 status = "PASS"
                 error = None
