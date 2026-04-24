@@ -9,6 +9,7 @@ Each agent gets:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -226,6 +227,121 @@ def _skipped_plan_review(reason: str) -> dict:
         "output": "",
         "reason": reason,
     }
+
+
+def _skipped_plan_fix(reason: str) -> dict:
+    """Default-shape result dict for any early-abort codex plan fix path.
+
+    Mirrors _skipped_plan_review's role for the new fix-apply flow. attempted
+    defaults to False because "skipped" means we never dispatched codex; the
+    caller can distinguish "no attempt" from "attempt that produced nothing".
+    """
+    return {
+        "attempted": False,
+        "status": "skipped",
+        "reason": reason,
+        "diff": "",
+        "summary": "",
+        "scope_ok": True,
+        "touched_other_files": [],
+        "thread_id": None,
+        "job_id": None,
+    }
+
+
+def _snapshot_dir(path: Path) -> dict[str, tuple[int, int]]:
+    """Return ``{relative_path: (mtime_ns, size)}`` for all files under ``path``.
+
+    Used to verify codex plan fix only touched plan.md within run_dir —
+    paths that appear in one snapshot but not the other, or whose
+    (mtime_ns, size) changes, are scope violations.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    if not path.exists():
+        return out
+    for p in path.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            s = p.stat()
+        except OSError:
+            continue
+        out[str(p.relative_to(path))] = (s.st_mtime_ns, s.st_size)
+    return out
+
+
+def _dir_delta(
+    before: dict[str, tuple[int, int]],
+    after: dict[str, tuple[int, int]],
+    *,
+    ignore: set[str],
+) -> list[str]:
+    """Return paths that appear in either snapshot but differ, minus ``ignore``.
+
+    Sorted for deterministic reporting in the fix result dict.
+    """
+    changed: list[str] = []
+    for p in set(before) | set(after):
+        if p in ignore:
+            continue
+        if before.get(p) != after.get(p):
+            changed.append(p)
+    return sorted(changed)
+
+
+def _unified_plan_diff(before: bytes, after: bytes, label: str) -> str:
+    """Render a unified diff of plan.md for human / main-LLM review.
+
+    Text is decoded with ``errors="replace"`` so non-UTF-8 contents still
+    produce a readable diff rather than crashing the fix flow.
+    """
+    if before == after:
+        return ""
+    before_text = before.decode("utf-8", errors="replace").splitlines(keepends=True)
+    after_text = after.decode("utf-8", errors="replace").splitlines(keepends=True)
+    return "".join(difflib.unified_diff(
+        before_text, after_text,
+        fromfile=f"a/{label}",
+        tofile=f"b/{label}",
+        n=3,
+    ))
+
+
+def _build_codex_plan_fix_prompt(plan_path: Path, findings: list[dict]) -> str:
+    """Build the codex `task --write` prompt for applying minimal fixes.
+
+    Instructs codex to edit exactly one file (plan.md at the absolute path
+    given) and to do the minimum change that addresses each finding. The
+    scope violation check in ``run_codex_plan_fix`` enforces this after the
+    fact; the prompt is what makes compliance likely in the first place.
+    """
+    findings_lines: list[str] = []
+    for i, f in enumerate(findings, start=1):
+        severity = str(f.get("severity", "")).upper() or "INFO"
+        title = str(f.get("title", "")).strip() or "(untitled finding)"
+        body = str(f.get("body", "")).strip()
+        rec = str(f.get("recommendation", "")).strip()
+        findings_lines.append(f"### {i}. [{severity}] {title}")
+        if body:
+            findings_lines.append(body)
+        if rec:
+            findings_lines.append(f"**Recommended fix**: {rec}")
+    findings_block = "\n\n".join(findings_lines) if findings_lines else "(no findings supplied)"
+
+    return (
+        f"You are addressing your own plan-review findings by editing the plan "
+        f"file directly.\n\n"
+        f"Target file (edit ONLY this one): {plan_path}\n\n"
+        "Findings to address:\n\n"
+        f"{findings_block}\n\n"
+        "Rules:\n"
+        "- Apply the minimum edit that addresses each finding. Do not rewrite the plan.\n"
+        "- Preserve unrelated sections verbatim (stages you aren't touching, overview, "
+        "unrelated success criteria).\n"
+        "- Do not create new files. Do not modify any file other than the target above.\n"
+        "- Do not touch plan.json, .ai/runs/**/jobs/**, or anything outside the plan.md.\n"
+        "- When done, respond with a 1-3 sentence summary of the changes made.\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2182,6 +2298,197 @@ class AgentDispatcher:
             "job_id": job_id,
             "thread_id": thread_id_str,
         }
+
+    async def run_codex_plan_fix(
+        self,
+        plan_path: Path,
+        findings: list[dict],
+        *,
+        resume_thread_id: str | None = None,
+    ) -> dict:
+        """Dispatch codex to minimally edit plan.md addressing the given findings.
+
+        Runs the same background-launch + poll + fetch pipeline as
+        ``run_codex_plan_review``, but with ``--write`` so codex can edit
+        plan.md, and with pre/post snapshots of the run_dir to catch scope
+        violations (codex touching anything besides plan.md).
+
+        Returns:
+            dict with keys:
+              - attempted (bool): False when prereqs missing or launch failed
+              - status (str): "completed" | "failed" | "cancelled" | "running" | "skipped"
+              - reason (str): diagnostic blurb when status != completed
+              - diff (str): unified diff of plan.md (empty when no changes)
+              - summary (str): codex's final text message
+              - scope_ok (bool): True when only plan.md changed under run_dir
+              - touched_other_files (list[str]): run-dir-relative paths codex
+                modified outside plan.md (empty on success)
+              - thread_id (str | None): codex thread id for subsequent resume
+              - job_id (str | None): codex job id
+
+        Purpose: replace the planner-revision round-trip. After codex review
+        surfaces findings, let codex itself apply the patch; the main LLM
+        evaluates the diff and either approves or pauses for user review.
+        """
+        await self.bus.emit(AgentStarted(agent="codex-plan-fix", model="haiku"))
+        t0 = time.time()
+        result: dict = {
+            "attempted": False,
+            "status": "skipped",
+            "reason": "",
+            "diff": "",
+            "summary": "",
+            "scope_ok": True,
+            "touched_other_files": [],
+            "thread_id": None,
+            "job_id": None,
+        }
+        try:
+            result = await self._run_codex_plan_fix_inner(
+                plan_path, findings, resume_thread_id=resume_thread_id,
+            )
+            return result
+        finally:
+            summary_parts: list[str] = [f"status={result.get('status', 'unknown')}"]
+            if result.get("attempted") and result.get("status") == "completed":
+                summary_parts.append(
+                    "diff=empty" if not result.get("diff") else "diff=present"
+                )
+                if not result.get("scope_ok", True):
+                    summary_parts.append("scope=violated")
+            await self.bus.emit(AgentCompleted(
+                agent="codex-plan-fix",
+                duration_s=round(time.time() - t0, 1),
+                result_summary=" ".join(summary_parts),
+            ))
+
+    async def _run_codex_plan_fix_inner(
+        self,
+        plan_path: Path,
+        findings: list[dict],
+        *,
+        resume_thread_id: str | None,
+    ) -> dict:
+        codex_plugin_root, companion_script, reason = self._resolve_codex_companion()
+        if not codex_plugin_root or not companion_script:
+            return _skipped_plan_fix(reason or "codex plugin not found")
+
+        run_dir = plan_path.parent
+        plan_rel_in_run = plan_path.name
+
+        pre_plan_bytes = plan_path.read_bytes() if plan_path.exists() else b""
+        pre_snapshot = _snapshot_dir(run_dir)
+
+        prompt_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                suffix=".prompt.txt",
+                prefix=".codex-plan-fix-",
+                dir=self.cwd,
+                delete=False,
+            ) as handle:
+                handle.write(_build_codex_plan_fix_prompt(plan_path, findings))
+                prompt_path = handle.name
+
+            should_resume = False
+            if resume_thread_id:
+                candidate_thread_id = await self._codex_task_resume_candidate_thread_id(companion_script)
+                should_resume = candidate_thread_id == resume_thread_id
+
+            task_args = [
+                "--json",
+                "--background",
+                "--write",
+                "--cwd", self.cwd,
+                "--prompt-file", prompt_path,
+            ]
+            if should_resume:
+                task_args.append("--resume-last")
+
+            launch = await self._run_codex_json_subcommand(
+                companion_script, "task", task_args, timeout_s=30.0,
+            )
+            if not launch or not launch.get("jobId"):
+                return _skipped_plan_fix("codex background launch failed")
+
+            job_id = str(launch["jobId"])
+            launch_thread_id = launch.get("threadId")
+
+            job, terminal = await self._poll_codex_job(companion_script, job_id)
+            job_state = job.get("status") if job else None
+            thread_id = (job.get("threadId") if job else None) or launch_thread_id
+            thread_id_str = str(thread_id) if thread_id else None
+
+            post_plan_bytes = plan_path.read_bytes() if plan_path.exists() else b""
+            post_snapshot = _snapshot_dir(run_dir)
+            diff = _unified_plan_diff(pre_plan_bytes, post_plan_bytes, plan_rel_in_run)
+            touched = _dir_delta(pre_snapshot, post_snapshot, ignore={plan_rel_in_run})
+            scope_ok = len(touched) == 0
+
+            if not terminal:
+                return {
+                    "attempted": True,
+                    "status": "running",
+                    "reason": f"codex plan fix still running after {int(_PLAN_REVIEW_TIMEOUT_S)} seconds",
+                    "diff": diff,
+                    "summary": "",
+                    "scope_ok": scope_ok,
+                    "touched_other_files": touched,
+                    "thread_id": thread_id_str,
+                    "job_id": job_id,
+                }
+
+            if job_state in ("failed", "cancelled"):
+                err = (job.get("error") if job else None) or (job.get("failureMessage") if job else None) or ""
+                return {
+                    "attempted": True,
+                    "status": job_state,
+                    "reason": f"codex plan fix {job_state}" + (f": {err}" if err else ""),
+                    "diff": diff,
+                    "summary": "",
+                    "scope_ok": scope_ok,
+                    "touched_other_files": touched,
+                    "thread_id": thread_id_str,
+                    "job_id": job_id,
+                }
+
+            # Terminal + completed — fetch the final message for context.
+            result_payload = await self._run_codex_json_subcommand(
+                companion_script, "result",
+                [job_id, "--json", "--cwd", self.cwd],
+                timeout_s=10.0,
+            )
+            stored_job = (result_payload or {}).get("storedJob") or {}
+            stored_result = stored_job.get("result") or {}
+            final_message = str(
+                stored_result.get("finalMessage")
+                or stored_result.get("rawOutput")
+                or ""
+            )
+
+            return {
+                "attempted": True,
+                "status": "completed",
+                "reason": "",
+                "diff": diff,
+                "summary": final_message,
+                "scope_ok": scope_ok,
+                "touched_other_files": touched,
+                "thread_id": thread_id_str,
+                "job_id": job_id,
+            }
+        except RateLimitError:
+            raise
+        except Exception as exc:
+            return _skipped_plan_fix(f"codex plan fix failed: {exc}")
+        finally:
+            if prompt_path:
+                try:
+                    Path(prompt_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
         """Query codex for a previously-launched plan review job.
