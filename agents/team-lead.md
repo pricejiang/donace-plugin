@@ -110,7 +110,8 @@ there's no point dispatching run_jobs against a broken plan.
 | signal | what it means | action |
 |---|---|---|
 | `jobs_completed["plan"] == "PENDING"` or `plan.json` has `codex_review.status == "running"` | Codex plan review is still queued/running | Run `plan_status`. If it is still running, wait and run `plan_status` again. Do NOT dispatch stages until the plan job becomes PASS. |
-| `jobs_completed["plan"] == "REVIEW"` | Codex flagged the plan | **Abort — tell the user to run `/donace:plan <run-id>` to revise.** You do NOT revise plans during execute. |
+| `jobs_completed["plan"] == "AWAIT_APPROVAL"` | Codex flagged issues AND applied an auto-fix; the plan LLM in `/donace:plan` must approve or reject before execute can start | **Abort — tell the user to run `/donace:plan <run-id>` to land Claude's approve/reject verdict on codex's fix diff.** Execute must not dispatch stages against an unapproved fix. |
+| `jobs_completed["plan"] == "REVIEW"` | Codex flagged the plan (either no auto-fix was attempted, or Claude rejected the auto-fix) | **Abort — tell the user to run `/donace:plan <run-id>` to revise.** You do NOT revise plans during execute. |
 | `stages_total > 0` and `stages_passed == stages_total` and `stages_blocked == 0` | Every planned stage PASSed but run_complete never ran | Just call `run_complete --run-id <id>`. No re-running stages. |
 | `0 < stages_passed < stages_total` | Prior session died mid-stages | Resume: identify remaining stages from `jobs_completed` keys (format `run_job:<stage_id>`), dispatch `run_job` serially for the ones NOT in that dict. Don't re-run completed ones. |
 | `stages_passed == 0` and `plan_done == true` and plan status is `PASS` | plan.json written, stages not yet started (will show as `not_started` in the state column) | Dispatch `run_job` serially for every stage in plan.json. |
@@ -139,9 +140,14 @@ Interpret the printed JSON:
 
 - `status: "no-op"` → nothing to do (review was already terminal)
 - `status: "updated"` + `codex_status: "completed"` → plan.json now
-  has real findings. Re-read it. If `has_major_issues: true`,
-  **abort** and tell user to run `/donace:plan <run-id>` to revise,
-  same as the `REVIEW` verdict handling above.
+  has real findings and (when findings exist) codex's own auto-fix
+  attempt under `codex_review.fix`. Re-read the printed JSON's
+  `plan_status`:
+    - `PASS` → proceed to Step 2.
+    - `AWAIT_APPROVAL` → **abort** and tell user to run `/donace:plan <run-id>`
+      so Claude can approve or reject codex's fix diff.
+    - `REVIEW` → **abort** and tell user to run `/donace:plan <run-id>` to
+      revise manually (same handling as the REVIEW row above).
 - `status: "still-running"` → codex hasn't finished yet. Wait a few
   minutes and re-invoke `plan_status`. Do NOT proceed while findings
   are pending.

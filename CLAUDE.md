@@ -43,14 +43,21 @@ python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" <subcommand> [args]
 ```
 
 Available subcommands: `run_start`, `run_complete`, `list_runs`, `mark`,
-`write_plan`, `plan`, `plan_status`, `run_job`, `verify`, `review`,
-`document`, `health`.
+`write_plan`, `plan`, `plan_status`, `approve_plan`, `reject_plan`,
+`run_job`, `verify`, `review`, `document`, `health`.
 
 ## Status conventions
 
 **Plan job status** (`jobs_completed["plan"]`):
-- `PASS` — codex_review terminal, no major issues → execute can dispatch stages
-- `REVIEW` — `codex_review.has_major_issues: true` → user must re-run `/donace:plan`
+- `PASS` — codex_review terminal, no major issues (or Claude explicitly
+  approved an auto-fix via `approve_plan`) → execute can dispatch stages
+- `AWAIT_APPROVAL` — codex found issues and auto-applied a clean in-scope
+  fix (`codex_review.fix`). The main LLM in `/donace:plan` must evaluate
+  the diff and call `approve_plan` → `PASS`, or `reject_plan --reason ...`
+  → `REVIEW`. Execute must not dispatch stages in this state.
+- `REVIEW` — `codex_review.has_major_issues: true` AND no clean auto-fix
+  (codex fix failed / violated scope / produced empty diff, OR Claude
+  rejected it) → user must re-run `/donace:plan` to revise manually
 - `PENDING` — `codex_review.status in {queued, running}` → team-lead runs `plan_status` to poll
 - `ERROR` — something broke; read job result JSON
 
@@ -76,6 +83,7 @@ donace calls `scripts/codex-companion.mjs`:
 |---|---|---|---|
 | `run_codex_review` (per stage) | `review` | foreground, 180s cap, via Haiku wrapper | yes |
 | `run_codex_plan_review` | `task --background --json` | direct subprocess, 600s cap, poll-then-fetch | no (bypasses wrapper) |
+| `run_codex_plan_fix` | `task --background --json --write` | direct subprocess, 600s cap, pre/post run_dir snapshot for scope check | no (bypasses wrapper) |
 | `fetch_codex_plan_review_result` | `status <job-id>` then `result <job-id>` | direct subprocess | no |
 | `_codex_task_resume_candidate_thread_id` | `task-resume-candidate` | direct subprocess | no |
 

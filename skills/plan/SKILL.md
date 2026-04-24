@@ -106,34 +106,76 @@ python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" plan \
 
 Use `run_in_background: true`. Wait for completion.
 
-Read `.ai/runs/<id>/plan.json`. Look at `codex_review.status` (PASS or REVIEW) and `codex_review.findings` (list of issues).
+Read `.ai/runs/<id>/plan.json`. Inspect two fields:
 
-## Step 6: Branch on review status
+- **`codex_review.has_major_issues`** + **`codex_review.findings`** — codex's verdict on the plan.
+- **`codex_review.fix`** (present only when findings existed) — codex's own auto-applied minimal patch. Subfields: `attempted`, `status`, `diff` (unified diff of plan.md), `summary` (codex's 1-3 sentence description), `scope_ok` (True when only plan.md changed), `touched_other_files` (scope violations).
 
-### If `codex_review.status == "PASS"`:
+Also inspect the plan job status written by `orchestrator.py plan`:
+
+- **`PASS`** — no findings, plan is clean.
+- **`AWAIT_APPROVAL`** — codex auto-fix produced a clean in-scope patch, Claude's verdict is pending. **Do not** hand off to execute — approve or reject first.
+- **`REVIEW`** — either no fix attempted or the fix failed/drifted scope. User must manually revise.
+- **`PENDING`** — codex review still running; call `plan_status` to finalize, then re-read plan.json.
+
+## Step 6: Branch on plan status
+
+### If status == `PASS`:
 
 Print the plan path and hand off:
 
 > "Plan validated. Review `.ai/runs/<id>/plan.md` — when you're ready to build, run:
-> 
+>
 > `/donace:execute <run-id>`"
 
 Then **end the skill**. Do not proceed further.
 
-### If `codex_review.status == "REVIEW"`:
+### If status == `AWAIT_APPROVAL`:
 
-Show the findings to the user and ask how to address them. Example:
+Codex flagged findings AND applied its own minimal patch. Your job: judge whether the patch actually addresses every finding without drifting scope or introducing new risk. The user is not involved in this step unless you reject.
+
+1. Re-read `.ai/runs/<id>/plan.md` — this is the **post-fix** plan on disk.
+2. Read `codex_review.findings` and `codex_review.fix.diff` from plan.json. Mentally walk each finding and confirm the diff addresses it.
+3. Decide:
+
+**Approve** when every finding is addressed by the diff AND the diff stays in scope (no unrelated section edits, no new stages inserted unless a finding demanded it, no Success Criteria rewrites that weren't requested):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" approve_plan \
+  --run-id <id> --cwd "<project>" \
+  --note "<1-2 sentence rationale, optional>"
+```
+
+This flips the plan job to `PASS`. Then hand off to `/donace:execute` (same as the PASS branch above) and end the skill.
+
+**Reject** when you see any of: finding not addressed; finding addressed in a way that introduces a new problem; diff edits sections unrelated to findings; scope_ok=False (touched other files — always reject these):
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" reject_plan \
+  --run-id <id> --cwd "<project>" \
+  --reason "<specific: which finding wasn't addressed, or what drifted>"
+```
+
+`--reason` is **mandatory** and should name the specific thing you saw, not a vague "looks off". The reason surfaces to the user so they know what to fix manually.
+
+After `reject_plan`, the plan job status is `REVIEW`. Fall through to the REVIEW branch below — loop back to Step 4 with a revision brief that includes your rejection reason.
+
+### If status == `REVIEW`:
+
+Show the findings (plus your rejection reason, if you just rejected a codex fix) to the user and ask how to address them:
 
 > "Codex flagged these issues with the plan:
-> 
+>
 > - *<finding 1>*
 > - *<finding 2>*
-> 
+>
+> *[If you rejected a codex auto-fix:]* I rejected codex's auto-fix because *<reason>*.
+>
 > How should I revise the plan?"
 
 Synthesize the user's response into a revision brief, then **loop back to Step 4** with that brief as `--task`. The `write_plan` command auto-detects the existing `plan.md` and treats the new brief as a revision directive.
 
-Keep looping Steps 4-6 until the plan passes or the user decides to abandon the run.
+Keep looping Steps 4-6 until the plan reaches PASS (direct or via approve_plan), or the user decides to abandon the run.
 
 ## Step 7: Handoff
 
