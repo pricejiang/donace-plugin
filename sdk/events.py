@@ -241,6 +241,39 @@ class AgentSkipped(Event):
         self.type = "agent.skipped"
 
 
+@dataclass
+class AgentStalled(Event):
+    """Soft idle warning. Emitted once when an agent's idle stretch crosses
+    the soft threshold; the dispatcher keeps waiting until the hard
+    threshold or until a `.continue`/`.kill` marker resolves the stall.
+
+    Lets the dashboard / team-lead surface stalls to the user without
+    burning a retry budget on transient slowness (e.g. opus mid-thought).
+    """
+    agent: str = ""
+    idle_s: int = 0
+    soft_threshold_s: int = 0
+    hard_threshold_s: int = 0
+    marker_path: str | None = None
+
+    def __post_init__(self) -> None:
+        self.type = "agent.stalled"
+
+
+@dataclass
+class AgentResumed(Event):
+    """Soft stall cleared. Emitted when a `.continue` marker resets the
+    idle counter, or when the agent itself emits new activity after an
+    AgentStalled warning. Pairs with AgentStalled for dashboard timeline.
+    """
+    agent: str = ""
+    waited_s: int = 0
+    via: str = ""  # "continue_marker" | "self_recovered"
+
+    def __post_init__(self) -> None:
+        self.type = "agent.resumed"
+
+
 # ---------------------------------------------------------------------------
 # Sprint events (Phase 2)
 # ---------------------------------------------------------------------------
@@ -504,6 +537,8 @@ _register("agent.started", AgentStarted)
 _register("agent.completed", AgentCompleted)
 _register("agent.failed", AgentFailed)
 _register("agent.skipped", AgentSkipped)
+_register("agent.stalled", AgentStalled)
+_register("agent.resumed", AgentResumed)
 _register("stages.announced", StagesAnnounced)
 _register("stage.changed", StageChanged)
 _register("stage.completed", StageCompleted)

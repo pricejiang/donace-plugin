@@ -1017,6 +1017,7 @@ async def cmd_write_plan(
         dispatcher = AgentDispatcher(
             agents_dir=_agents_dir(), cwd=cwd, bus=bus,
             file_scope=[str(plan_rel)],
+            run_id=run_id, job_id=job_id,
         )
         await dispatcher.query("planner", prompt, model="opus")
 
@@ -2346,6 +2347,8 @@ async def cmd_run_job(
             bus=bus,
             file_scope=file_scope,
             codex_review_base=pre_stage_sha,
+            run_id=run_id,
+            job_id=job_id,
         )
         await bus.emit(StageChanged(
             stage_name=stage.name,
@@ -2520,6 +2523,7 @@ async def cmd_verify(
         # safety net for writes that slip past the pattern detector.
         dispatcher = AgentDispatcher(
             agents_dir=_agents_dir(), cwd=cwd, bus=bus, file_scope=[],
+            run_id=run_id, job_id=job_id,
         )
 
         dummy_stage = Stage(name="Full verification", has_user_facing_changes=True)
@@ -2617,7 +2621,10 @@ async def cmd_review(
         await bus.emit(PhaseStarted(phase="wrap"))
 
         from sdk.agent_dispatch import AgentDispatcher
-        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
+        dispatcher = AgentDispatcher(
+            agents_dir=_agents_dir(), cwd=cwd, bus=bus,
+            run_id=run_id, job_id=job_id,
+        )
 
         agent_name = f"{reviewer}-reviewer"
         prompt = (
@@ -2701,7 +2708,10 @@ async def cmd_document(
         await bus.emit(PhaseStarted(phase="wrap"))
 
         from sdk.agent_dispatch import AgentDispatcher
-        dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
+        dispatcher = AgentDispatcher(
+            agents_dir=_agents_dir(), cwd=cwd, bus=bus,
+            run_id=run_id, job_id=job_id,
+        )
 
         context = _load_context(cwd, run_id, level="summary")
 

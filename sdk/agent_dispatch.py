@@ -24,6 +24,8 @@ from sdk.events import (
     AgentCompleted,
     AgentFailed,
     AgentMessage,
+    AgentResumed,
+    AgentStalled,
     AgentStarted,
     AgentTokens,
     AgentToolResult,
@@ -1454,6 +1456,8 @@ class AgentDispatcher:
         bus: EventBus,
         file_scope: list[str] | None = None,
         codex_review_base: str | None = None,
+        run_id: str | None = None,
+        job_id: str | None = None,
     ) -> None:
         if not HAS_SDK:
             raise RuntimeError(
@@ -1471,6 +1475,14 @@ class AgentDispatcher:
         # cumulative merge-base..HEAD range. Left None for verify flows and
         # anywhere else that wants the prior "full diff since main" behavior.
         self.codex_review_base = codex_review_base
+        # Optional job context. When both are set, the soft-stall watchdog
+        # writes a marker file under
+        # .ai/runs/<run_id>/jobs/<job_id>.<agent>.stalled
+        # so team-lead / main LLM can poll for stalls and prompt the user
+        # to .continue or .kill. Without them, soft warnings still emit on
+        # the EventBus but no marker is written.
+        self.run_id = run_id
+        self.job_id = job_id
         self._agent_configs: dict[str, AgentConfig] = {}
 
     def _get_config(self, agent_name: str) -> AgentConfig:
@@ -1718,25 +1730,42 @@ class AgentDispatcher:
         except Exception:
             pass  # best-effort backfill, don't crash on parse errors
 
-    # Per-agent idle threshold (seconds). Replaces the old AGENT_TIMEOUT
-    # wallclock cap: run-phase5-runB-6e7f3779bc67 killed implementer at
-    # 900s wallclock with 5 partial files still mid-edit — the agent was
-    # productive, we just ran out of budget. With idle semantics, an
-    # agent may run indefinitely as long as it keeps making observable
-    # progress: SDK stream activity, or an in-flight tool/subagent that
-    # the dispatcher knows is still running.
+    # Two-stage idle watchdog. Replaces the old single-threshold AGENT_TIMEOUT
+    # wallclock cap (run-phase5-runB-6e7f3779bc67 killed implementer at 900s
+    # wallclock with 5 partial files mid-edit — productive, just out of budget).
+    # And replaces the prior single-threshold idle cap (run-phase5-runE-dbeea30
+    # killed opus implementer at 186s — model was thinking between tool calls,
+    # not stuck). Now:
+    #   SOFT — emit AgentStalled + write `<job-id>.<agent>.stalled` marker,
+    #          KEEP WAITING.
+    #          Lets team-lead / main LLM surface the stall to the user without
+    #          burning a retry budget. Soft fires at most once per quiet stretch;
+    #          activity resuming clears it (AgentResumed via=self_recovered).
+    #   HARD — actually cancel the SDK call. Absolute upper bound when no human
+    #          is around to write a `.continue` marker.
+    # User overrides: the matching `<job-id>.<agent>.continue` next to the
+    # marker resets the timer and clears soft state; `<job-id>.<agent>.kill`
+    # forces immediate cancel.
     #
-    # Per-agent overrides exist for known-silent phases: planner
-    # dispatches Explore subagents whose work is invisible in the parent
-    # stream until tool_result returns, so its budget is looser.
-    AGENT_IDLE_TIMEOUT: dict[str, int] = {
+    # Per-agent overrides:
+    # - planner dispatches Explore subagents whose work is invisible in the
+    #   parent stream until tool_result returns, so its soft budget is looser.
+    # - implementer runs on opus; opus often spends 2-4 minutes mid-thought
+    #   between tool calls (especially with extended thinking on large stages).
+    AGENT_IDLE_SOFT_TIMEOUT: dict[str, int] = {
         "planner": 300,
+        "implementer": 360,
     }
-    DEFAULT_IDLE_TIMEOUT = 180  # 3 minutes of silence
+    AGENT_IDLE_HARD_TIMEOUT: dict[str, int] = {
+        "planner": 1200,
+        "implementer": 1800,
+    }
+    DEFAULT_IDLE_SOFT_TIMEOUT = 180  # 3 min of silence → warn
+    DEFAULT_IDLE_HARD_TIMEOUT = 900  # 15 min of silence → kill
 
-    # How often the watchdog checks last_activity. Smaller = faster kill
-    # after threshold; larger = less asyncio overhead. Kill latency
-    # beyond the threshold is bounded by this interval.
+    # How often the watchdog checks last_activity. Smaller = faster threshold
+    # crossing detection; larger = less asyncio overhead. Kill latency beyond
+    # either threshold is bounded by this interval.
     IDLE_CHECK_INTERVAL = 15.0
 
     # No max_turns limit — the idle watchdog is the safety valve.
@@ -1774,7 +1803,18 @@ class AgentDispatcher:
         """
         config = self._get_config(agent)
         model_id = _resolve_model(model or config.model)
-        idle_threshold = self.AGENT_IDLE_TIMEOUT.get(agent, self.DEFAULT_IDLE_TIMEOUT)
+        soft_threshold = self.AGENT_IDLE_SOFT_TIMEOUT.get(
+            agent, self.DEFAULT_IDLE_SOFT_TIMEOUT,
+        )
+        hard_threshold = self.AGENT_IDLE_HARD_TIMEOUT.get(
+            agent, self.DEFAULT_IDLE_HARD_TIMEOUT,
+        )
+        # Defensive: if a misconfiguration sets soft > hard, cap soft at hard so
+        # the warning still fires (and AgentStalled events still emit) right
+        # before the kill, instead of being silently skipped. Tests exploit
+        # this with both thresholds set very small to a single value.
+        if soft_threshold > hard_threshold:
+            soft_threshold = hard_threshold
 
         # Inject token budget hint into prompt (not enforced, just guidance)
         budget = self.AGENT_TOKEN_BUDGET.get(agent)
@@ -1845,7 +1885,38 @@ class AgentDispatcher:
             )
         )
 
+        # Optional stall marker paths. Only present when both run_id and
+        # job_id are set on the dispatcher (i.e. this query came from a
+        # job-tracked command like cmd_run_job). Free-standing dispatches
+        # still emit AgentStalled events but skip the marker file dance.
+        #
+        # Marker filenames include the agent because some jobs run multiple
+        # verifier agents concurrently. A shared `<job-id>.kill`/`.continue`
+        # marker would otherwise be consumed nondeterministically by whichever
+        # watchdog loop ticked first.
+        stall_marker_path: Path | None = None
+        continue_marker_path: Path | None = None
+        kill_marker_path: Path | None = None
+        if self.run_id and self.job_id:
+            jobs_dir = Path(self.cwd) / ".ai" / "runs" / self.run_id / "jobs"
+            marker_agent = re.sub(r"[^A-Za-z0-9_.-]+", "_", agent)
+            marker_stem = f"{self.job_id}.{marker_agent}"
+            stall_marker_path = jobs_dir / f"{marker_stem}.stalled"
+            continue_marker_path = jobs_dir / f"{marker_stem}.continue"
+            kill_marker_path = jobs_dir / f"{marker_stem}.kill"
+
+        def _unlink_marker(path: Path | None) -> None:
+            if path is None:
+                return
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
         stalled_idle: float | None = None
+        kill_reason: str = "hard_timeout"  # "hard_timeout" | "user_kill"
+        soft_emitted = False
+        soft_emitted_at: float = 0.0
         try:
             while True:
                 done, _pending = await asyncio.wait(
@@ -1853,19 +1924,100 @@ class AgentDispatcher:
                 )
                 if run_task in done:
                     break
-                if active_operations[0] > 0:
-                    continue
-                idle = loop.time() - last_activity[0]
-                if idle >= idle_threshold:
-                    stalled_idle = idle
+
+                # User .kill marker wins over everything — explicit human
+                # intent to stop right now.
+                if kill_marker_path is not None and kill_marker_path.exists():
+                    _unlink_marker(kill_marker_path)
+                    _unlink_marker(continue_marker_path)
+                    _unlink_marker(stall_marker_path)
+                    kill_reason = "user_kill"
+                    stalled_idle = loop.time() - last_activity[0]
                     run_task.cancel()
                     try:
                         await run_task
                     except BaseException:
                         pass
                     break
+
+                # User .continue marker resets the soft state and idle clock.
+                if continue_marker_path is not None and continue_marker_path.exists():
+                    _unlink_marker(continue_marker_path)
+                    if soft_emitted:
+                        waited = int(loop.time() - soft_emitted_at)
+                        soft_emitted = False
+                        _unlink_marker(stall_marker_path)
+                        await self.bus.emit(AgentResumed(
+                            agent=agent, waited_s=waited, via="continue_marker",
+                        ))
+                    _mark_activity()
+                    continue
+
+                if active_operations[0] > 0:
+                    # In-flight tool/subagent ⇒ not idle. If we previously
+                    # warned and the agent recovered on its own, clear the
+                    # stall state so the next quiet stretch starts fresh.
+                    if soft_emitted:
+                        waited = int(loop.time() - soft_emitted_at)
+                        soft_emitted = False
+                        _unlink_marker(stall_marker_path)
+                        await self.bus.emit(AgentResumed(
+                            agent=agent, waited_s=waited, via="self_recovered",
+                        ))
+                    continue
+
+                idle = loop.time() - last_activity[0]
+
+                # Activity resumed naturally between ticks — clear stall.
+                if soft_emitted and idle < soft_threshold:
+                    waited = int(loop.time() - soft_emitted_at)
+                    soft_emitted = False
+                    _unlink_marker(stall_marker_path)
+                    await self.bus.emit(AgentResumed(
+                        agent=agent, waited_s=waited, via="self_recovered",
+                    ))
+
+                if idle >= hard_threshold:
+                    stalled_idle = idle
+                    _unlink_marker(stall_marker_path)
+                    _unlink_marker(continue_marker_path)
+                    _unlink_marker(kill_marker_path)
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except BaseException:
+                        pass
+                    break
+
+                if idle >= soft_threshold and not soft_emitted:
+                    soft_emitted = True
+                    soft_emitted_at = loop.time()
+                    if stall_marker_path is not None:
+                        try:
+                            stall_marker_path.parent.mkdir(parents=True, exist_ok=True)
+                            stall_marker_path.write_text(json.dumps({
+                                "agent": agent,
+                                "model": model_id,
+                                "idle_s": int(idle),
+                                "soft_threshold_s": soft_threshold,
+                                "hard_threshold_s": hard_threshold,
+                                "pid": os.getpid(),
+                                "ts": time.time(),
+                            }, indent=2))
+                        except OSError:
+                            pass  # non-fatal: dashboard event still fires
+                    await self.bus.emit(AgentStalled(
+                        agent=agent,
+                        idle_s=int(idle),
+                        soft_threshold_s=soft_threshold,
+                        hard_threshold_s=hard_threshold,
+                        marker_path=str(stall_marker_path) if stall_marker_path else None,
+                    ))
         except asyncio.CancelledError:
             run_task.cancel()
+            _unlink_marker(stall_marker_path)
+            _unlink_marker(continue_marker_path)
+            _unlink_marker(kill_marker_path)
             raise
 
         if stalled_idle is not None:
@@ -1880,10 +2032,16 @@ class AgentDispatcher:
                     baseline=touched_baseline,
                     file_scope=self.file_scope,
                 )
-            error_msg = (
-                f"agent={agent} timed out "
-                f"(idle {stalled_idle:.0f}s \u2265 {idle_threshold}s threshold)"
-            )
+            if kill_reason == "user_kill":
+                error_msg = (
+                    f"agent={agent} stopped by user via .kill marker "
+                    f"(idle {stalled_idle:.0f}s)"
+                )
+            else:
+                error_msg = (
+                    f"agent={agent} timed out "
+                    f"(idle {stalled_idle:.0f}s \u2265 {hard_threshold}s threshold)"
+                )
             if touched:
                 # Cap the list — porcelain output can be long if a hung
                 # implementer touched many files; the first handful is
@@ -1894,6 +2052,12 @@ class AgentDispatcher:
                 error_msg += f" (partial writes: {preview})"
             await self.bus.emit(AgentFailed(agent=agent, error=error_msg))
             raise RuntimeError(error_msg)
+
+        # Normal completion — clean up any stale markers we may have
+        # written during a soft stall that the agent later recovered from.
+        _unlink_marker(stall_marker_path)
+        _unlink_marker(continue_marker_path)
+        _unlink_marker(kill_marker_path)
 
         try:
             result = run_task.result()

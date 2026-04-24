@@ -69,7 +69,9 @@ If you find yourself wanting to invoke one of these, stop and report to the user
 
 ### Foreground vs Background
 
-**IMPORTANT**: Long-running commands (`run_job`, `verify`, `review`, `document`) MUST use `run_in_background: true` so you can continue chatting with the user and report progress. You'll be notified when they complete.
+**IMPORTANT**: Long-running commands (`run_job`, `verify`, `review`, `document`) MUST use `run_in_background: true` so you can continue chatting with the user and report progress.
+
+**You will NOT be auto-notified when a background bash finishes.** Claude Code does not wake idle subagents on background-task completion. Poll explicitly with `BashOutput` between conversational turns, OR run a tight watch loop (`while sleep 30; do ... done`) that checks both BashOutput and `.ai/runs/<id>/jobs/*.stalled` markers. If your final message in a turn is just text like "waiting for completion", the harness ends your session — control returns to the caller, the run continues unsupervised, and the user has to drive `orchestrator.py` directly. That is the failure mode of run-phase5-runE-dbeea30dbe6d (team-lead session ended after dispatching stage-1 in background, never came back).
 
 `run_complete` is **usually** instant, BUT if you skipped the wrap phase (review and document), it will run them inline before aggregating. In that case it can take several minutes. To keep it instant, always dispatch `review` and `document` explicitly before calling `run_complete`, or run `run_complete` in the background if you're unsure.
 
@@ -167,10 +169,43 @@ Always run this once before Step 2 on any resumed run.
    Run stages **serially** — per-stage commits and codex review share git state; parallel run_jobs can contaminate review scope or cause `auto_commit` to skip because HEAD moved.
 3. Respect dependencies: do not run a stage before its dependencies PASS.
 4. Chat with the user while jobs run — keep them informed.
-5. On completion notification:
+5. **While a job is running, also poll for stall markers** (see "Stall handling" below) so you can surface long pauses to the user before the hard timeout fires.
+6. On completion notification:
    - **PASS** → continue to next stage
    - **BLOCKED** → read `.ai/runs/<id>/jobs/job-run_job-<stage-id>-*.json` for `unresolved`. Decide: retry with `--max-fix-attempts 3` if mechanical (typo, missing import), or escalate via `AskUserQuestion` if structural.
    - **INTERRUPTED** → check what was completed, decide next step.
+
+### Stall handling (NEW — replaces the old "wait silently" pattern)
+
+The dispatcher's idle watchdog is two-stage. After ~3 minutes of silence
+(longer for opus implementer / planner) the agent crosses the **soft**
+threshold: it is **not killed**, and it writes a marker file at:
+
+```
+.ai/runs/<id>/jobs/<job-id>.<agent>.stalled
+```
+
+The marker is JSON:
+```json
+{ "agent": "implementer", "model": "claude-opus-4-7", "idle_s": 187,
+  "soft_threshold_s": 360, "hard_threshold_s": 1800,
+  "pid": 12345, "ts": 1745520000.0 }
+```
+
+**Your loop while waiting on a `run_job` BashOutput**:
+```bash
+ls .ai/runs/<id>/jobs/*.stalled 2>/dev/null
+```
+If a `.stalled` marker appears, read it, then `AskUserQuestion`:
+> "Implementer has been idle 187s on stage-2 (soft threshold 360s, hard kill at 1800s). Wait / kill / give more time?"
+
+Then write the user's choice to disk **next to the marker** (NOT replacing it):
+- **wait / give more time** → replace `.stalled` with `.continue` on that marker path, e.g. `touch .ai/runs/<id>/jobs/<job-id>.<agent>.continue`. The watchdog sees this, resets the idle clock, removes both files, and the agent keeps running.
+- **kill** → replace `.stalled` with `.kill` on that marker path, e.g. `touch .ai/runs/<id>/jobs/<job-id>.<agent>.kill`. The watchdog cancels that agent's SDK call immediately. The job ends BLOCKED with `unresolved: ["agent=... stopped by user via .kill marker (idle Xs)"]`.
+- **no decision** → marker stays; if the agent recovers on its own, the dispatcher emits `agent.resumed (via=self_recovered)` and removes the marker. If silence continues to the hard threshold, the watchdog kills with `unresolved: ["agent=... timed out (idle Xs ≥ Ys threshold)"]`.
+
+Do not mistake a `.stalled` marker for a job result. The job is still
+running. Only the JSON in `jobs/<job-id>.json` is authoritative for PASS/BLOCKED/INTERRUPTED.
 
 ## Step 3: Wrap phase (after all stages PASS)
 
