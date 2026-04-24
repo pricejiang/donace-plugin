@@ -208,7 +208,7 @@ async def run_job(
         )
         if task_context:
             impl_prompt = f"{task_context}\n\n{impl_prompt}"
-        impl_output = await query(agent="implementer", prompt=impl_prompt, model="sonnet")
+        impl_output = await query(agent="implementer", prompt=impl_prompt, model="opus")
     except RateLimitError as exc:
         # Infra throttle, not a plan failure. INTERRUPTED pauses the run
         # and keeps stage-1 eligible for resume — BLOCKED would count
@@ -335,7 +335,7 @@ async def run_job(
             if task_context:
                 fix_prompt = f"{task_context}\n\n{fix_prompt}"
             fix_output = await query(
-                agent="implementer", prompt=fix_prompt, model="sonnet", role="fix",
+                agent="implementer", prompt=fix_prompt, model="opus", role="fix",
             )
         except RateLimitError as exc:
             return JobResult(

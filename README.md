@@ -8,7 +8,7 @@ Generator-Evaluator agent harness for Claude Code. Sprint-based development work
 |---|---|---|
 | **team-lead** | opus | Execution coordinator — dispatched by `/donace:execute` to run validated plans (run_job → verify → review → document → run_complete) |
 | **planner** | opus | Writes `.ai/runs/<id>/plan.md` for complex tasks — dispatched by `/donace:plan` via `write_plan` |
-| **implementer** | sonnet | Writes production code following the plan |
+| **implementer** | opus | Writes production code following the plan |
 | **test-engineer** | sonnet | Writes and runs unit tests |
 | **typescript-reviewer** | opus | Deep TypeScript/React code review |
 | **ios-reviewer** | opus | Deep iOS/Swift code review |
