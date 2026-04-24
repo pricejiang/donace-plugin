@@ -397,7 +397,7 @@ def _format_plan_review_findings(findings: Any) -> list[str]:
 # Security: command blocklist and path validation
 # ---------------------------------------------------------------------------
 
-_BLOCKED_COMMANDS = [
+_SHELL_BLOCKED_COMMANDS = [
     "rm -rf /",
     "rm -rf /*",
     "git push --force",
@@ -409,26 +409,40 @@ _BLOCKED_COMMANDS = [
     ":(){ :|:& };:",
     "prisma migrate reset",
     "prisma db push --force-reset",
+]
+
+_SQL_BLOCKED_COMMANDS = [
     "DROP DATABASE",
     "DROP TABLE",
     "TRUNCATE",
     "DELETE FROM",
 ]
 
+_BLOCKED_COMMANDS = _SHELL_BLOCKED_COMMANDS + _SQL_BLOCKED_COMMANDS
+
+_SHELL_EXECUTOR_COMMANDS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "fish"})
+_SQL_EXECUTOR_COMMANDS = frozenset({"psql", "mysql", "mariadb", "sqlite3", "duckdb"})
+_HEREDOC_EXECUTOR_COMMANDS = _SHELL_EXECUTOR_COMMANDS | _SQL_EXECUTOR_COMMANDS
+
 
 def _is_blocked_command(command: str) -> str | None:
     """Check if a command matches the blocklist. Returns reason if blocked, None if safe.
 
-    Scans a sanitized copy with quoted / heredoc bodies and shell comments
-    blanked — keywords inside ``python3 -c "..."``, ``node -e "..."``, or
-    ``cat <<EOF ... EOF`` are literal string data, not executing commands,
-    and false positives there sent run-phase5-runB implementer into retry
-    loops. The blocklist stays strict on raw shell (``psql; DROP TABLE x``
-    outside quotes still blocks).
+    Destructive shell commands are scanned after comments only. SQL keywords
+    use the quoted/data-heredoc sanitizer, except when the command is clearly
+    executing shell or SQL input (``bash -c``, ``eval``, ``psql -c``,
+    ``psql <<EOF``), where raw content is executable and must still block.
     """
-    cmd_stripped = _blank_for_blocklist(command).strip()
-    for blocked in _BLOCKED_COMMANDS:
-        if blocked in cmd_stripped:
+    comment_blanked = _blank_shell_comments(command).strip()
+
+    for blocked in _SHELL_BLOCKED_COMMANDS:
+        if blocked in comment_blanked:
+            return f"blocked: '{blocked}' is not allowed in automated execution"
+
+    sql_scan = _blank_for_blocklist(command).strip()
+    raw_sql_scan = comment_blanked if _has_executable_sql_context(command) else ""
+    for blocked in _SQL_BLOCKED_COMMANDS:
+        if blocked in sql_scan or (raw_sql_scan and blocked in raw_sql_scan):
             return f"blocked: '{blocked}' is not allowed in automated execution"
     return None
 
@@ -778,7 +792,76 @@ _HEREDOC_START_RE = re.compile(
 )
 
 
-def _blank_heredoc_bodies(command: str) -> str:
+def _leading_command_name(segment: str) -> str:
+    """Return the command word at the start of a shell segment."""
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        tokens = segment.split()
+
+    for tok in tokens:
+        if tok in ("env", "command"):
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            continue
+        if tok in _SHELL_OPS or tok.startswith(("<", ">")):
+            continue
+        if tok.startswith("-"):
+            continue
+        return os.path.basename(tok)
+    return ""
+
+
+def _command_name_before_index(searchable: str, index: int) -> str:
+    """Return the command receiving a heredoc opener at ``index``."""
+    line_start = searchable.rfind("\n", 0, index) + 1
+    prefix = searchable[line_start:index]
+    segment = re.split(r"(?:&&|\|\||[;|&])", prefix)[-1]
+    return _leading_command_name(segment)
+
+
+def _iter_command_segments(searchable: str) -> list[tuple[str, str]]:
+    """Return ``(command_name, segment)`` pairs from a shell-ish command string."""
+    segments: list[tuple[str, str]] = []
+    for line in searchable.splitlines():
+        for segment in re.split(r"(?:&&|\|\||[;|&])", line):
+            name = _leading_command_name(segment)
+            if name:
+                segments.append((name, segment))
+    return segments
+
+
+def _shell_segment_runs_string(segment: str) -> bool:
+    """True for shell invocations that execute a string argument."""
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        tokens = segment.split()
+    return any(tok == "-c" or (tok.startswith("-") and "c" in tok[1:]) for tok in tokens[1:])
+
+
+def _has_executable_sql_context(command: str) -> bool:
+    """True when SQL keywords in quotes/heredocs can be executed by this command."""
+    searchable = _blank_quoted_regions(
+        _blank_heredoc_bodies(command, preserve_for_commands=_HEREDOC_EXECUTOR_COMMANDS)
+    )
+    for name, segment in _iter_command_segments(searchable):
+        if name in _SQL_EXECUTOR_COMMANDS:
+            return True
+        if name == "eval":
+            return True
+        if name in _SHELL_EXECUTOR_COMMANDS and (
+            "<<" in segment or _shell_segment_runs_string(segment)
+        ):
+            return True
+    return False
+
+
+def _blank_heredoc_bodies(
+    command: str,
+    *,
+    preserve_for_commands: frozenset[str] = frozenset(),
+) -> str:
     """Blank the body of ``<<DELIM`` heredocs so substring scans skip inert data.
 
     run-phase5-runB stage-1 tried ``cat <<EOF\\n-- DELETE FROM things\\nEOF`` —
@@ -789,11 +872,15 @@ def _blank_heredoc_bodies(command: str) -> str:
     inert content.
     """
     out = list(command)
+    heredoc_opener_scan = _blank_quoted_regions(command)
     pos = 0
     while pos < len(command):
         m = _HEREDOC_START_RE.search(command, pos)
         if m is None:
             break
+        if heredoc_opener_scan[m.start():m.start() + 2] != "<<":
+            pos = m.end()
+            continue
         allow_indent = m.group(1) == "-"
         delim = next(g for g in (m.group(2), m.group(3), m.group(4), m.group(5)) if g)
         nl = command.find("\n", m.end())
@@ -818,22 +905,25 @@ def _blank_heredoc_bodies(command: str) -> str:
         # the heredoc never terminates (malformed command; treat the rest
         # as body so we don't leave keywords exposed).
         body_end = terminator_at if terminator_at is not None else len(command)
-        for j in range(body_start, body_end):
-            if command[j] != "\n":
-                out[j] = " "
+        command_name = _command_name_before_index(heredoc_opener_scan, m.start())
+        if command_name not in preserve_for_commands:
+            for j in range(body_start, body_end):
+                if command[j] != "\n":
+                    out[j] = " "
         pos = body_end
     return "".join(out)
 
 
 def _blank_for_blocklist(command: str) -> str:
-    """Sanitize a command before running it through the blocklist substring scan.
+    """Sanitize SQL/data text before running it through the SQL blocklist scan.
 
-    Chains the existing blanker helpers so that quoted bodies (``python3 -c
-    "..."``, ``node -e "..."``), shell comments, and heredoc bodies no
-    longer feed the blocklist. Keeps the blocklist honest on real shell
-    invocations outside any quoting.
+    Quoted bodies and data heredocs are skipped to avoid migration-content
+    false positives. Heredocs fed to shell/SQL executors are preserved because
+    their stdin is executable.
     """
-    return _blank_quoted_regions(_blank_heredoc_bodies(command))
+    return _blank_quoted_regions(
+        _blank_heredoc_bodies(command, preserve_for_commands=_HEREDOC_EXECUTOR_COMMANDS)
+    )
 
 
 def _extract_shell_word(command: str, start: int) -> str:

@@ -359,8 +359,8 @@ class BlocklistQuotedBodyTests(unittest.TestCase):
     to build a migration SQL file. The shell command never executed SQL —
     DELETE FROM is a literal in the Python string — but the substring scan
     still fired and dumped the implementer into another retry loop. Blocklist
-    scanning must run on a sanitized command where quoted / heredoc bodies
-    are blanked (mirroring what _blank_quoted_regions does for redirects).
+    scanning must skip inert quoted / data-heredoc bodies without hiding
+    payloads that shell or SQL interpreters will execute.
     """
 
     def test_real_dangerous_command_still_blocked(self):
@@ -398,6 +398,34 @@ class BlocklistQuotedBodyTests(unittest.TestCase):
     def test_delete_from_in_indented_heredoc_body_not_blocked(self):
         cmd = "cat <<-EOF\n\tDELETE FROM things\n\tEOF"
         self.assertIsNone(_is_blocked_command(cmd))
+
+    def test_bash_c_quoted_dangerous_command_is_blocked(self):
+        cmd = 'bash -c "rm -rf /"'
+        self.assertIn("rm -rf /", _is_blocked_command(cmd) or "")
+
+    def test_eval_single_quoted_dangerous_command_is_blocked(self):
+        cmd = "eval 'git reset --hard'"
+        self.assertIn("git reset --hard", _is_blocked_command(cmd) or "")
+
+    def test_double_quoted_command_substitution_is_blocked(self):
+        cmd = 'echo "$(rm -rf /)"'
+        self.assertIn("rm -rf /", _is_blocked_command(cmd) or "")
+
+    def test_bash_heredoc_body_is_blocked(self):
+        cmd = "bash <<EOF\nrm -rf /\nEOF"
+        self.assertIn("rm -rf /", _is_blocked_command(cmd) or "")
+
+    def test_psql_heredoc_body_is_blocked(self):
+        cmd = "psql <<EOF\nDROP TABLE users;\nEOF"
+        self.assertIn("DROP TABLE", _is_blocked_command(cmd) or "")
+
+    def test_psql_c_quoted_sql_is_blocked(self):
+        cmd = 'psql -c "DROP TABLE users;"'
+        self.assertIn("DROP TABLE", _is_blocked_command(cmd) or "")
+
+    def test_fake_heredoc_inside_quotes_does_not_hide_later_command(self):
+        cmd = 'echo "<<EOF\nnot a heredoc"; rm -rf /'
+        self.assertIn("rm -rf /", _is_blocked_command(cmd) or "")
 
     def test_delete_from_outside_quotes_still_blocked(self):
         # A real psql invocation with SQL on the command line — this IS
