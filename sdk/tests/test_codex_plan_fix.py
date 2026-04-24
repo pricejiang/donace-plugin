@@ -9,8 +9,8 @@ return the diff, and hand it to the main LLM for sanity-checking. Only
 pause for user intervention when the LLM isn't satisfied with the diff.
 
 This file covers the dispatcher-level piece only — the `run_codex_plan_fix`
-method that wraps `codex task --write` and verifies scope (only plan.md
-changed under the run_dir). The cmd_plan / skill-side wiring lands in
+method that wraps `codex task --write` and verifies scope across the cwd
+(only plan.md may change). The cmd_plan / skill-side wiring lands in
 follow-up commits.
 
 Runs with stdlib unittest. Invoke from repo root:
@@ -24,6 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -93,6 +94,8 @@ class _PlanFixSeam:
             return {"job": job}
         if subcommand == "result":
             return {"storedJob": {"result": {"finalMessage": self.final_message}}}
+        if subcommand == "cancel":
+            return {"jobId": self.job_id, "status": "cancelled"}
         return None
 
     def first_task_args(self) -> list[str] | None:
@@ -258,10 +261,34 @@ class PlanFixBasicsTests(unittest.TestCase):
         ))
 
         self.assertFalse(result["scope_ok"])
-        self.assertIn("plan.json", result["touched_other_files"])
+        self.assertIn(
+            str(plan_json.relative_to(self.tmpdir)),
+            result["touched_other_files"],
+        )
         # Diff is still populated — caller might still want to see what codex
         # tried to do before rejecting.
         self.assertIn("revised per codex findings", result["diff"])
+
+    def test_scope_violation_when_project_file_outside_run_dir_touched(self):
+        """Scope check covers the whole project cwd, not just .ai/runs/<id>."""
+        dispatcher = self._make_dispatcher()
+        source_file = self.tmpdir / "apps" / "web" / "feature.ts"
+        seam = _PlanFixSeam(file_mutations=[
+            (self.plan_path, _FIXED_PLAN.encode()),
+            (source_file, b"export const leaked = true;\n"),
+        ])
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
+
+        result = self._run(dispatcher.run_codex_plan_fix(
+            plan_path=self.plan_path,
+            findings=_FINDINGS_SAMPLE,
+        ))
+
+        self.assertFalse(result["scope_ok"])
+        self.assertIn(
+            str(source_file.relative_to(self.tmpdir)),
+            result["touched_other_files"],
+        )
 
     def test_scope_violation_when_new_file_created_in_run_dir(self):
         """Scope check catches file creation, not just modification."""
@@ -279,7 +306,26 @@ class PlanFixBasicsTests(unittest.TestCase):
         ))
 
         self.assertFalse(result["scope_ok"])
-        self.assertIn("notes.md", result["touched_other_files"])
+        self.assertIn(
+            str(stray.relative_to(self.tmpdir)),
+            result["touched_other_files"],
+        )
+
+    def test_timeout_cancels_background_write_task(self):
+        """A timed-out --write task must be cancelled so it cannot keep editing."""
+        dispatcher = self._make_dispatcher()
+        seam = _PlanFixSeam(file_mutations=[(self.plan_path, _FIXED_PLAN.encode())])
+        dispatcher._run_codex_json_subcommand = seam  # type: ignore[method-assign]
+
+        with patch("sdk.agent_dispatch._PLAN_REVIEW_TIMEOUT_S", 0.0):
+            result = self._run(dispatcher.run_codex_plan_fix(
+                plan_path=self.plan_path,
+                findings=_FINDINGS_SAMPLE,
+            ))
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertTrue(any(subcommand == "cancel" for subcommand, _ in seam.calls))
+        self.assertIn("cancelled", result["reason"])
 
     # ------------------------------------------------------------------
     # Failure modes

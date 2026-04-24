@@ -244,6 +244,26 @@ class CmdRejectPlanTests(unittest.TestCase):
         ))
         self.assertEqual(result["status"], "error")
 
+    def test_rejected_fix_cannot_be_approved_later(self):
+        """Once Claude rejects a codex fix, approve_plan must not resurrect it."""
+        self._run(commands.cmd_reject_plan(
+            cwd=str(self.tmpdir), run_id=self.run_id,
+            dashboard_url=None, reason="Diff missed the test-coverage finding",
+        ))
+
+        result = self._run(commands.cmd_approve_plan(
+            cwd=str(self.tmpdir), run_id=self.run_id,
+            dashboard_url=None, note="changed my mind",
+        ))
+
+        self.assertEqual(result["status"], "error")
+        plan_json = self._plan_json()
+        self.assertTrue(plan_json["codex_review"]["has_major_issues"])
+        self.assertEqual(
+            plan_json["codex_review"]["fix"]["verdict"], "rejected",
+        )
+        self.assertEqual(self._latest_plan_job_status(), "REVIEW")
+
 
 if __name__ == "__main__":
     unittest.main()

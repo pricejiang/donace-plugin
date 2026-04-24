@@ -210,6 +210,7 @@ def _plan_status_from_codex_review(codex_review: dict[str, Any]) -> str:
             and fix.get("status") == "completed"
             and fix.get("scope_ok")
             and fix.get("diff")
+            and not fix.get("verdict")
         ):
             return "AWAIT_APPROVAL"
         return "REVIEW"
@@ -2081,6 +2082,8 @@ def _await_approval_fix_payload(plan_json: dict) -> dict | None:
     if not fix.get("scope_ok"):
         return None
     if not fix.get("diff"):
+        return None
+    if fix.get("verdict"):
         return None
     return fix
 

@@ -252,7 +252,7 @@ def _skipped_plan_fix(reason: str) -> dict:
 def _snapshot_dir(path: Path) -> dict[str, tuple[int, int]]:
     """Return ``{relative_path: (mtime_ns, size)}`` for all files under ``path``.
 
-    Used to verify codex plan fix only touched plan.md within run_dir —
+    Used to verify codex plan fix only touched plan.md within cwd —
     paths that appear in one snapshot but not the other, or whose
     (mtime_ns, size) changes, are scope violations.
     """
@@ -260,6 +260,8 @@ def _snapshot_dir(path: Path) -> dict[str, tuple[int, int]]:
     if not path.exists():
         return out
     for p in path.rglob("*"):
+        if ".git" in p.parts:
+            continue
         if not p.is_file():
             continue
         try:
@@ -2310,7 +2312,7 @@ class AgentDispatcher:
 
         Runs the same background-launch + poll + fetch pipeline as
         ``run_codex_plan_review``, but with ``--write`` so codex can edit
-        plan.md, and with pre/post snapshots of the run_dir to catch scope
+        plan.md, and with pre/post snapshots of the cwd to catch scope
         violations (codex touching anything besides plan.md).
 
         Returns:
@@ -2320,8 +2322,8 @@ class AgentDispatcher:
               - reason (str): diagnostic blurb when status != completed
               - diff (str): unified diff of plan.md (empty when no changes)
               - summary (str): codex's final text message
-              - scope_ok (bool): True when only plan.md changed under run_dir
-              - touched_other_files (list[str]): run-dir-relative paths codex
+              - scope_ok (bool): True when only plan.md changed under cwd
+              - touched_other_files (list[str]): cwd-relative paths codex
                 modified outside plan.md (empty on success)
               - thread_id (str | None): codex thread id for subsequent resume
               - job_id (str | None): codex job id
@@ -2373,11 +2375,13 @@ class AgentDispatcher:
         if not codex_plugin_root or not companion_script:
             return _skipped_plan_fix(reason or "codex plugin not found")
 
-        run_dir = plan_path.parent
-        plan_rel_in_run = plan_path.name
-
-        pre_plan_bytes = plan_path.read_bytes() if plan_path.exists() else b""
-        pre_snapshot = _snapshot_dir(run_dir)
+        scope_root = Path(self.cwd).resolve()
+        plan_abs = plan_path.resolve()
+        try:
+            plan_rel_in_scope = str(plan_abs.relative_to(scope_root))
+        except ValueError:
+            plan_rel_in_scope = str(plan_abs)
+        plan_diff_label = plan_path.name
 
         prompt_path: str | None = None
         try:
@@ -2391,6 +2395,9 @@ class AgentDispatcher:
             ) as handle:
                 handle.write(_build_codex_plan_fix_prompt(plan_path, findings))
                 prompt_path = handle.name
+
+            pre_plan_bytes = plan_path.read_bytes() if plan_path.exists() else b""
+            pre_snapshot = _snapshot_dir(scope_root)
 
             should_resume = False
             if resume_thread_id:
@@ -2421,24 +2428,42 @@ class AgentDispatcher:
             thread_id = (job.get("threadId") if job else None) or launch_thread_id
             thread_id_str = str(thread_id) if thread_id else None
 
-            post_plan_bytes = plan_path.read_bytes() if plan_path.exists() else b""
-            post_snapshot = _snapshot_dir(run_dir)
-            diff = _unified_plan_diff(pre_plan_bytes, post_plan_bytes, plan_rel_in_run)
-            touched = _dir_delta(pre_snapshot, post_snapshot, ignore={plan_rel_in_run})
-            scope_ok = len(touched) == 0
+            def collect_scope_result() -> dict:
+                post_plan_bytes = plan_path.read_bytes() if plan_path.exists() else b""
+                post_snapshot = _snapshot_dir(scope_root)
+                touched = _dir_delta(
+                    pre_snapshot, post_snapshot, ignore={plan_rel_in_scope},
+                )
+                return {
+                    "diff": _unified_plan_diff(
+                        pre_plan_bytes, post_plan_bytes, plan_diff_label,
+                    ),
+                    "scope_ok": len(touched) == 0,
+                    "touched_other_files": touched,
+                }
 
             if not terminal:
+                cancel_payload = await self._run_codex_json_subcommand(
+                    companion_script, "cancel",
+                    [job_id, "--json", "--cwd", self.cwd],
+                    timeout_s=10.0,
+                )
+                cancelled = (cancel_payload or {}).get("status") == "cancelled"
+                scope_result = collect_scope_result()
                 return {
                     "attempted": True,
-                    "status": "running",
-                    "reason": f"codex plan fix still running after {int(_PLAN_REVIEW_TIMEOUT_S)} seconds",
-                    "diff": diff,
+                    "status": "cancelled" if cancelled else "running",
+                    "reason": (
+                        f"codex plan fix timed out after {int(_PLAN_REVIEW_TIMEOUT_S)} seconds"
+                        + (" and was cancelled" if cancelled else "; cancel failed")
+                    ),
                     "summary": "",
-                    "scope_ok": scope_ok,
-                    "touched_other_files": touched,
                     "thread_id": thread_id_str,
                     "job_id": job_id,
+                    **scope_result,
                 }
+
+            scope_result = collect_scope_result()
 
             if job_state in ("failed", "cancelled"):
                 err = (job.get("error") if job else None) or (job.get("failureMessage") if job else None) or ""
@@ -2446,12 +2471,10 @@ class AgentDispatcher:
                     "attempted": True,
                     "status": job_state,
                     "reason": f"codex plan fix {job_state}" + (f": {err}" if err else ""),
-                    "diff": diff,
                     "summary": "",
-                    "scope_ok": scope_ok,
-                    "touched_other_files": touched,
                     "thread_id": thread_id_str,
                     "job_id": job_id,
+                    **scope_result,
                 }
 
             # Terminal + completed — fetch the final message for context.
@@ -2472,12 +2495,10 @@ class AgentDispatcher:
                 "attempted": True,
                 "status": "completed",
                 "reason": "",
-                "diff": diff,
                 "summary": final_message,
-                "scope_ok": scope_ok,
-                "touched_other_files": touched,
                 "thread_id": thread_id_str,
                 "job_id": job_id,
+                **scope_result,
             }
         except RateLimitError:
             raise
