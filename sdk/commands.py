@@ -96,11 +96,123 @@ def _prior_codex_thread_id(run_dir: Path) -> str | None:
 _PLAN_REVIEW_IN_PROGRESS_STATES = {"queued", "running"}
 
 
+async def _maybe_apply_codex_plan_fix(
+    *,
+    dispatcher: Any,
+    codex_review: dict[str, Any],
+    plan_file: Path,
+    plan_content: str,
+    stages: list[Any],
+) -> tuple[dict[str, Any], str, list[Any]]:
+    """Run the codex auto-fix when review flags major issues, return updated state.
+
+    Returns (codex_review, plan_content, stages). When no fix is run the
+    inputs pass through unchanged. When the fix runs, the review dict gets
+    a ``fix`` subfield, and — if the patch landed on disk — plan_content
+    and stages are re-read from the post-fix plan.md so plan.json stays in
+    sync with the file team-lead is about to hand to implementer.
+    """
+    if codex_review.get("status") != "completed":
+        return codex_review, plan_content, stages
+    if not codex_review.get("has_major_issues"):
+        return codex_review, plan_content, stages
+
+    findings = codex_review.get("findings") or []
+    if not findings:
+        # Review flagged issues but didn't itemize them; codex fix has no
+        # structured payload to work from, so skip rather than guess.
+        return codex_review, plan_content, stages
+
+    try:
+        fix_result = await dispatcher.run_codex_plan_fix(
+            plan_path=plan_file,
+            findings=_coerce_findings_for_fix(findings),
+            resume_thread_id=codex_review.get("thread_id"),
+        )
+    except Exception as exc:
+        fix_result = {
+            "attempted": True,
+            "status": "failed",
+            "reason": f"codex plan fix raised: {exc}",
+            "diff": "",
+            "summary": "",
+            "scope_ok": True,
+            "touched_other_files": [],
+            "thread_id": None,
+            "job_id": None,
+        }
+
+    updated_review = {**codex_review, "fix": fix_result}
+
+    # If codex actually edited plan.md, re-read + re-parse so plan.json's
+    # stages reflect what implementer will receive. If it didn't edit (empty
+    # diff), the original content is still on disk and re-parsing is a no-op.
+    new_content = plan_content
+    new_stages = stages
+    if fix_result.get("diff"):
+        try:
+            from sdk.orchestrator import _parse_plan_stages
+            new_content = plan_file.read_text("utf-8")
+            new_stages = _parse_plan_stages(new_content) or stages
+        except Exception:
+            # Re-parse failure shouldn't sink the whole plan command —
+            # keep the prior content/stages and let the caller still see
+            # the fix payload in codex_review for diagnostics.
+            pass
+
+    return updated_review, new_content, new_stages
+
+
+def _coerce_findings_for_fix(findings: Any) -> list[dict]:
+    """Normalize the review's findings list into dicts the fix prompt expects.
+
+    _format_plan_review_findings may have downgraded dicts to strings for
+    display; the fix prompt needs the structured fields back.
+    """
+    out: list[dict] = []
+    if not isinstance(findings, list):
+        return out
+    for item in findings:
+        if isinstance(item, dict):
+            out.append(item)
+        elif isinstance(item, str):
+            # Best-effort: treat the whole string as the body so codex has
+            # some signal even when structure was lost upstream.
+            out.append({
+                "severity": "info",
+                "title": item[:80],
+                "body": item,
+                "recommendation": "",
+            })
+    return out
+
+
 def _plan_status_from_codex_review(codex_review: dict[str, Any]) -> str:
-    if codex_review.get("has_major_issues"):
-        return "REVIEW"
+    """Derive the plan job status from the codex review + optional auto-fix.
+
+    Returns:
+      - PENDING: review still running (queued / running)
+      - REVIEW: review found major issues and either no fix was attempted or
+        the fix failed / violated scope / produced no diff — user must
+        manually revise
+      - AWAIT_APPROVAL: review found issues AND codex auto-fix produced a
+        clean in-scope patch — waiting on the main LLM's approval verdict
+        (via cmd_approve_plan or cmd_reject_plan). Execute must not start.
+      - PASS: review had no major issues OR Claude has already approved a
+        prior fix
+    """
     if codex_review.get("status") in _PLAN_REVIEW_IN_PROGRESS_STATES:
         return "PENDING"
+    if codex_review.get("has_major_issues"):
+        fix = codex_review.get("fix") or {}
+        if (
+            fix.get("attempted")
+            and fix.get("status") == "completed"
+            and fix.get("scope_ok")
+            and fix.get("diff")
+        ):
+            return "AWAIT_APPROVAL"
+        return "REVIEW"
     return "PASS"
 
 
@@ -1709,6 +1821,7 @@ async def cmd_plan(
         # re-deriving everything from a 26KB plan every round.
         prior_thread_id = _prior_codex_thread_id(run_dir)
         codex_review: dict[str, Any] = {"status": "skipped", "has_major_issues": False}
+        dispatcher = None  # reused for auto-fix if review surfaces findings
         if not skip_codex:
             try:
                 from sdk.agent_dispatch import AgentDispatcher
@@ -1723,6 +1836,19 @@ async def cmd_plan(
                     "has_major_issues": False,
                     "error": str(exc),
                 }
+
+        # Auto-fix: if the review settled with findings, dispatch codex once
+        # more (via the same thread) to apply a minimal patch to plan.md.
+        # Re-parses stages because the fix may have added / renamed stages.
+        # See agent_dispatch.run_codex_plan_fix for the scope verification.
+        if dispatcher is not None:
+            codex_review, plan_content, stages = await _maybe_apply_codex_plan_fix(
+                dispatcher=dispatcher,
+                codex_review=codex_review,
+                plan_file=plan_file,
+                plan_content=plan_content,
+                stages=stages,
+            )
 
         # Generate JSON sidecar
         plan_json = {
@@ -1862,6 +1988,40 @@ async def cmd_plan_status(
             print(json.dumps(result, indent=2))
             return result
 
+        # If the background review landed findings, run the auto-fix here
+        # too — otherwise plan_status would drop the run into REVIEW and
+        # miss the AWAIT_APPROVAL shortcut that the foreground cmd_plan
+        # path takes. Re-parse stages if the fix edits plan.md.
+        plan_file = run_dir / "plan.md"
+        plan_content = plan_file.read_text("utf-8") if plan_file.exists() else ""
+        stages_list = plan_json.get("stages") or []
+        if plan_content and updated_review.get("has_major_issues"):
+            from sdk.orchestrator import _parse_plan_stages
+            parsed_stages = _parse_plan_stages(plan_content)
+            updated_review, plan_content, parsed_stages = await _maybe_apply_codex_plan_fix(
+                dispatcher=dispatcher,
+                codex_review=updated_review,
+                plan_file=plan_file,
+                plan_content=plan_content,
+                stages=parsed_stages,
+            )
+            stages_list = [
+                {
+                    "id": f"stage-{i+1}",
+                    "name": s.name,
+                    "files": s.files,
+                    "dependencies": s.depends_on,
+                    "has_user_facing_changes": s.has_user_facing_changes,
+                    "estimated_turns": s.estimated_turns,
+                }
+                for i, s in enumerate(parsed_stages)
+            ]
+            if stages_list:
+                plan_json["stages"] = stages_list
+            # Keep context/plan.md in sync with any post-fix edits.
+            (run_dir / "context").mkdir(parents=True, exist_ok=True)
+            (run_dir / "context" / "plan.md").write_text(plan_content)
+
         # Dashboard phase bar: codex landed a terminal verdict — close the
         # plan phase. Emit before teardown so the event reaches the bus.
         await bus.emit(PhaseCompleted(phase="plan"))
@@ -1892,6 +2052,205 @@ async def cmd_plan_status(
     }
     print(json.dumps(result, indent=2))
     return result
+
+
+# ---------------------------------------------------------------------------
+# approve_plan / reject_plan — Claude's verdict on codex's auto-fix
+# ---------------------------------------------------------------------------
+# Resolution path for the AWAIT_APPROVAL state cmd_plan writes when codex's
+# review finds issues and the auto-fix (run_codex_plan_fix) lands a clean
+# in-scope patch. The main LLM in the /donace:plan chat evaluates diff vs
+# findings and calls one of these to unblock execute.
+
+def _await_approval_fix_payload(plan_json: dict) -> dict | None:
+    """Return the fix dict when plan.json is in the AWAIT_APPROVAL shape, else None.
+
+    Centralizes the "is this plan actually waiting on Claude's verdict?"
+    precondition used by both approve and reject. Looser than the exact
+    status-classifier check because callers care about "can I legitimately
+    record a verdict", not "which bucket does the classifier pick".
+    """
+    review = plan_json.get("codex_review") or {}
+    if not review.get("has_major_issues"):
+        return None
+    fix = review.get("fix") or {}
+    if not fix.get("attempted"):
+        return None
+    if fix.get("status") != "completed":
+        return None
+    if not fix.get("scope_ok"):
+        return None
+    if not fix.get("diff"):
+        return None
+    return fix
+
+
+async def cmd_approve_plan(
+    cwd: str,
+    run_id: str,
+    dashboard_url: str | None,
+    note: str | None = None,
+) -> dict:
+    """Mark the codex auto-fix as approved — plan moves from AWAIT_APPROVAL to PASS.
+
+    Called by the main LLM (from /donace:plan) when codex's fix diff
+    genuinely addresses every finding without scope drift. Writes:
+    - codex_review.has_major_issues = False (the review is now resolved)
+    - codex_review.fix.verdict = "approved"
+    - codex_review.fix.note = <Claude's reasoning, optional>
+
+    Plus a new plan job file with status=PASS so /donace:execute's
+    classifier sees a green plan phase.
+    """
+    run_dir = Path(cwd) / ".ai" / "runs" / run_id
+    plan_json_path = run_dir / "plan.json"
+    if not plan_json_path.exists():
+        result = {"status": "error", "reason": "no plan.json"}
+        print(json.dumps(result, indent=2))
+        return result
+    try:
+        plan_json = json.loads(plan_json_path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        result = {"status": "error", "reason": f"plan.json unreadable: {exc}"}
+        print(json.dumps(result, indent=2))
+        return result
+
+    fix = _await_approval_fix_payload(plan_json)
+    if fix is None:
+        result = {
+            "status": "error",
+            "reason": "plan is not in AWAIT_APPROVAL state (no clean fix to approve)",
+        }
+        print(json.dumps(result, indent=2))
+        return result
+
+    job_id = f"job-plan-{uuid.uuid4().hex[:8]}"
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
+    try:
+        await bus.emit(JobRegistered(job_id=job_id, command="plan", pid=os.getpid()))
+        await bus.emit(JobStarted(job_id=job_id, command="plan"))
+
+        review = plan_json.setdefault("codex_review", {})
+        fix_payload = review.setdefault("fix", {})
+        fix_payload["verdict"] = "approved"
+        if note:
+            fix_payload["note"] = note
+        review["has_major_issues"] = False
+        plan_json_path.write_text(json.dumps(plan_json, indent=2))
+
+        await bus.emit(JobCompleted(
+            job_id=job_id, command="plan", status="PASS",
+            result_summary="Claude approved codex fix",
+        ))
+        await bus.emit(PhaseCompleted(phase="plan"))
+        _supersede_prior_jobs(cwd, run_id, "plan", job_id)
+        _write_job_result(cwd, run_id, job_id, {
+            "command": "plan",
+            "status": "PASS",
+            "plan": plan_json,
+            "approval": {
+                "verdict": "approved",
+                "note": note or "",
+            },
+        })
+
+        result = {
+            "status": "approved",
+            "plan_status": "PASS",
+            "job_id": job_id,
+            "note": note or "",
+        }
+        print(json.dumps(result, indent=2))
+        return result
+    finally:
+        await _teardown(emitter, bus)
+
+
+async def cmd_reject_plan(
+    cwd: str,
+    run_id: str,
+    dashboard_url: str | None,
+    reason: str,
+) -> dict:
+    """Mark the codex auto-fix as rejected — plan falls back to REVIEW.
+
+    Called by the main LLM when it reads codex's diff and decides the fix
+    missed a finding, drifted scope, or introduced a new risk. Writes:
+    - codex_review.fix.verdict = "rejected"
+    - codex_review.fix.reason = <why Claude rejected>
+    - has_major_issues stays True — user must manually revise plan.md
+
+    The reason is mandatory: Claude must tell the user what it saw that
+    prompted the rejection, otherwise the "pause for user" loop lacks the
+    one piece of information the user actually needs.
+    """
+    reason = (reason or "").strip()
+    if not reason:
+        result = {"status": "error", "reason": "reject_plan requires a non-empty --reason"}
+        print(json.dumps(result, indent=2))
+        return result
+
+    run_dir = Path(cwd) / ".ai" / "runs" / run_id
+    plan_json_path = run_dir / "plan.json"
+    if not plan_json_path.exists():
+        result = {"status": "error", "reason": "no plan.json"}
+        print(json.dumps(result, indent=2))
+        return result
+    try:
+        plan_json = json.loads(plan_json_path.read_text("utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        result = {"status": "error", "reason": f"plan.json unreadable: {exc}"}
+        print(json.dumps(result, indent=2))
+        return result
+
+    fix = _await_approval_fix_payload(plan_json)
+    if fix is None:
+        result = {
+            "status": "error",
+            "reason": "plan is not in AWAIT_APPROVAL state (no fix to reject)",
+        }
+        print(json.dumps(result, indent=2))
+        return result
+
+    job_id = f"job-plan-{uuid.uuid4().hex[:8]}"
+    bus, emitter = await _setup_bus(run_id, dashboard_url, job_id=job_id, cwd=cwd)
+    try:
+        await bus.emit(JobRegistered(job_id=job_id, command="plan", pid=os.getpid()))
+        await bus.emit(JobStarted(job_id=job_id, command="plan"))
+
+        review = plan_json.setdefault("codex_review", {})
+        fix_payload = review.setdefault("fix", {})
+        fix_payload["verdict"] = "rejected"
+        fix_payload["reason"] = reason
+        # has_major_issues stays True — the revision loop is still live.
+        plan_json_path.write_text(json.dumps(plan_json, indent=2))
+
+        await bus.emit(JobCompleted(
+            job_id=job_id, command="plan", status="REVIEW",
+            result_summary=f"Claude rejected codex fix: {reason[:80]}",
+        ))
+        await bus.emit(PhaseCompleted(phase="plan"))
+        _supersede_prior_jobs(cwd, run_id, "plan", job_id)
+        _write_job_result(cwd, run_id, job_id, {
+            "command": "plan",
+            "status": "REVIEW",
+            "plan": plan_json,
+            "approval": {
+                "verdict": "rejected",
+                "reason": reason,
+            },
+        })
+
+        result = {
+            "status": "rejected",
+            "plan_status": "REVIEW",
+            "job_id": job_id,
+            "reason": reason,
+        }
+        print(json.dumps(result, indent=2))
+        return result
+    finally:
+        await _teardown(emitter, bus)
 
 
 # ---------------------------------------------------------------------------

@@ -297,7 +297,8 @@ def cmd_health(cwd: str | None = None) -> int:
 
 _SUBCOMMANDS = frozenset({
     "run_start", "run_complete", "list_runs", "mark",
-    "write_plan", "plan", "run_job",
+    "write_plan", "plan", "plan_status", "approve_plan", "reject_plan",
+    "run_job",
     "verify", "review", "document", "health",
 })
 
@@ -477,6 +478,34 @@ def main() -> None:
     p.add_argument("--run-id", required=True)
     p.add_argument("--dashboard-url", default=None)
 
+    # --- approve_plan ---
+    p = subparsers.add_parser(
+        "approve_plan",
+        help="Approve codex's auto-fix on a plan in AWAIT_APPROVAL. "
+             "Called by the main LLM from /donace:plan after evaluating "
+             "codex_review.fix.diff against the findings. Lifts the plan "
+             "job to PASS so /donace:execute can proceed.",
+    )
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--note", type=str, default=None,
+                   help="Optional 1-3 sentence Claude rationale for the approval")
+
+    # --- reject_plan ---
+    p = subparsers.add_parser(
+        "reject_plan",
+        help="Reject codex's auto-fix on a plan in AWAIT_APPROVAL. "
+             "Called by the main LLM when the fix diff misses a finding, "
+             "drifts scope, or introduces a new risk. Keeps plan in REVIEW "
+             "so the user can revise manually.",
+    )
+    p.add_argument("--cwd", type=str, default=os.getcwd())
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--dashboard-url", default=None)
+    p.add_argument("--reason", required=True, type=str,
+                   help="Required: what Claude saw that prompted the rejection")
+
     # --- health ---
     p = subparsers.add_parser(
         "health", help="Smoke-test orchestrator reachability and deps",
@@ -495,7 +524,7 @@ def main() -> None:
     from sdk.commands import (
         cmd_run_start, cmd_run_complete, cmd_plan, cmd_run_job,
         cmd_verify, cmd_review, cmd_document, cmd_mark, cmd_write_plan,
-        cmd_list_runs, cmd_plan_status,
+        cmd_list_runs, cmd_plan_status, cmd_approve_plan, cmd_reject_plan,
     )
 
     if args.command == "run_start":
@@ -555,6 +584,18 @@ def main() -> None:
         asyncio.run(cmd_plan_status(
             cwd=args.cwd, run_id=args.run_id,
             dashboard_url=args.dashboard_url,
+        ))
+    elif args.command == "approve_plan":
+        asyncio.run(cmd_approve_plan(
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+            note=args.note,
+        ))
+    elif args.command == "reject_plan":
+        asyncio.run(cmd_reject_plan(
+            cwd=args.cwd, run_id=args.run_id,
+            dashboard_url=args.dashboard_url,
+            reason=args.reason,
         ))
     else:
         parser.print_help()
