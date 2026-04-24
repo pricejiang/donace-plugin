@@ -82,7 +82,7 @@ donace calls `scripts/codex-companion.mjs`:
 | Donace call | Codex subcommand | Mode | Rate-limit aware |
 |---|---|---|---|
 | `run_codex_review` (per stage) | `review` | foreground, 180s cap, via Haiku wrapper | yes |
-| `run_codex_plan_review` | `task --background --json` | direct subprocess, 600s cap, poll-then-fetch | no (bypasses wrapper) |
+| `run_codex_plan_review` | `task --background --json` | direct subprocess, two-pass review + missed-issue audit, 600s cap per pass | no (bypasses wrapper) |
 | `run_codex_plan_fix` | `task --background --json --write` | direct subprocess, 600s cap, pre/post cwd snapshot for scope check | no (bypasses wrapper) |
 | `fetch_codex_plan_review_result` | `status <job-id>` then `result <job-id>` | direct subprocess | no |
 | `_codex_task_resume_candidate_thread_id` | `task-resume-candidate` | direct subprocess | no |

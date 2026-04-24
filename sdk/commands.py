@@ -1976,7 +1976,18 @@ async def cmd_plan_status(
     try:
         from sdk.agent_dispatch import AgentDispatcher
         dispatcher = AgentDispatcher(agents_dir=_agents_dir(), cwd=cwd, bus=bus)
-        updated_review = await dispatcher.fetch_codex_plan_review_result(str(job_id))
+        plan_file = run_dir / "plan.md"
+        plan_content = plan_file.read_text("utf-8") if plan_file.exists() else ""
+        initial_review = (
+            review.get("initial_review")
+            if isinstance(review.get("initial_review"), dict)
+            else None
+        )
+        updated_review = await dispatcher.fetch_codex_plan_review_result(
+            str(job_id),
+            plan_text=plan_content or None,
+            initial_review=initial_review,
+        )
 
         new_state = updated_review.get("status")
         if new_state == "running":
@@ -1993,8 +2004,6 @@ async def cmd_plan_status(
         # too — otherwise plan_status would drop the run into REVIEW and
         # miss the AWAIT_APPROVAL shortcut that the foreground cmd_plan
         # path takes. Re-parse stages if the fix edits plan.md.
-        plan_file = run_dir / "plan.md"
-        plan_content = plan_file.read_text("utf-8") if plan_file.exists() else ""
         stages_list = plan_json.get("stages") or []
         if plan_content and updated_review.get("has_major_issues"):
             from sdk.orchestrator import _parse_plan_stages

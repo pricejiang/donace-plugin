@@ -244,7 +244,7 @@ class PlanPhaseEventsTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            async def fetch_codex_plan_review_result(self, job_id):
+            async def fetch_codex_plan_review_result(self, job_id, **_kw):
                 return {
                     "status": "completed",
                     "has_major_issues": False,

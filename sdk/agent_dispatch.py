@@ -444,9 +444,18 @@ def _build_codex_plan_review_prompt(plan_text: str) -> str:
     """Build a structured review prompt for implementation plans."""
     return (
         "Review the implementation plan below before coding starts.\n\n"
-        "Only call out issues strong enough to justify revising the plan before implementation. "
+        "This is an exhaustive pre-implementation gate, not a sampled review. "
+        "Find every issue strong enough to justify revising the plan before implementation. "
+        "Do not stop after the first few issues and do not return only the top findings.\n\n"
         "Focus on missing dependencies, incorrect stage ordering, hidden coupling between stages, "
         "missing verification work, and anything likely to cause rework during the sprint loop.\n\n"
+        "Before writing JSON, internally perform a full pass over: stage ordering and dependency graph; "
+        "files/scope per stage; hidden coupling between stages; missing or vague success criteria; "
+        "missing tests, runtime checks, migrations, config, rollout, or data compatibility work; "
+        "user-facing changes that lack verification; and revision drift where a fix addresses one "
+        "finding but creates another issue.\n\n"
+        "Consolidate duplicates into root-cause findings. Prefer fewer complete blocking findings over "
+        "many nits, but do not omit any blocking risk.\n\n"
         "Ignore minor wording edits and style nits.\n\n"
         "Return ONLY valid JSON in this exact shape:\n"
         "{\n"
@@ -464,6 +473,50 @@ def _build_codex_plan_review_prompt(plan_text: str) -> str:
         "}\n\n"
         'Use "needs-attention" only when the plan should be revised before implementation. '
         'Use "approve" when remaining comments are optional.\n\n'
+        "Implementation plan:\n"
+        "```markdown\n"
+        f"{plan_text}\n"
+        "```"
+    )
+
+
+def _build_codex_plan_review_audit_prompt(plan_text: str, first_review: dict) -> str:
+    """Build the second-pass prompt that audits the first review for misses."""
+    first_review_json = json.dumps({
+        "summary": first_review.get("summary", ""),
+        "findings": first_review.get("findings", []),
+        "next_steps": first_review.get("next_steps", []),
+    }, indent=2)
+    return (
+        "You are performing a second-pass audit of your previous implementation-plan review.\n\n"
+        "Goal: find blocking plan issues the first pass missed before the user spends another "
+        "revision cycle and another full Codex review.\n\n"
+        "Rules:\n"
+        "- Re-read the full plan. Do not only verify the first-pass findings.\n"
+        "- Return only additional issues that are strong enough to require revising the plan before implementation.\n"
+        "- Do not repeat or rephrase first-pass findings. If an issue is already covered, omit it.\n"
+        "- Check stage dependency graph, hidden coupling, file scope, verification gaps, migrations/config/data compatibility, user-facing runtime checks, and revision drift.\n"
+        "- Ignore style nits and optional improvements.\n\n"
+        "Return ONLY valid JSON in this exact shape:\n"
+        "{\n"
+        '  "verdict": "approve" | "needs-attention",\n'
+        '  "summary": "short summary of additional missed issues, or no additional blocking issues",\n'
+        '  "findings": [\n'
+        "    {\n"
+        '      "severity": "high" | "medium" | "low",\n'
+        '      "title": "short title",\n'
+        '      "body": "why this matters",\n'
+        '      "recommendation": "concrete fix"\n'
+        "    }\n"
+        "  ],\n"
+        '  "next_steps": ["optional follow-up"]\n'
+        "}\n\n"
+        'Use "needs-attention" only when you found additional blocking issues not covered by the first pass. '
+        'Use "approve" when there are no additional blocking issues.\n\n'
+        "First-pass review result:\n"
+        "```json\n"
+        f"{first_review_json}\n"
+        "```\n\n"
         "Implementation plan:\n"
         "```markdown\n"
         f"{plan_text}\n"
@@ -509,6 +562,83 @@ def _format_plan_review_findings(findings: Any) -> list[str]:
             formatted.append(text)
 
     return formatted
+
+
+def _dedupe_text_items(items: list[Any]) -> list[Any]:
+    """Deduplicate text-ish list items while preserving order."""
+    out: list[Any] = []
+    seen: set[str] = set()
+    for item in items:
+        key = str(item).strip().casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _compact_review_pass(review: dict) -> dict:
+    """Keep review-pass metadata useful without duplicating bulky fields."""
+    return {
+        "status": review.get("status"),
+        "has_major_issues": bool(review.get("has_major_issues")),
+        "summary": review.get("summary", ""),
+        "findings": review.get("findings", []),
+        "next_steps": review.get("next_steps", []),
+        "job_id": review.get("job_id"),
+        "thread_id": review.get("thread_id"),
+        "reason": review.get("reason", ""),
+    }
+
+
+def _merge_plan_review_passes(initial: dict, audit: dict) -> dict:
+    """Merge first-pass review findings with the second-pass missed-issue audit."""
+    initial_findings = initial.get("findings") if isinstance(initial.get("findings"), list) else []
+    audit_findings = audit.get("findings") if isinstance(audit.get("findings"), list) else []
+    findings = _dedupe_text_items([*initial_findings, *audit_findings])
+
+    initial_steps = initial.get("next_steps") if isinstance(initial.get("next_steps"), list) else []
+    audit_steps = audit.get("next_steps") if isinstance(audit.get("next_steps"), list) else []
+    next_steps = _dedupe_text_items([*initial_steps, *audit_steps])
+
+    summary_parts = []
+    if initial.get("summary"):
+        summary_parts.append(f"Initial pass: {initial.get('summary')}")
+    if audit.get("summary"):
+        summary_parts.append(f"Audit pass: {audit.get('summary')}")
+    elif audit.get("status") and audit.get("status") != "completed":
+        summary_parts.append(
+            f"Audit pass {audit.get('status')}: {audit.get('reason', 'no detail')}"
+        )
+    summary = " ".join(summary_parts).strip()
+
+    audit_status = audit.get("status")
+    audit_reason = audit.get("reason", "")
+    return {
+        "status": "completed",
+        "phase": "complete",
+        "has_major_issues": bool(
+            initial.get("has_major_issues")
+            or audit.get("has_major_issues")
+            or findings
+        ),
+        "summary": summary,
+        "findings": findings,
+        "next_steps": next_steps,
+        "output": json.dumps({
+            "initial": initial.get("output", ""),
+            "audit": audit.get("output", ""),
+        }),
+        "job_id": initial.get("job_id"),
+        "thread_id": audit.get("thread_id") or initial.get("thread_id"),
+        "audit_job_id": audit.get("job_id"),
+        "audit_status": audit_status,
+        "audit_reason": audit_reason,
+        "review_passes": {
+            "initial": _compact_review_pass(initial),
+            "audit": _compact_review_pass(audit),
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2097,6 +2227,9 @@ class AgentDispatcher:
             summary_parts: list[str] = [f"status={result.get('status', 'unknown')}"]
             if result.get("has_major_issues"):
                 summary_parts.append("verdict=needs-attention")
+            audit_status = result.get("audit_status")
+            if audit_status and audit_status != "completed":
+                summary_parts.append(f"audit={audit_status}")
             await self.bus.emit(AgentCompleted(
                 agent="codex-plan-review",
                 duration_s=round(time.time() - t0, 1),
@@ -2127,17 +2260,42 @@ class AgentDispatcher:
         if not codex_plugin_root or not companion_script:
             return _skipped_plan_review(reason or "codex plugin not found")
 
+        initial = await self._run_codex_plan_review_task(
+            companion_script,
+            _build_codex_plan_review_prompt(plan_text),
+            prompt_prefix=".codex-plan-review-",
+            task_label="codex plan review",
+            resume_last=resume_last,
+            resume_thread_id=resume_thread_id,
+        )
+        if initial.get("status") != "completed":
+            return initial
+        return await self._run_codex_plan_review_audit(
+            companion_script, plan_text, initial,
+        )
+
+    async def _run_codex_plan_review_task(
+        self,
+        companion_script: Path,
+        prompt_text: str,
+        *,
+        prompt_prefix: str,
+        task_label: str,
+        resume_last: bool = False,
+        resume_thread_id: str | None = None,
+    ) -> dict:
+        """Launch one background codex plan-review task and parse it if terminal."""
         prompt_path: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
                 suffix=".prompt.txt",
-                prefix=".codex-plan-review-",
+                prefix=prompt_prefix,
                 dir=self.cwd,
                 delete=False,
             ) as handle:
-                handle.write(_build_codex_plan_review_prompt(plan_text))
+                handle.write(prompt_text)
                 prompt_path = handle.name
 
             should_resume = False
@@ -2160,7 +2318,7 @@ class AgentDispatcher:
                 companion_script, "task", task_args, timeout_s=30.0,
             )
             if not launch or not launch.get("jobId"):
-                return _skipped_plan_review("codex background launch failed")
+                return _skipped_plan_review(f"{task_label} background launch failed")
 
             job_id = str(launch["jobId"])
             launch_thread_id = launch.get("threadId")
@@ -2179,7 +2337,7 @@ class AgentDispatcher:
                     "findings": [],
                     "next_steps": [],
                     "output": "",
-                    "reason": f"codex plan review still running after {int(_PLAN_REVIEW_TIMEOUT_S)} seconds",
+                    "reason": f"{task_label} still running after {int(_PLAN_REVIEW_TIMEOUT_S)} seconds",
                     "job_id": job_id,
                     "thread_id": str(thread_id) if thread_id else None,
                 }
@@ -2193,7 +2351,7 @@ class AgentDispatcher:
                     "findings": [],
                     "next_steps": [],
                     "output": "",
-                    "reason": f"codex plan review {job_state}" + (f": {err}" if err else ""),
+                    "reason": f"{task_label} {job_state}" + (f": {err}" if err else ""),
                     "job_id": job_id,
                     "thread_id": str(thread_id) if thread_id else None,
                 }
@@ -2209,6 +2367,28 @@ class AgentDispatcher:
                     Path(prompt_path).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    async def _run_codex_plan_review_audit(
+        self,
+        companion_script: Path,
+        plan_text: str,
+        initial_review: dict,
+    ) -> dict:
+        """Run the second pass that searches for missed blocking findings."""
+        audit = await self._run_codex_plan_review_task(
+            companion_script,
+            _build_codex_plan_review_audit_prompt(plan_text, initial_review),
+            prompt_prefix=".codex-plan-review-audit-",
+            task_label="codex plan review audit",
+            resume_thread_id=initial_review.get("thread_id"),
+        )
+        if audit.get("status") == "running":
+            return {
+                **audit,
+                "phase": "audit",
+                "initial_review": initial_review,
+            }
+        return _merge_plan_review_passes(initial_review, audit)
 
     async def _poll_codex_job(
         self, companion_script: Path, job_id: str,
@@ -2511,7 +2691,13 @@ class AgentDispatcher:
                 except Exception:
                     pass
 
-    async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
+    async def fetch_codex_plan_review_result(
+        self,
+        job_id: str,
+        *,
+        plan_text: str | None = None,
+        initial_review: dict | None = None,
+    ) -> dict:
         """Query codex for a previously-launched plan review job.
 
         Used by cmd_plan_status to finalize a review that timed out
@@ -2523,6 +2709,8 @@ class AgentDispatcher:
         if not codex_plugin_root or not companion_script:
             result = _skipped_plan_review(reason or "codex plugin not found")
             result["job_id"] = job_id
+            if initial_review is not None:
+                return _merge_plan_review_passes(initial_review, result)
             return result
 
         status_payload = await self._run_codex_json_subcommand(
@@ -2533,6 +2721,8 @@ class AgentDispatcher:
         if not status_payload:
             result = _skipped_plan_review("codex status lookup failed")
             result["job_id"] = job_id
+            if initial_review is not None:
+                return _merge_plan_review_passes(initial_review, result)
             return result
 
         job = status_payload.get("job") or {}
@@ -2551,10 +2741,11 @@ class AgentDispatcher:
                 "reason": f"codex plan review still {state}",
                 "job_id": job_id,
                 "thread_id": thread_id_str,
+                **({"phase": "audit", "initial_review": initial_review} if initial_review is not None else {}),
             }
         if state in ("failed", "cancelled"):
             err = job.get("error") or job.get("failureMessage") or ""
-            return {
+            result = {
                 "status": "skipped",
                 "has_major_issues": False,
                 "summary": "",
@@ -2565,7 +2756,18 @@ class AgentDispatcher:
                 "job_id": job_id,
                 "thread_id": thread_id_str,
             }
-        return await self._parse_completed_plan_review(companion_script, job_id, thread_id)
+            if initial_review is not None:
+                return _merge_plan_review_passes(initial_review, result)
+            return result
+
+        completed = await self._parse_completed_plan_review(companion_script, job_id, thread_id)
+        if initial_review is not None:
+            return _merge_plan_review_passes(initial_review, completed)
+        if completed.get("status") == "completed" and plan_text:
+            return await self._run_codex_plan_review_audit(
+                companion_script, plan_text, completed,
+            )
+        return completed
 
     async def _run_codex_json_subcommand(
         self,

@@ -6,10 +6,12 @@ away real findings because we got impatient. Switch to:
 
 1. Launch codex with `task --background --json` (returns jobId in <1s)
 2. Poll `status <job-id> --json` every 3s until completed, 600s cap
-3. If cap hits while codex is still running, persist `{status: "running",
+3. Run a second background audit pass that searches for missed blocking
+   findings before the user spends another revision cycle
+4. If cap hits while codex is still running, persist `{status: "running",
    job_id, thread_id}` in plan.json WITHOUT cancelling codex — the real
    findings are in codex's own state
-4. New `cmd_plan_status` lets team-lead finalize a running review before
+5. New `cmd_plan_status` lets team-lead finalize a running review before
    starting the sprint
 
 Runs with stdlib unittest:
@@ -136,7 +138,7 @@ class BackgroundLaunchTests(unittest.TestCase):
             "## Plan", resume_thread_id="thread-abc",
         ))
 
-        self.assertEqual(len(captured_task_args), 1)
+        self.assertGreaterEqual(len(captured_task_args), 1)
         self.assertIn("--background", captured_task_args[0])
         self.assertIn("--resume-last", captured_task_args[0])
 
@@ -193,8 +195,152 @@ class PollAndResultTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "completed")
         self.assertTrue(result["has_major_issues"])
-        self.assertEqual(result["summary"], "fix X")
+        self.assertIn("fix X", result["summary"])
         self.assertGreaterEqual(status_calls["n"], 3)
+
+    def test_second_pass_adds_missed_blocking_findings(self):
+        dispatcher = _make_dispatcher()
+        task_ids = ["task-initial", "task-audit"]
+        result_payloads = [
+            {
+                "verdict": "approve",
+                "summary": "first pass saw no blockers",
+                "findings": [],
+                "next_steps": [],
+            },
+            {
+                "verdict": "needs-attention",
+                "summary": "audit found a missed dependency",
+                "findings": [{
+                    "severity": "high",
+                    "title": "Missing dependency",
+                    "body": "Stage 2 uses the API before Stage 1 creates it.",
+                    "recommendation": "Add a Stage 2 dependency on Stage 1.",
+                }],
+                "next_steps": ["Add dependency edge"],
+            },
+        ]
+        calls = {"task": 0, "result": 0}
+
+        async def fake(companion_script, subcommand, args, **_kw):
+            if subcommand == "task":
+                job_id = task_ids[calls["task"]]
+                calls["task"] += 1
+                return {"jobId": job_id, "threadId": "thread-review", "status": "queued"}
+            if subcommand == "status":
+                job_id = args[0]
+                return {"job": {"id": job_id, "status": "completed", "threadId": "thread-review"}}
+            if subcommand == "result":
+                payload = result_payloads[calls["result"]]
+                calls["result"] += 1
+                return {"storedJob": {"result": {"finalMessage": json.dumps(payload)}}}
+            return None
+
+        _install_subcommand_fake(dispatcher, fake)
+        dispatcher._codex_task_resume_candidate_thread_id = (  # type: ignore[method-assign]
+            lambda companion_script: asyncio.sleep(0, result="thread-review")
+        )
+
+        result = _run(dispatcher.run_codex_plan_review("## Plan"))
+
+        self.assertEqual(calls["task"], 2)
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["has_major_issues"])
+        self.assertEqual(result["audit_job_id"], "task-audit")
+        self.assertTrue(any("Missing dependency" in f for f in result["findings"]))
+
+    def test_audit_approve_preserves_initial_findings(self):
+        """Most common needs-attention path: audit finds no extra blockers."""
+        dispatcher = _make_dispatcher()
+        task_ids = ["task-initial", "task-audit"]
+        result_payloads = [
+            {
+                "verdict": "needs-attention",
+                "summary": "stage 1 is vague",
+                "findings": [{
+                    "severity": "high",
+                    "title": "Vague success criteria",
+                    "body": "Stage 1 cannot be verified objectively.",
+                    "recommendation": "Add concrete observable outcomes.",
+                }],
+                "next_steps": ["Tighten Stage 1"],
+            },
+            {
+                "verdict": "approve",
+                "summary": "no additional blocking issues",
+                "findings": [],
+                "next_steps": [],
+            },
+        ]
+        calls = {"task": 0, "result": 0}
+
+        async def fake(companion_script, subcommand, args, **_kw):
+            if subcommand == "task":
+                job_id = task_ids[calls["task"]]
+                calls["task"] += 1
+                return {"jobId": job_id, "threadId": "thread-review", "status": "queued"}
+            if subcommand == "status":
+                job_id = args[0]
+                return {"job": {"id": job_id, "status": "completed", "threadId": "thread-review"}}
+            if subcommand == "result":
+                payload = result_payloads[calls["result"]]
+                calls["result"] += 1
+                return {"storedJob": {"result": {"finalMessage": json.dumps(payload)}}}
+            return None
+
+        _install_subcommand_fake(dispatcher, fake)
+        dispatcher._codex_task_resume_candidate_thread_id = (  # type: ignore[method-assign]
+            lambda companion_script: asyncio.sleep(0, result="thread-review")
+        )
+
+        result = _run(dispatcher.run_codex_plan_review("## Plan"))
+
+        self.assertEqual(calls["task"], 2)
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(result["has_major_issues"])
+        self.assertEqual(result["audit_status"], "completed")
+        self.assertEqual(len(result["findings"]), 1)
+        self.assertIn("Vague success criteria", result["findings"][0])
+        self.assertIn("no additional blocking issues", result["summary"])
+
+    def test_audit_timeout_returns_resumable_audit_state(self):
+        dispatcher = _make_dispatcher()
+        calls = {"task": 0}
+
+        async def fake(companion_script, subcommand, args, **_kw):
+            if subcommand == "task":
+                calls["task"] += 1
+                job_id = "task-initial" if calls["task"] == 1 else "task-audit"
+                return {"jobId": job_id, "threadId": "thread-review", "status": "queued"}
+            if subcommand == "status":
+                job_id = args[0]
+                status = "completed" if job_id == "task-initial" else "running"
+                return {"job": {"id": job_id, "status": status, "threadId": "thread-review"}}
+            if subcommand == "result":
+                return {
+                    "storedJob": {
+                        "result": {
+                            "finalMessage": json.dumps({
+                                "verdict": "approve",
+                                "summary": "initial clean",
+                                "findings": [],
+                                "next_steps": [],
+                            }),
+                        },
+                    },
+                }
+            return None
+
+        _install_subcommand_fake(dispatcher, fake)
+
+        with patch("sdk.agent_dispatch._PLAN_REVIEW_POLL_INTERVAL_S", 0.01), \
+             patch("sdk.agent_dispatch._PLAN_REVIEW_TIMEOUT_S", 0.05):
+            result = _run(dispatcher.run_codex_plan_review("## Plan"))
+
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["phase"], "audit")
+        self.assertEqual(result["job_id"], "task-audit")
+        self.assertIn("initial_review", result)
 
     def test_timeout_returns_running_with_job_id(self):
         dispatcher = _make_dispatcher()
@@ -324,7 +470,7 @@ class CmdPlanStatusTests(unittest.TestCase):
             def _resolve_codex_companion_sync(self):
                 return ("plugin-root", Path("x.mjs"), None)
 
-            async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
+            async def fetch_codex_plan_review_result(self, job_id: str, **_kw) -> dict:
                 self.last_job_id = job_id
                 return {
                     "status": "completed",
@@ -361,7 +507,7 @@ class CmdPlanStatusTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
+            async def fetch_codex_plan_review_result(self, job_id: str, **_kw) -> dict:
                 return {
                     "status": "running",
                     "has_major_issues": False,
@@ -398,7 +544,7 @@ class CmdPlanStatusTests(unittest.TestCase):
             def __init__(self, *a, **kw):
                 pass
 
-            async def fetch_codex_plan_review_result(self, job_id: str) -> dict:
+            async def fetch_codex_plan_review_result(self, job_id: str, **_kw) -> dict:
                 return {
                     "status": "completed",
                     "has_major_issues": False,
