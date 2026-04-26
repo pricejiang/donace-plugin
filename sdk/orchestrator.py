@@ -96,6 +96,16 @@ def _parse_plan_stages(content: str) -> list[Stage]:
     deps_pattern = re.compile(r"\*\*Dependenc(?:y|ies)\*\*:\s*(.+)", re.IGNORECASE)
     turns_pattern = re.compile(r"\*\*Estimated turns\*\*:\s*(\d+)", re.IGNORECASE)
     files_pattern = re.compile(r"\*\*Files(?:\s+to\s+modify)?\*\*:\s*(.+)", re.IGNORECASE)
+    # Header-only line `**Files to modify**:` opens a multi-line bullet list.
+    files_header_pattern = re.compile(r"^\s*\*\*Files(?:\s+to\s+modify)?\*\*:\s*$", re.IGNORECASE)
+    # Any other bold field (`**Dependencies**:`, etc.) terminates collection.
+    bold_field_pattern = re.compile(r"^\s*\*\*[^*]+\*\*\s*:")
+    bullet_pattern = re.compile(r"^\s*[-*]\s+(.+)$")
+
+    def _append_path(raw: str) -> None:
+        path = re.sub(r"\s*\([^)]*\)\s*", "", raw).strip()
+        if path and path.lower() != "none":
+            current_files.append(path)
 
     # First pass: collect stage number → name mapping
     number_to_name: dict[str, str] = {}
@@ -110,6 +120,8 @@ def _parse_plan_stages(content: str) -> list[Stage]:
     current_deps_raw: list[str] = []
     current_estimated_turns = 0
     current_files: list[str] = []
+    collecting_files = False
+    saw_file_bullet = False
 
     for line in content.split("\n"):
         stage_match = stage_header_pattern.match(line.strip())
@@ -128,7 +140,31 @@ def _parse_plan_stages(content: str) -> list[Stage]:
             current_deps_raw = []
             current_estimated_turns = 0
             current_files = []
+            collecting_files = False
+            saw_file_bullet = False
             continue
+
+        # Multi-line bullet list under `**Files to modify**:` (with no inline
+        # content). Allows spacer blank lines before the first bullet, then
+        # ends at a blank line or another bold field once bullets have started.
+        if collecting_files and current_name:
+            if line.strip() == "":
+                if saw_file_bullet:
+                    collecting_files = False
+                    saw_file_bullet = False
+                continue
+            if bold_field_pattern.match(line):
+                # Next field — fall through so its handler runs on this line.
+                collecting_files = False
+                saw_file_bullet = False
+            else:
+                bm = bullet_pattern.match(line)
+                if bm:
+                    _append_path(bm.group(1).strip())
+                    saw_file_bullet = True
+                # Whether or not the line was a bullet, it belongs to the
+                # file-collection block; don't run the field handlers below.
+                continue
 
         uf_match = user_facing_pattern.search(line)
         if uf_match and current_name:
@@ -154,10 +190,11 @@ def _parse_plan_stages(content: str) -> list[Stage]:
             raw_files = files_match.group(1).strip()
             # Parse "path/a.ts (new), path/b.ts (modify)" or "path/a.ts, path/b.ts"
             for part in raw_files.split(","):
-                # Strip annotations like "(new)", "(add WS upgrade)"
-                path = re.sub(r"\s*\([^)]*\)\s*", "", part).strip()
-                if path and path.lower() != "none":
-                    current_files.append(path)
+                _append_path(part)
+        elif current_name and files_header_pattern.match(line):
+            # Header-only `**Files to modify**:` → bullet list follows.
+            collecting_files = True
+            saw_file_bullet = False
 
     # Save last stage
     if current_name:

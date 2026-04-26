@@ -395,5 +395,169 @@ class EmptyFilesStageRoutingTests(unittest.TestCase):
         self.assertIn("runtime-verifier crashed: browser crashed", " ".join(result["unresolved"]))
 
 
+class VerifyOnlyFastPathSanityCheckTests(unittest.TestCase):
+    """cmd_run_job: refuse the verify-only fast-path when plan.md disagrees.
+
+    Repro: run-phase5_5-96ed1d5cf406. plan.md declares 3 new files for
+    Stage 1 in bullet-list form; the (then-broken) parser silently produced
+    files=[] in plan.json; the fast-path skipped implementer; runtime-verifier
+    saw nothing on disk and BLOCKED 3 times in a row.
+
+    Even with the parser fixed, a stale plan.json from before the fix could
+    still trigger this. Treat it as ERROR so team-lead stops retrying and
+    re-runs the plan command.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cwd = self._tmp.name
+        self.run_id = "run-stale-planjson"
+        run_dir = Path(self.cwd) / ".ai" / "runs" / self.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # plan.md declares files via bullet list — what real plans actually use.
+        (run_dir / "plan.md").write_text(
+            "# Implementation Plan\n\n"
+            "## Stage 1: Display Types\n"
+            "**Goal**: create types\n"
+            "**Files to modify**:\n"
+            "\n"
+            "- `apps/web/lib/types/character.ts` (new)\n"
+            "- `apps/web/lib/types/world.ts` (new)\n"
+            "\n"
+            "**Dependencies**: None\n"
+            "**Estimated turns**: 5\n"
+        )
+        # plan.json has files=[] — what an old buggy parser would have written.
+        self.plan_path = run_dir / "plan.json"
+        self.plan_path.write_text(json.dumps({
+            "plan_file": "plan.md",
+            "stages": [
+                {
+                    "id": "stage-1",
+                    "name": "Display Types",
+                    "files": [],
+                    "dependencies": [],
+                    "has_user_facing_changes": False,
+                    "estimated_turns": 5,
+                },
+            ],
+        }))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _drive(self, *, stage_id: str = "stage-1") -> tuple[dict, dict]:
+        calls = {"query": 0, "test": 0, "codex": 0, "runtime": 0}
+
+        class FakeDispatcher:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def query(self, *a, **kw):
+                calls["query"] += 1
+                return ""
+
+            async def run_test_engineer(self, *a, **kw):
+                calls["test"] += 1
+                return {"passed": 0, "failed": 0, "output": ""}
+
+            async def run_codex_review(self):
+                calls["codex"] += 1
+                return {"status": "skipped", "has_issues": False, "output": ""}
+
+            async def run_runtime_verifier(self, stage_name, task_context):
+                calls["runtime"] += 1
+                return {"status": "PASS", "score": "1/1", "output": ""}
+
+        patch_obj, _captured = _capture_bus_patch()
+
+        with patch_obj, \
+             patch("sdk.commands._register_job", return_value=Path(self.cwd) / "fake.lock"), \
+             patch("sdk.commands._unregister_job"), \
+             patch("sdk.commands._write_job_result"), \
+             patch("sdk.commands._git_head", return_value=""), \
+             patch("sdk.commands._git_dirty_paths", return_value=[]), \
+             patch("sdk.commands._git_commit_stage", return_value={"status": "skipped"}), \
+             patch("sdk.commands._load_context", return_value=""), \
+             patch("sdk.agent_dispatch.AgentDispatcher", FakeDispatcher):
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(cmd_run_job(
+                    stage_id=stage_id,
+                    plan_path=str(self.plan_path),
+                    cwd=self.cwd,
+                    run_id=self.run_id,
+                    dashboard_url=None,
+                ))
+            finally:
+                loop.close()
+        return result, calls
+
+    def test_stale_planjson_with_files_in_planmd_is_rejected(self):
+        result, calls = self._drive()
+
+        self.assertEqual(
+            calls["runtime"], 0,
+            msg="must not silently route to runtime-verifier when plan.md "
+                "declares files but plan.json's stage.files is []",
+        )
+        self.assertEqual(calls["query"], 0)
+        self.assertEqual(
+            result["status"], "ERROR",
+            msg=f"must surface as ERROR (parsing/data mismatch); got {result}",
+        )
+        # Message must point at the cause and the recovery action.
+        msg = result.get("error", "") or " ".join(result.get("unresolved", []))
+        self.assertIn("plan.md", msg.lower())
+        self.assertIn("stage-1", msg.lower())
+
+    def test_duplicate_stage_names_do_not_false_positive(self):
+        run_dir = Path(self.cwd) / ".ai" / "runs" / self.run_id
+        (run_dir / "plan.md").write_text(
+            "# Implementation Plan\n\n"
+            "## Stage 1: Cleanup\n"
+            "**Files to modify**:\n"
+            "- `apps/web/lib/a.ts` (modify)\n"
+            "\n"
+            "**Dependencies**: None\n"
+            "**Estimated turns**: 1\n"
+            "\n"
+            "## Stage 2: Cleanup\n"
+            "**Files to modify**: None\n"
+            "**Dependencies**: Stage 1\n"
+            "**Estimated turns**: 0\n"
+        )
+        self.plan_path.write_text(json.dumps({
+            "plan_file": "plan.md",
+            "stages": [
+                {
+                    "id": "stage-1",
+                    "name": "Cleanup",
+                    "files": ["`apps/web/lib/a.ts`"],
+                    "dependencies": [],
+                    "has_user_facing_changes": False,
+                    "estimated_turns": 1,
+                },
+                {
+                    "id": "stage-2",
+                    "name": "Cleanup",
+                    "files": [],
+                    "dependencies": ["Cleanup"],
+                    "has_user_facing_changes": False,
+                    "estimated_turns": 0,
+                },
+            ],
+        }))
+
+        result, calls = self._drive(stage_id="stage-2")
+
+        self.assertEqual(
+            result["status"], "PASS",
+            msg=f"later verify-only stage must not inherit files from an earlier same-name stage; got {result}",
+        )
+        self.assertEqual(calls["runtime"], 1)
+        self.assertEqual(calls["query"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

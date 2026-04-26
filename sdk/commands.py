@@ -2319,6 +2319,32 @@ async def cmd_reject_plan(
 # run_job
 # ---------------------------------------------------------------------------
 
+def _planmd_declares_files_for_stage(plan_json_path: Path, stage_index: int) -> bool:
+    """Return True if plan.md (sibling of plan.json) declares any files for
+    the stage at `stage_index` when re-parsed with the current parser.
+
+    Disambiguates `stage.files == []` in plan.json: it can mean either an
+    intentional verify-only stage (`Files to modify: None` in plan.md) or a
+    stale plan.json written before the bullet-list parser fix. The verify-only
+    fast-path uses this to refuse the latter and surface a clear ERROR.
+
+    Match by stage position, not display name: plan.json is generated from the
+    parsed stage list in order, but stage names are not guaranteed unique.
+    """
+    plan_md = plan_json_path.parent / "plan.md"
+    if not plan_md.exists():
+        return False
+    try:
+        text = plan_md.read_text("utf-8")
+    except OSError:
+        return False
+    from sdk.orchestrator import _parse_plan_stages
+    stages = _parse_plan_stages(text)
+    if 0 <= stage_index < len(stages):
+        return bool(stages[stage_index].files)
+    return False
+
+
 async def cmd_run_job(
     stage_id: str,
     plan_path: str,
@@ -2406,6 +2432,19 @@ async def cmd_run_job(
             estimated_turns=stage.estimated_turns,
         ))
         if not stage_files:
+            # Sanity gate: a stale plan.json (e.g. written by the pre-bullet-list
+            # parser) can leave stage.files=[] even when plan.md declared files.
+            # If we silently take the verify-only fast-path, the implementer
+            # never runs and the verifier judges an empty disk — see
+            # run-phase5_5-96ed1d5cf406. Refuse and route to ERROR so team-lead
+            # surfaces the real problem (re-run /donace:plan) instead of
+            # burning the 3-strike retry budget.
+            if _planmd_declares_files_for_stage(resolved_plan, stage_index):
+                raise RuntimeError(
+                    f"plan.json says stage-id '{stage_id}' has no files, but "
+                    f"plan.md declares files for it. plan.json is stale or "
+                    f"malformed; re-run `/donace:plan {run_id}` to regenerate."
+                )
             # Verify-only stage: no files to modify → skip implementer (who
             # would raise NEEDS_CONTEXT), skip test-engineer / codex (they
             # need a diff to review), and route straight to runtime-verifier.
