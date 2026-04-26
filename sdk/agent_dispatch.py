@@ -251,6 +251,26 @@ def _skipped_plan_fix(reason: str) -> dict:
     }
 
 
+def _codex_job_error_detail(job: dict | None) -> str:
+    """Return the best human-readable failure detail from codex job payloads."""
+    if not job:
+        return ""
+    for key in ("error", "failureMessage", "errorMessage", "summary", "rendered"):
+        value = job.get(key)
+        if not value:
+            continue
+        if isinstance(value, str):
+            detail = value.strip()
+        else:
+            try:
+                detail = json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                detail = str(value).strip()
+        if detail:
+            return detail
+    return ""
+
+
 def _snapshot_dir(path: Path) -> dict[str, tuple[int, int]]:
     """Return ``{relative_path: (mtime_ns, size)}`` for all files under ``path``.
 
@@ -2507,7 +2527,7 @@ class AgentDispatcher:
                 }
 
             if job_state in ("failed", "cancelled"):
-                err = (job.get("error") if job else None) or (job.get("failureMessage") if job else None) or ""
+                err = _codex_job_error_detail(job)
                 return {
                     "status": "skipped",
                     "has_major_issues": False,
@@ -2810,7 +2830,7 @@ class AgentDispatcher:
             scope_result = collect_scope_result()
 
             if job_state in ("failed", "cancelled"):
-                err = (job.get("error") if job else None) or (job.get("failureMessage") if job else None) or ""
+                err = _codex_job_error_detail(job)
                 return {
                     "attempted": True,
                     "status": job_state,
@@ -2908,7 +2928,7 @@ class AgentDispatcher:
                 **({"phase": "audit", "initial_review": initial_review} if initial_review is not None else {}),
             }
         if state in ("failed", "cancelled"):
-            err = job.get("error") or job.get("failureMessage") or ""
+            err = _codex_job_error_detail(job)
             result = {
                 "status": "skipped",
                 "has_major_issues": False,

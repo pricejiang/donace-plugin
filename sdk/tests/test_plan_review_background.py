@@ -32,7 +32,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from sdk.agent_dispatch import AgentDispatcher  # noqa: E402
-from sdk.commands import _classify_run_state, cmd_plan, cmd_plan_status  # noqa: E402
+from sdk.commands import (  # noqa: E402
+    _classify_run_state,
+    _plan_status_from_codex_review,
+    cmd_plan,
+    cmd_plan_status,
+)
 from sdk.events import EventBus, Stage  # noqa: E402
 
 
@@ -386,6 +391,30 @@ class PollAndResultTests(unittest.TestCase):
         self.assertEqual(result.get("job_id"), "task-fail")
         self.assertIn("failed", result.get("reason", "").lower())
 
+    def test_failed_job_reason_uses_summary_when_error_fields_absent(self):
+        dispatcher = _make_dispatcher()
+
+        async def fake(companion_script, subcommand, args, **_kw):
+            if subcommand == "task":
+                return {"jobId": "task-fail", "threadId": "thread-fail", "status": "queued"}
+            if subcommand == "status":
+                return {
+                    "job": {
+                        "status": "failed",
+                        "threadId": "thread-fail",
+                        "summary": "The 'gpt-5.5' model requires a newer version of Codex.",
+                    },
+                }
+            return None
+
+        _install_subcommand_fake(dispatcher, fake)
+
+        with patch("sdk.agent_dispatch._PLAN_REVIEW_POLL_INTERVAL_S", 0.01):
+            result = _run(dispatcher.run_codex_plan_review("## Plan"))
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("gpt-5.5", result.get("reason", ""))
+
     def test_fetch_queued_job_keeps_running_state(self):
         dispatcher = _make_dispatcher()
         subcommands: list[str] = []
@@ -630,6 +659,92 @@ class CmdPlanPendingGateTests(unittest.TestCase):
 
         self.assertEqual(classified["jobs_completed"]["plan"], "PASS")
         self.assertEqual(classified["state"], "incomplete")
+
+    def test_skipped_plan_review_records_error_not_pass(self):
+        class FakeDispatcher:
+            def __init__(self, *a, **kw):
+                pass
+
+            async def run_codex_plan_review(self, plan_text: str, *, resume_thread_id=None) -> dict:
+                return {
+                    "status": "skipped",
+                    "has_major_issues": False,
+                    "summary": "",
+                    "findings": [],
+                    "next_steps": [],
+                    "output": "",
+                    "reason": "codex plan review failed: gpt-5.5 requires newer Codex",
+                    "job_id": "task-failed",
+                    "thread_id": "thread-failed",
+                }
+
+        with patch("sdk.orchestrator._parse_plan_stages", return_value=[
+            Stage(name="Stage 1", has_user_facing_changes=False, files=["apps/web/x.ts"]),
+        ]), patch("sdk.agent_dispatch.AgentDispatcher", FakeDispatcher):
+            _run(cmd_plan(str(self.cwd), self.run_id, None))
+
+        classified = _classify_run_state(self.run_dir)
+        self.assertEqual(classified["jobs_completed"]["plan"], "ERROR")
+        self.assertEqual(classified["state"], "incomplete")
+
+        plan_json = json.loads((self.run_dir / "plan.json").read_text())
+        self.assertEqual(plan_json["codex_review"]["status"], "skipped")
+        self.assertIn("gpt-5.5", plan_json["codex_review"]["reason"])
+
+    def test_skipped_plan_review_blocks_legacy_pass_job(self):
+        (self.run_dir / "plan.json").write_text(json.dumps({
+            "plan_file": ".ai/runs/run-pending/plan.md",
+            "stages": [{"id": "stage-1", "name": "Stage 1"}],
+            "codex_review": {
+                "status": "skipped",
+                "has_major_issues": False,
+                "reason": "codex plan review failed",
+                "job_id": "task-old",
+            },
+        }))
+        jobs_dir = self.run_dir / "jobs"
+        jobs_dir.mkdir()
+        (jobs_dir / "job-plan-old.json").write_text(json.dumps({
+            "command": "plan",
+            "status": "PASS",
+        }))
+
+        classified = _classify_run_state(self.run_dir)
+
+        self.assertEqual(classified["jobs_completed"]["plan"], "PASS")
+        self.assertEqual(classified["state"], "incomplete")
+
+    def test_explicit_skip_codex_is_marked_allowed_and_passes(self):
+        with patch("sdk.orchestrator._parse_plan_stages", return_value=[
+            Stage(name="Stage 1", has_user_facing_changes=False, files=["apps/web/x.ts"]),
+        ]):
+            _run(cmd_plan(str(self.cwd), self.run_id, None, skip_codex=True))
+
+        classified = _classify_run_state(self.run_dir)
+        self.assertEqual(classified["jobs_completed"]["plan"], "PASS")
+        self.assertEqual(classified["state"], "not_started")
+
+        plan_json = json.loads((self.run_dir / "plan.json").read_text())
+        self.assertEqual(plan_json["codex_review"]["status"], "skipped")
+        self.assertTrue(plan_json["codex_review"]["skip_allowed"])
+
+    def test_plan_status_helper_rejects_accidental_skips(self):
+        self.assertEqual(
+            _plan_status_from_codex_review({
+                "status": "skipped",
+                "has_major_issues": False,
+                "reason": "codex failed",
+            }),
+            "ERROR",
+        )
+        self.assertEqual(
+            _plan_status_from_codex_review({
+                "status": "skipped",
+                "has_major_issues": False,
+                "skip_allowed": True,
+            }),
+            "PASS",
+        )
 
 
 if __name__ == "__main__":

@@ -59,9 +59,20 @@ Available subcommands: `run_start`, `run_complete`, `list_runs`, `mark`,
   (codex fix failed / violated scope / produced empty diff, OR Claude
   rejected it) → user must re-run `/donace:plan` to revise manually
 - `PENDING` — `codex_review.status in {queued, running}` → team-lead runs `plan_status` to poll
-- `ERROR` — something broke; read job result JSON
+- `ERROR` — codex review never produced a verdict. Two flavors share this
+  status: (a) **review infra failure** — codex CLI/model version mismatch,
+  plugin missing, background job returned `failed`/`cancelled`, parse failure,
+  or exception in the poller (`codex_review.status == "skipped"` with a
+  `reason` and no `skip_allowed` sentinel); (b) **cmd_plan exception** —
+  unhandled error in the plan command itself (`codex_review.status == "error"`).
+  Both block execute. Read `codex_review.reason` (or `error`) before deciding
+  what to tell the user. `--skip-codex` is an explicit no-review mode, NOT
+  ERROR — it sets `skip_allowed: True` and resolves to PASS.
 
-The gate lives in `_classify_run_state` via `not plan_review_in_progress`.
+The gate lives in `_codex_plan_review_allows_execute` (called from
+`_classify_run_state` and `_plan_status_from_codex_review`). Only
+`status in {completed, pass}` with `has_major_issues == False`, OR
+`status == "skipped"` with `skip_allowed == True`, lets execute proceed.
 A stale on-disk `PASS` plan job is held back if `plan.json.codex_review.status`
 flips to `queued`/`running` (e.g. after a revision kicks off a new review).
 

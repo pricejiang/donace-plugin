@@ -94,6 +94,23 @@ def _prior_codex_thread_id(run_dir: Path) -> str | None:
 
 
 _PLAN_REVIEW_IN_PROGRESS_STATES = {"queued", "running"}
+_PLAN_REVIEW_PASS_STATES = {"completed", "pass"}
+
+
+def _codex_plan_review_allows_execute(codex_review: dict[str, Any]) -> bool:
+    """Return True only when codex review produced an affirmative terminal gate."""
+    status = str(codex_review.get("status", "")).strip().lower()
+    if status in _PLAN_REVIEW_IN_PROGRESS_STATES:
+        return False
+    if codex_review.get("has_major_issues"):
+        return False
+    if status in _PLAN_REVIEW_PASS_STATES:
+        return True
+    # `--skip-codex` is the only intentional no-review path. Accidental
+    # skipped/error review results must block execute instead of becoming PASS.
+    if status == "skipped" and codex_review.get("skip_allowed"):
+        return True
+    return False
 
 
 async def _maybe_apply_codex_plan_fix(
@@ -198,11 +215,18 @@ def _plan_status_from_codex_review(codex_review: dict[str, Any]) -> str:
       - AWAIT_APPROVAL: review found issues AND codex auto-fix produced a
         clean in-scope patch — waiting on the main LLM's approval verdict
         (via cmd_approve_plan or cmd_reject_plan). Execute must not start.
+      - ERROR: codex review failed, was accidentally skipped, or returned an
+        unknown status. This is infrastructure failure, not plan approval.
       - PASS: review had no major issues OR Claude has already approved a
         prior fix
     """
-    if codex_review.get("status") in _PLAN_REVIEW_IN_PROGRESS_STATES:
+    status = str(codex_review.get("status", "")).strip().lower()
+    if status in _PLAN_REVIEW_IN_PROGRESS_STATES:
         return "PENDING"
+    if status == "skipped" and codex_review.get("skip_allowed"):
+        return "PASS"
+    if status not in _PLAN_REVIEW_PASS_STATES:
+        return "ERROR"
     if codex_review.get("has_major_issues"):
         fix = codex_review.get("fix") or {}
         if (
@@ -1267,6 +1291,7 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
     plan_json_path = run_dir / "plan.json"
     plan_json_ready = False
     plan_review_in_progress = False
+    plan_review_allows_execute = True
     if plan_json_path.exists():
         try:
             plan_data_for_state = json.loads(plan_json_path.read_text())
@@ -1275,13 +1300,14 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
             plan_review_in_progress = (
                 codex_review.get("status") in _PLAN_REVIEW_IN_PROGRESS_STATES
             )
+            plan_review_allows_execute = _codex_plan_review_allows_execute(codex_review)
             plan_json_ready = (
                 bool(stages)
-                and not codex_review.get("has_major_issues")
-                and not plan_review_in_progress
+                and plan_review_allows_execute
             )
         except (json.JSONDecodeError, OSError):
             plan_json_ready = False
+            plan_review_allows_execute = False
 
     jobs_completed = info["jobs_completed"]
     plan_status = jobs_completed.get("plan")
@@ -1293,7 +1319,10 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
         or (run_dir / "plan.md").exists()
         or plan_json_path.exists()
     )
-    plan_ready = (plan_status == "PASS" and not plan_review_in_progress) or plan_json_ready
+    plan_ready = (
+        (plan_status == "PASS" and plan_review_allows_execute)
+        or plan_json_ready
+    )
     plan_needs_attention = (
         (plan_status is not None and plan_status != "PASS")
         or (write_plan_status is not None and write_plan_status != "PASS")
@@ -1838,6 +1867,17 @@ async def cmd_plan(
                     "has_major_issues": False,
                     "error": str(exc),
                 }
+        else:
+            codex_review = {
+                "status": "skipped",
+                "has_major_issues": False,
+                "summary": "",
+                "findings": [],
+                "next_steps": [],
+                "output": "",
+                "reason": "codex plan review explicitly skipped by --skip-codex",
+                "skip_allowed": True,
+            }
 
         # Auto-fix: if the review settled with findings, dispatch codex once
         # more (via the same thread) to apply a minimal patch to plan.md.
