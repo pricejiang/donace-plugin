@@ -174,7 +174,10 @@ Always run this once before Step 2 on any resumed run.
 6. On completion notification:
    - **PASS** → continue to next stage
    - **BLOCKED** → read `.ai/runs/<id>/jobs/job-run_job-<stage-id>-*.json` for `unresolved`. Decide: retry with `--max-fix-attempts 3` if mechanical (typo, missing import), or escalate via `AskUserQuestion` if structural.
-   - **INTERRUPTED** → check what was completed, decide next step.
+   - **INTERRUPTED** → read the job JSON's `cancel_reason` field to branch:
+     - `cancel_reason` non-empty (e.g. `"user requested"` — set by `bus.cancel(reason)` when `/api/interrupt` fires) → **user-initiated stop**. Terminal for this team-lead session: stop the main loop, skip remaining stages / wrap work, and return the 3-line summary with the partial state. Do **not** auto-resume in the same session.
+     - `cancel_reason` empty AND `unresolved` contains `rate_limited:` → **infra throttle**. Keep the run resumable: report the pause, preserve partial progress, and only continue / resume when explicitly appropriate.
+     - `cancel_reason` empty AND no `rate_limited:` in `unresolved` → unusual cancel path. Default to terminal handling and surface the job JSON to the user.
 
 ### Stall handling (NEW — replaces the old "wait silently" pattern)
 
@@ -290,7 +293,14 @@ curl -s -X POST localhost:8741/api/interrupt \
   -d '{"job_id": "<id>", "reason": "user requested"}'
 ```
 
-The job will finish its current agent call, then return INTERRUPTED with partial results.
+The job will finish its current agent call, then return `INTERRUPTED` with partial results.
+
+For this user-interrupt path, the resulting job JSON has `cancel_reason` populated (e.g. `"user requested"`) — that is the authoritative signal that a user requested the stop. Treat it as a **terminal stop signal for the current team-lead session**:
+- record the partial state
+- do **not** auto-resume the run in the same session
+- return the normal 3-line summary to `/donace:execute`
+
+Treat `INTERRUPTED` as resumable-by-default only when `cancel_reason` is empty AND `unresolved` reflects an infra cause (e.g. `rate_limited:`), never when `cancel_reason` is set.
 
 ## Rules
 

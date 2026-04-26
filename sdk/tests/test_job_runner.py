@@ -18,6 +18,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from sdk import commands as sdk_cmds  # noqa: E402
+from sdk.agent_dispatch import RateLimitError  # noqa: E402
 from sdk.commands import cmd_run_job  # noqa: E402
 from sdk.events import EventBus, Stage  # noqa: E402
 from sdk.job_runner import JobResult, _collect_failures, run_job  # noqa: E402
@@ -294,6 +295,7 @@ class EmptyFilesStageRoutingTests(unittest.TestCase):
         runtime_status: str,
         runtime_output: str = "",
         runtime_exc: Exception | None = None,
+        cancel_reason_during_runtime: str = "",
     ) -> tuple[dict, dict]:
         """Drive cmd_run_job for stage-verify with a fake runtime verdict.
 
@@ -303,7 +305,7 @@ class EmptyFilesStageRoutingTests(unittest.TestCase):
 
         class FakeDispatcher:
             def __init__(self, *a, **kw):
-                pass
+                self.bus = kw["bus"]
 
             async def query(self, *a, **kw):
                 calls["query"] += 1
@@ -321,6 +323,8 @@ class EmptyFilesStageRoutingTests(unittest.TestCase):
                 calls["runtime"] += 1
                 if runtime_exc:
                     raise runtime_exc
+                if cancel_reason_during_runtime:
+                    self.bus.cancel(cancel_reason_during_runtime)
                 return {
                     "status": runtime_status,
                     "score": "1/1",
@@ -393,6 +397,25 @@ class EmptyFilesStageRoutingTests(unittest.TestCase):
         })
         assert result.get("unresolved")
         self.assertIn("runtime-verifier crashed: browser crashed", " ".join(result["unresolved"]))
+
+    def test_user_cancel_during_runtime_returns_interrupted_with_reason(self):
+        result, calls = self._run_stage(
+            "PASS",
+            "all criteria met",
+            cancel_reason_during_runtime="user requested",
+        )
+
+        self.assertEqual(calls["runtime"], 1)
+        self.assertEqual(calls["query"], 0)
+        self.assertEqual(result["status"], "INTERRUPTED")
+        self.assertEqual(result["interrupted_at"], "verify")
+        self.assertEqual(result["cancel_reason"], "user requested")
+        self.assertEqual(result["completed_steps"], ["verify"])
+        self.assertEqual(result["runtime_result"], {
+            "status": "PASS",
+            "score": "1/1",
+            "output": "all criteria met",
+        })
 
 
 class VerifyOnlyFastPathSanityCheckTests(unittest.TestCase):
@@ -557,6 +580,103 @@ class VerifyOnlyFastPathSanityCheckTests(unittest.TestCase):
         )
         self.assertEqual(calls["runtime"], 1)
         self.assertEqual(calls["query"], 0)
+
+
+class JobResultCancelReasonTests(unittest.TestCase):
+    """JobResult.cancel_reason captures bus.cancel_reason at the INTERRUPTED
+    return sites, so team-lead can distinguish a user-initiated stop (via
+    /api/interrupt → bus.cancel(reason)) from a transient infra interrupt
+    (RateLimitError → unresolved=['rate_limited:...']) without parsing the
+    unresolved list.
+    """
+
+    def _make_stage(self) -> Stage:
+        return Stage(
+            name="Cancel Stage",
+            has_user_facing_changes=False,
+            files=["apps/web/x.ts"],
+        )
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def test_to_dict_includes_cancel_reason(self):
+        r = JobResult(status="INTERRUPTED", cancel_reason="user requested")
+        d = r.to_dict()
+        self.assertIn("cancel_reason", d)
+        self.assertEqual(d["cancel_reason"], "user requested")
+
+    def test_default_cancel_reason_is_empty_string(self):
+        r = JobResult(status="PASS")
+        self.assertEqual(r.cancel_reason, "")
+        self.assertEqual(r.to_dict()["cancel_reason"], "")
+
+    def test_user_cancel_before_implement_records_reason(self):
+        """bus.cancel('user requested') before implement → JobResult carries reason."""
+        stage = self._make_stage()
+        bus = EventBus(run_id="test-run")
+        bus.cancel("user requested")  # /api/interrupt path simulated
+
+        async def query_should_not_be_called(**kwargs):
+            raise AssertionError("query should not run after cancel")
+
+        async def no_tests(stage):
+            return {"passed": 0, "failed": 0, "output": "", "status": "skipped"}
+
+        async def no_codex():
+            return {"status": "skipped", "has_issues": False, "output": ""}
+
+        result: JobResult = self._run(run_job(
+            stage=stage,
+            cwd=str(_REPO_ROOT),
+            bus=bus,
+            query=query_should_not_be_called,
+            run_test_engineer=no_tests,
+            run_codex_review=no_codex,
+            run_runtime_verifier=None,
+            task_context="",
+            skip_agents={"test", "codex", "runtime"},
+        ))
+
+        self.assertEqual(result.status, "INTERRUPTED")
+        self.assertEqual(result.interrupted_at, "implement")
+        self.assertEqual(result.cancel_reason, "user requested")
+        self.assertIsNone(result.unresolved)
+
+    def test_rate_limit_does_not_set_cancel_reason(self):
+        """Rate-limit interrupt keeps cancel_reason empty; reason stays in unresolved."""
+        stage = self._make_stage()
+        bus = EventBus(run_id="test-run")
+
+        async def query_rate_limited(**kwargs):
+            raise RateLimitError("hit your limit · resets 1am")
+
+        async def no_tests(stage):
+            return {"passed": 0, "failed": 0, "output": "", "status": "skipped"}
+
+        async def no_codex():
+            return {"status": "skipped", "has_issues": False, "output": ""}
+
+        result: JobResult = self._run(run_job(
+            stage=stage,
+            cwd=str(_REPO_ROOT),
+            bus=bus,
+            query=query_rate_limited,
+            run_test_engineer=no_tests,
+            run_codex_review=no_codex,
+            run_runtime_verifier=None,
+            task_context="",
+            skip_agents={"test", "codex", "runtime"},
+        ))
+
+        self.assertEqual(result.status, "INTERRUPTED")
+        self.assertEqual(result.cancel_reason, "")
+        assert result.unresolved is not None
+        self.assertIn("rate_limited", " ".join(result.unresolved))
 
 
 if __name__ == "__main__":

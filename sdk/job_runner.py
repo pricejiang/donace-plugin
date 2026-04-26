@@ -37,6 +37,10 @@ class JobResult:
     unresolved: list[str] | None = None
     interrupted_at: str = ""
     completed_steps: list[str] = field(default_factory=list)
+    # Populated when bus.cancel(reason) fires (e.g. /api/interrupt with a
+    # user-supplied reason). Lets team-lead distinguish a user-initiated
+    # stop from a transient infra interrupt without parsing `unresolved`.
+    cancel_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +52,7 @@ class JobResult:
             "unresolved": self.unresolved,
             "interrupted_at": self.interrupted_at,
             "completed_steps": self.completed_steps,
+            "cancel_reason": self.cancel_reason,
         }
 
 
@@ -190,7 +195,12 @@ async def run_job(
 
     # --- 1. Implement ---
     if bus.is_cancelled:
-        return JobResult(status="INTERRUPTED", interrupted_at="implement", completed_steps=completed_steps)
+        return JobResult(
+            status="INTERRUPTED",
+            interrupted_at="implement",
+            completed_steps=completed_steps,
+            cancel_reason=bus.cancel_reason,
+        )
 
     # Lifecycle emits (AgentStarted/Completed/Failed) now live in
     # dispatcher.query(), so no need to wrap each call site here.
@@ -241,7 +251,12 @@ async def run_job(
 
     # --- 2. Verify (parallel) ---
     if bus.is_cancelled:
-        return JobResult(status="INTERRUPTED", interrupted_at="verify", completed_steps=completed_steps)
+        return JobResult(
+            status="INTERRUPTED",
+            interrupted_at="verify",
+            completed_steps=completed_steps,
+            cancel_reason=bus.cancel_reason,
+        )
 
     verify_coros = []
     verify_names = []
@@ -304,6 +319,7 @@ async def run_job(
                 test_result=test_result, codex_result=codex_result,
                 runtime_result=runtime_result, fix_attempts=fix_attempts,
                 interrupted_at="fix_loop", completed_steps=completed_steps,
+                cancel_reason=bus.cancel_reason,
             )
 
         fix_attempts += 1

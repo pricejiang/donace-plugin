@@ -2445,46 +2445,61 @@ async def cmd_run_job(
                     f"plan.md declares files for it. plan.json is stale or "
                     f"malformed; re-run `/donace:plan {run_id}` to regenerate."
                 )
-            # Verify-only stage: no files to modify → skip implementer (who
-            # would raise NEEDS_CONTEXT), skip test-engineer / codex (they
-            # need a diff to review), and route straight to runtime-verifier.
-            # Matches the Stage 8 ('Typecheck, Lint, QA') pattern that used
-            # to waste a 900s implementer dispatch.
-            try:
-                runtime_result = await dispatcher.run_runtime_verifier(stage.name, task_context)
-            except RateLimitError as exc:
+            if bus.is_cancelled:
                 result = JobResult(
                     status="INTERRUPTED",
-                    unresolved=[f"rate_limited: {exc}"],
                     interrupted_at="verify",
-                )
-            except Exception as exc:
-                runtime_result = {"status": "error", "error": str(exc)}
-                result = JobResult(
-                    status="BLOCKED",
-                    runtime_result=runtime_result,
-                    unresolved=[f"runtime-verifier crashed: {exc}"],
-                    completed_steps=["verify"],
+                    cancel_reason=bus.cancel_reason,
                 )
             else:
-                if runtime_result.get("status") == "PASS":
+                # Verify-only stage: no files to modify → skip implementer (who
+                # would raise NEEDS_CONTEXT), skip test-engineer / codex (they
+                # need a diff to review), and route straight to runtime-verifier.
+                # Matches the Stage 8 ('Typecheck, Lint, QA') pattern that used
+                # to waste a 900s implementer dispatch.
+                try:
+                    runtime_result = await dispatcher.run_runtime_verifier(stage.name, task_context)
+                except RateLimitError as exc:
                     result = JobResult(
-                        status="PASS",
-                        runtime_result=runtime_result,
-                        completed_steps=["verify", "done"],
+                        status="INTERRUPTED",
+                        unresolved=[f"rate_limited: {exc}"],
+                        interrupted_at="verify",
                     )
-                else:
-                    unresolved = (
-                        runtime_result.get("output")
-                        or runtime_result.get("error")
-                        or "Runtime verification failed"
-                    )
+                except Exception as exc:
+                    runtime_result = {"status": "error", "error": str(exc)}
                     result = JobResult(
                         status="BLOCKED",
                         runtime_result=runtime_result,
-                        unresolved=[unresolved],
+                        unresolved=[f"runtime-verifier crashed: {exc}"],
                         completed_steps=["verify"],
                     )
+                else:
+                    if bus.is_cancelled:
+                        result = JobResult(
+                            status="INTERRUPTED",
+                            runtime_result=runtime_result,
+                            interrupted_at="verify",
+                            completed_steps=["verify"],
+                            cancel_reason=bus.cancel_reason,
+                        )
+                    elif runtime_result.get("status") == "PASS":
+                        result = JobResult(
+                            status="PASS",
+                            runtime_result=runtime_result,
+                            completed_steps=["verify", "done"],
+                        )
+                    else:
+                        unresolved = (
+                            runtime_result.get("output")
+                            or runtime_result.get("error")
+                            or "Runtime verification failed"
+                        )
+                        result = JobResult(
+                            status="BLOCKED",
+                            runtime_result=runtime_result,
+                            unresolved=[unresolved],
+                            completed_steps=["verify"],
+                        )
         else:
             result = await run_job(
                 stage=stage,
