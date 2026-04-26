@@ -94,7 +94,11 @@ def _prior_codex_thread_id(run_dir: Path) -> str | None:
 
 
 _PLAN_REVIEW_IN_PROGRESS_STATES = {"queued", "running"}
-_PLAN_REVIEW_PASS_STATES = {"completed", "pass"}
+# Only "completed" is produced today by every review path
+# (`_run_codex_plan_review_task`, `_merge_plan_review_passes`,
+# `_parse_completed_plan_review`, etc.). Kept as a set so adding future
+# affirmative variants stays a one-line change.
+_PLAN_REVIEW_PASS_STATES = {"completed"}
 
 
 def _codex_plan_review_allows_execute(codex_review: dict[str, Any]) -> bool:
@@ -1291,6 +1295,11 @@ def _classify_run_state(run_dir: Path) -> dict[str, Any]:
     plan_json_path = run_dir / "plan.json"
     plan_json_ready = False
     plan_review_in_progress = False
+    # Default True so a run with no plan.json yet (state "empty"/"not_started"
+    # before plan phase fires) doesn't get incorrectly classified as
+    # "incomplete" by the plan_ready check below. The actual gate only opens
+    # when plan_json exists AND _codex_plan_review_allows_execute returns True;
+    # this default just suppresses a phantom "blocked" signal in the empty case.
     plan_review_allows_execute = True
     if plan_json_path.exists():
         try:
