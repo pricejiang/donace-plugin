@@ -145,7 +145,37 @@ class BackgroundLaunchTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(captured_task_args), 1)
         self.assertIn("--background", captured_task_args[0])
+        self.assertIn("--write", captured_task_args[0])
         self.assertIn("--resume-last", captured_task_args[0])
+
+    def test_launch_uses_write_sandbox_for_review_thread(self):
+        """Review is logically read-only but needs a write-enabled thread.
+
+        The follow-up plan-fix turn resumes the review thread to preserve
+        context. If the original thread is read-only, Codex cannot apply the
+        fix even when the fix job passes --write.
+        """
+        dispatcher = _make_dispatcher()
+        captured_task_args: list[list[str]] = []
+
+        async def fake(companion_script, subcommand, args, **_kw):
+            if subcommand == "task":
+                captured_task_args.append(list(args))
+                return {"jobId": "task-abc", "threadId": "thread-abc", "status": "queued"}
+            if subcommand == "status":
+                return {"job": {"status": "completed", "threadId": "thread-abc"}}
+            if subcommand == "result":
+                return {"storedJob": {"result": {"finalMessage": '{"verdict":"approve"}'}}}
+            return None
+
+        _install_subcommand_fake(dispatcher, fake)
+
+        _run(dispatcher.run_codex_plan_review("## Plan"))
+
+        self.assertGreaterEqual(len(captured_task_args), 1)
+        for args in captured_task_args:
+            self.assertIn("--background", args)
+            self.assertIn("--write", args)
 
     def test_launch_failure_returns_skipped(self):
         dispatcher = _make_dispatcher()

@@ -479,6 +479,7 @@ def _build_codex_plan_review_prompt(plan_text: str) -> str:
         "Consolidate duplicates into root-cause findings. Prefer fewer complete blocking findings over "
         "many nits, but do not omit any blocking risk.\n\n"
         "Ignore minor wording edits and style nits.\n\n"
+        "Do not edit files or call write tools during review. This pass only returns JSON findings.\n\n"
         "Return ONLY valid JSON in this exact shape:\n"
         "{\n"
         '  "verdict": "approve" | "needs-attention",\n'
@@ -519,6 +520,7 @@ def _build_codex_plan_review_audit_prompt(plan_text: str, first_review: dict) ->
         "- Do not repeat or rephrase first-pass findings. If an issue is already covered, omit it.\n"
         "- Check stage dependency graph, hidden coupling, file scope, verification gaps, migrations/config/data compatibility, user-facing runtime checks, and revision drift.\n"
         "- Ignore style nits and optional improvements.\n\n"
+        "Do not edit files or call write tools during this audit. This pass only returns JSON findings.\n\n"
         "Return ONLY valid JSON in this exact shape:\n"
         "{\n"
         '  "verdict": "approve" | "needs-attention",\n'
@@ -2492,6 +2494,12 @@ class AgentDispatcher:
             task_args = [
                 "--json",
                 "--background",
+                # Codex app-server does not reliably upgrade a resumed
+                # read-only thread to workspace-write. Start review threads
+                # write-enabled so a later plan-fix turn can resume the same
+                # context and edit plan.md; the review prompts still forbid
+                # writes.
+                "--write",
                 "--cwd", self.cwd,
                 "--prompt-file", prompt_path,
             ]
