@@ -10,9 +10,12 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
+import os
 import re
 import secrets
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -189,6 +192,154 @@ def format_test_results_md(*, sid: str, attempt: int, results: Iterable[dict]) -
             lines.append(r["stderr"])
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ---- stage_status rendering ----
+
+_GLYPHS_UTF8 = {
+    "passed": "✓",
+    "running": "⟳",
+    "pending": "·",
+    "blocked": "✗",
+    "interrupted": "‖",
+}
+_GLYPHS_ASCII = {
+    "passed": "*",
+    "running": ">",
+    "pending": ".",
+    "blocked": "!",
+    "interrupted": "|",
+}
+
+
+def _glyph_for(status: str, *, utf8: bool) -> str:
+    table = _GLYPHS_UTF8 if utf8 else _GLYPHS_ASCII
+    return table.get(status, "?")
+
+
+def _reviewer_for(implementer: str) -> str:
+    return {"claude": "codex", "codex": "claude"}[implementer]
+
+
+def _state_summary(status_json: dict | None) -> str:
+    if status_json is None:
+        return "pending"
+    st = status_json.get("status", "pending")
+    rc = status_json.get("retry_count", 0)
+    reason = status_json.get("reason")
+    if st == "passed":
+        return f"passed ({rc + 1} tr{'y' if rc == 0 else 'ies'})"
+    if st == "running":
+        return f"running, retry {rc}/2" if rc else "running"
+    if st in ("blocked", "interrupted"):
+        return f"{st}: {reason}" if reason else st
+    return st
+
+
+def _utf8_supported() -> bool:
+    enc = (os.environ.get("LANG", "") + os.environ.get("LC_ALL", "")).lower()
+    return "utf" in enc
+
+
+def _relative_time(then_iso: str) -> str:
+    """Render 'started X ago' relative to now. then_iso is expected in UTC ('...Z')."""
+    try:
+        # calendar.timegm interprets the struct_time as UTC (mktime would treat it as local).
+        then = time.strptime(then_iso, "%Y-%m-%dT%H:%M:%SZ")
+        delta_sec = int(time.time() - calendar.timegm(then))
+    except Exception:
+        return "started ?"
+    if delta_sec < 60:
+        return f"started {delta_sec}s ago"
+    if delta_sec < 3600:
+        return f"started {delta_sec // 60}m ago"
+    if delta_sec < 86400:
+        return f"started {delta_sec // 3600}h ago"
+    return f"started {delta_sec // 86400}d ago"
+
+
+def render_stage_status(cwd: Path, run_id: str, *, utf8: bool | None = None, width: int | None = None) -> str:
+    if utf8 is None:
+        utf8 = _utf8_supported()
+    if width is None:
+        width = shutil.get_terminal_size((80, 24)).columns
+
+    run_dir = _runs_root(cwd) / run_id
+    if not run_dir.exists():
+        return f"Run {run_id} not found.\n"
+
+    meta = json.loads((run_dir / "meta.json").read_text())
+    stages = parse_plan(cwd, run_id) if (run_dir / "plan.md").exists() else []
+
+    # Per-stage status_json (None if not yet started).
+    stage_states: list[dict | None] = []
+    for s in stages:
+        sj = run_dir / "stages" / s["sid"] / "status.json"
+        stage_states.append(json.loads(sj.read_text()) if sj.exists() else None)
+
+    passed = sum(1 for st in stage_states if st and st.get("status") == "passed")
+    overall = meta.get("status", "unknown")
+
+    lines = []
+    lines.append(
+        f"Run {run_id}  •  {overall}  •  {passed}/{len(stages)} stages passed  •  {_relative_time(meta.get('created_at', ''))}"
+    )
+    lines.append("")
+
+    # Compute name column width.
+    max_name_len = max((len(s["name"]) for s in stages), default=0)
+    name_col = min(max_name_len, max(20, width - 60))
+
+    for stage, st in zip(stages, stage_states):
+        status = (st or {}).get("status", "pending")
+        glyph = _glyph_for(status, utf8=utf8)
+        name = stage["name"]
+        if len(name) > name_col:
+            name = name[: name_col - 1] + "…"
+        impl = stage["implementer"]
+        rev = _reviewer_for(impl)
+        summary = _state_summary(st)
+        lines.append(f"  {glyph}  {stage['sid']:7s} {name:<{name_col}}   {impl} → {rev}   {summary}")
+
+    # Tail extraction for the single active or blocked stage.
+    active_idx = next(
+        (i for i, st in enumerate(stage_states) if st and st.get("status") in ("running", "blocked")),
+        None,
+    )
+    if active_idx is not None:
+        sid = stages[active_idx]["sid"]
+        st = stage_states[active_idx]
+        assert st is not None  # narrowed by the next() filter above
+        tail = _extract_tail(run_dir / "stages" / sid, st)
+        if tail:
+            lines.append("")
+            arrow = "▼" if utf8 else "v"
+            lines.append(f"{arrow} {sid} latest evidence (retry {st.get('retry_count', 0)}):")
+            lines.append(tail)
+
+    return "\n".join(lines) + "\n"
+
+
+def _extract_tail(stage_dir: Path, status_json: dict, *, max_lines: int = 8) -> str:
+    """Last failing test command + tail, OR first [P0] block from review.md."""
+    reason = status_json.get("reason", "")
+    tr = stage_dir / "test-results.md"
+    rv = stage_dir / "review.md"
+
+    if "tests failed" in reason and tr.exists():
+        text = tr.read_text()
+        # Take the last $-prefixed command + its stderr block.
+        chunks = text.split("\n## Command")
+        if chunks:
+            last = chunks[-1]
+            return "  " + "\n  ".join(last.strip().splitlines()[: max_lines + 2])
+    if "P0" in reason and rv.exists():
+        text = rv.read_text()
+        idx = text.find("### [P0]")
+        if idx >= 0:
+            block = text[idx:].split("\n### [", 1)[0]
+            return "  " + "\n  ".join(block.strip().splitlines()[:max_lines])
+    return ""
 
 
 def main(argv: list[str] | None = None) -> int:
