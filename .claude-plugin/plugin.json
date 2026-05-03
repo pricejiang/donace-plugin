@@ -6,7 +6,8 @@
     "name": "Minghao Jiang"
   },
   "skills": [
-    "skills/chat"
+    "skills/chat",
+    "skills/plan"
   ],
   "agents": [
     "agents/planner.md",
