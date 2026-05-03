@@ -15,7 +15,9 @@ Iterate the stages of `.ai/runs/<id>/plan.md`, dispatching implementer + reviewe
 
 1. **Worktree state.** Decide path:
    - **Fresh run** (no `stages/<sid>/status.json` files yet): `git status --porcelain` MUST be empty. If dirty, stop and tell the user to commit/stash first.
-   - **Resume** (some stage has `status.json` with status `running` / `interrupted` / `blocked`): allow dirty worktree IF it's the partial work of an `interrupted` stage. Verify HEAD still matches that stage's saved `pre_stage_sha`. If HEAD diverged (unrelated commit, branch switch), mark the stage `blocked` with reason `resume baseline mismatch` and stop.
+   - **Resume of an interrupted stage**: allow dirty worktree IF it's the partial work of an `interrupted` stage. Verify HEAD still matches that stage's saved `pre_stage_sha`. If HEAD diverged (unrelated commit, branch switch), mark the stage `blocked` with reason `resume baseline mismatch` and stop.
+   - **Resume with a stale `running` stage**: if a prior session died mid-stage and left `status.json.status == "running"`, first rewrite it to `{"status": "interrupted", "reason": "session_ended", ...}` and then follow the interrupted-resume path. Do NOT treat stale `running` as a fresh entry.
+   - **Resume with a `blocked` stage**: do NOT auto-rerun it. Stop, show the blocked reason, and ask the user whether they want to keep the partial work for manual fixes or explicitly discard it and restart the stage.
 
 2. **Read** `.ai/runs/<id>/plan.md`. Use:
 
@@ -33,7 +35,9 @@ For each stage in plan order:
 
 - `status.json.status == "passed"` → skip, advance to next stage.
 - `status.json.status == "interrupted"` → resume in-place: keep `pre_stage_sha` and `retry_count` from disk; flip `status` back to `running`. Do NOT recapture `pre_stage_sha`.
-- Otherwise (no status.json, or status `running`/`blocked`) → fresh entry: capture `pre_stage_sha = git rev-parse HEAD`, write `status.json: {status: "running", retry_count: 0, pre_stage_sha: <sha>}`.
+- `status.json.status == "running"` → treat as a stale in-flight marker from a previous session: rewrite to `interrupted: session_ended`, then resume in-place using the same `pre_stage_sha` and `retry_count`.
+- `status.json.status == "blocked"` → stop immediately and tell the user why this stage is blocked. Do not re-enter automatically.
+- No `status.json` yet → fresh entry: capture `pre_stage_sha = git rev-parse HEAD`, write `status.json: {status: "running", retry_count: 0, pre_stage_sha: <sha>}`.
 
 ### 2. Dispatch implementer (background)
 
@@ -73,6 +77,8 @@ Bash(
   run_in_background=true,
 )
 ```
+
+On retries, append `--retry-context-file .ai/runs/<id>/stages/<sid>/retry-context.md` to that command.
 
 ### 3. Wait for implementer + rate-limit dispatch
 
@@ -188,8 +194,9 @@ Else: proceed to step 11.
 ### 7'. Retry handling (referenced by steps 3, 5, 6, 9, 10)
 
 - Increment `retry_count` in `status.json`.
+- Persist the retry context to `.ai/runs/<id>/stages/<sid>/retry-context.md` so the next implementer attempt sees the exact failing test output / worker error / P0 block.
 - If `retry_count > 2`: write `status.json: {status: "blocked", reason: <one of: "tests failed", "P0 unresolved", "worker errored", "empty diff", ...>}`. Stop the run. Tell the user.
-- Else: feed retry context (the failure detail) into the next implementer dispatch; goto step 2.
+- Else: feed retry context (the failure detail) into the next implementer dispatch; if implementer is codex, include `--retry-context-file .ai/runs/<id>/stages/<sid>/retry-context.md`; goto step 2.
 
 ### 11. Stage PASS
 
@@ -219,7 +226,10 @@ The main LLM never blocks while a worker runs. Common interactions:
 
 - **"what's stage 3 doing"** → Read `.ai/runs/<id>/stages/stage-3/status.json` and tail BashOutput for the active subprocess. Report inline.
 - **"kill stage 3"** → KillShell on the active background process; write `status.json: {status: "interrupted", reason: "user_interrupted"}`; preserve worktree for resume. Stop the run.
-- **"edit plan and restart"** → Stop the current dispatch. Tell the user to decide first whether to **keep partial work** (do nothing; resume picks it up) OR **discard partial work** (`git checkout -- .` to reset tracked files to `pre_stage_sha`, then `rm -f .ai/runs/<id>/stages/<sid>/status.json` so resume restarts the stage fresh). Then they edit `plan.md` and re-invoke `/donace:execute <id>`.
+- **"edit plan and restart"** → Stop the current dispatch. Tell the user to decide first whether to:
+  - **keep partial work**: do nothing; resume picks it up.
+  - **discard partial work**: only on explicit user choice, run `git reset --hard <pre_stage_sha>` and `git clean -fd`, then remove the stage's old evidence files (`status.json`, `retry-context.md`, `diff.patch`, `review.md`, `test-results.md`) so the next `/donace:execute <id>` starts that stage fresh.
+  Then they edit `plan.md` and re-invoke `/donace:execute <id>`.
 
 ## What `/donace:execute` is NOT
 

@@ -6,10 +6,12 @@ contract on stdout and the exit-code contract.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +52,7 @@ class HappyPathTest(unittest.TestCase):
                         stage_id="stage-1",
                         cwd=Path("/fake/project"),
                         diff_file=None,
+                        retry_context_file=None,
                         test_results_file=None,
                         stack=None,
                     )
@@ -72,6 +75,7 @@ class ErrorPathTest(unittest.TestCase):
                         stage_id="stage-1",
                         cwd=Path("/fake/project"),
                         diff_file=None,
+                        retry_context_file=None,
                         test_results_file=None,
                         stack=None,
                     )
@@ -96,6 +100,7 @@ class ErrorPathTest(unittest.TestCase):
                     stage_id="stage-1",
                     cwd=Path("/fake/project"),
                     diff_file=None,
+                    retry_context_file=None,
                     test_results_file=None,
                     stack=None,
                 )
@@ -141,6 +146,134 @@ class ErrorPathTest(unittest.TestCase):
             self.assertEqual(rc, 1)
         finally:
             sys.argv = argv_backup
+
+
+class PromptBuildTest(unittest.TestCase):
+    def test_extract_stage_block_returns_only_target_stage(self):
+        plan_text = """# Plan: example
+
+## Stage 1: first
+- implementer: claude
+- goal: one
+
+## Stage 2: second
+- implementer: codex
+- goal: two
+"""
+        block = codex_call._extract_stage_block(plan_text, "stage-2")
+        self.assertIn("## Stage 2: second", block)
+        self.assertIn("- goal: two", block)
+        self.assertNotIn("## Stage 1: first", block)
+
+    def test_build_prompt_for_implement_includes_stage_block_and_retry_context(self):
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            plugin_root = cwd / "plugin"
+            (plugin_root / "agents" / "prompts").mkdir(parents=True)
+            (plugin_root / "agents" / "prompts" / "codex-implementer.md").write_text("IMPLEMENT PREFIX")
+
+            run_dir = cwd / ".ai" / "runs" / "run-test"
+            run_dir.mkdir(parents=True)
+            (run_dir / "plan.md").write_text(
+                "# Plan: example\n\n"
+                "## Stage 1: add endpoint\n"
+                "- implementer: codex\n"
+                "- goal: add endpoint\n"
+                "- files: a.py\n"
+                "- success criteria:\n"
+                "  - works\n"
+                "- tests:\n"
+                "  - python3 -m unittest\n"
+                "\n"
+                "## Stage 2: follow-up\n"
+                "- implementer: claude\n"
+                "- goal: another\n"
+                "- files: b.py\n"
+                "- success criteria:\n"
+                "  - works\n"
+                "- tests:\n"
+                "  - none: docs-only\n"
+            )
+            retry_path = run_dir / "retry-context.md"
+            retry_path.write_text("stderr tail goes here")
+
+            old_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+            os.environ["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
+            try:
+                prompt = codex_call._build_prompt(
+                    "implement",
+                    "run-test",
+                    "stage-1",
+                    cwd,
+                    None,
+                    retry_path,
+                    None,
+                    None,
+                )
+            finally:
+                if old_plugin_root is None:
+                    os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+                else:
+                    os.environ["CLAUDE_PLUGIN_ROOT"] = old_plugin_root
+
+            self.assertIn("IMPLEMENT PREFIX", prompt)
+            self.assertIn("stage block:", prompt)
+            self.assertIn("## Stage 1: add endpoint", prompt)
+            self.assertNotIn("## Stage 2: follow-up", prompt)
+            self.assertIn("retry context:", prompt)
+            self.assertIn("stderr tail goes here", prompt)
+
+    def test_build_prompt_for_review_includes_stage_block_diff_and_tests(self):
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            plugin_root = cwd / "plugin"
+            (plugin_root / "agents" / "prompts").mkdir(parents=True)
+            (plugin_root / "agents" / "references").mkdir(parents=True)
+            (plugin_root / "agents" / "prompts" / "codex-reviewer.md").write_text("REVIEW PREFIX")
+            (plugin_root / "agents" / "references" / "review-checklist-python.md").write_text("CHECKLIST")
+
+            run_dir = cwd / ".ai" / "runs" / "run-test"
+            run_dir.mkdir(parents=True)
+            (run_dir / "plan.md").write_text(
+                "# Plan: example\n\n"
+                "## Stage 1: add endpoint\n"
+                "- implementer: claude\n"
+                "- goal: add endpoint\n"
+                "- files: a.py\n"
+                "- success criteria:\n"
+                "  - works\n"
+                "- tests:\n"
+                "  - python3 -m unittest\n"
+            )
+            diff_path = run_dir / "diff.patch"
+            diff_path.write_text("diff --git a/a.py b/a.py")
+            test_results_path = run_dir / "test-results.md"
+            test_results_path.write_text("# Test results\n\nexit: 0\n")
+
+            old_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+            os.environ["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
+            try:
+                prompt = codex_call._build_prompt(
+                    "review",
+                    "run-test",
+                    "stage-1",
+                    cwd,
+                    diff_path,
+                    None,
+                    test_results_path,
+                    "python",
+                )
+            finally:
+                if old_plugin_root is None:
+                    os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+                else:
+                    os.environ["CLAUDE_PLUGIN_ROOT"] = old_plugin_root
+
+            self.assertIn("REVIEW PREFIX", prompt)
+            self.assertIn("## Stage 1: add endpoint", prompt)
+            self.assertIn("diff --git a/a.py b/a.py", prompt)
+            self.assertIn("# Test results", prompt)
+            self.assertIn("CHECKLIST", prompt)
 
 
 if __name__ == "__main__":

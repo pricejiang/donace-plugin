@@ -51,6 +51,8 @@ python3 sdk/cli.py mark_completed --run-id <id>
 - `interrupted` — recoverable stop; partial work preserved. Reasons: `rate_limited`, `user_interrupted`, session ended mid-stage. **Resume does NOT consume a retry.**
 - `blocked` — hard stop; needs user intervention. Reasons: `tests failed` (after retry budget exhausted), `P0 unresolved`, `resume baseline mismatch`.
 
+If a previous session dies and leaves a stale `running` status behind, the next `/donace:execute` invocation should rewrite it to `interrupted: session_ended` before resuming. `blocked` is not auto-resumed; the user decides whether to keep or discard partial work first.
+
 **Per-run `meta.json` `status`** (one of): `spec`, `planned`, `running`, `interrupted`, `completed`, `blocked`.
 
 **P0 retry budget**: 3 total tries per stage (initial + 2 retries). Worker errors, test failures, and reviewer P0 findings all consume from the same budget. Rate-limits do NOT.
@@ -73,6 +75,8 @@ python3 sdk/cli.py mark_completed --run-id <id>
 `/donace:execute` requires a clean worktree on fresh start (`git status --porcelain` empty). On resume of an `interrupted` stage, dirty worktree is allowed because that's the partial work; the orchestrator verifies HEAD still matches the saved `pre_stage_sha`. Mismatch → `blocked: resume baseline mismatch`.
 
 The shared worktree is reserved while a run is active. User makes unrelated edits at their own risk; `git add -A` at PASS time will pick them up.
+
+When retrying a failed stage, persist the failure surface to `.ai/runs/<id>/stages/<sid>/retry-context.md` and pass it back into the next implementer attempt. On explicit discard of partial work, reset to `pre_stage_sha`, clean untracked files, and remove the stage's old evidence artifacts before restarting.
 
 ## Invariants worth preserving
 

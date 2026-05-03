@@ -2,7 +2,8 @@
 
 Two CLI modes (mirrors the spec section "Codex shell helper"):
 
-    codex_call.py implement --run-id <id> --stage-id <sid>
+    codex_call.py implement --run-id <id> --stage-id <sid> \
+                            [--retry-context-file <path>]
     codex_call.py review    --run-id <id> --stage-id <sid> \
                             --diff-file <path> \
                             --test-results-file <path> \
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +41,8 @@ _RATE_LIMIT_HINTS = (
     "429",
     "RateLimitError",
 )
+
+_STAGE_HEADER_RE = re.compile(r"^## Stage (\d+): .+$")
 
 
 class RateLimited(Exception):
@@ -88,12 +92,37 @@ def _run_companion(companion: Path, args: list[str], cwd: Path) -> dict:
         raise ValueError(f"codex-companion stdout was not JSON: {proc.stdout[:500]}") from exc
 
 
+def _extract_stage_block(plan_text: str, stage_id: str) -> str:
+    """Return the verbatim markdown block for one stage from plan.md."""
+    stage_num = stage_id.removeprefix("stage-")
+    target_header = f"## Stage {stage_num}:"
+    lines = plan_text.splitlines()
+    start_idx: int | None = None
+
+    for i, line in enumerate(lines):
+        if line.startswith(target_header):
+            start_idx = i
+            break
+
+    if start_idx is None:
+        raise ValueError(f"stage {stage_id} not found in plan.md")
+
+    end_idx = len(lines)
+    for i in range(start_idx + 1, len(lines)):
+        if _STAGE_HEADER_RE.match(lines[i]):
+            end_idx = i
+            break
+
+    return "\n".join(lines[start_idx:end_idx]).strip()
+
+
 def _build_prompt(
     mode: str,
     run_id: str,
     stage_id: str,
     cwd: Path,
     diff_file: Optional[Path],
+    retry_context_file: Optional[Path],
     test_results_file: Optional[Path],
     stack: Optional[str],
 ) -> str:
@@ -113,7 +142,13 @@ def _build_prompt(
 
     plan_path = cwd / ".ai" / "runs" / run_id / "plan.md"
     if plan_path.exists():
-        parts.extend(["", "plan.md (find your stage):", "---", plan_path.read_text(), "---"])
+        plan_text = plan_path.read_text()
+        parts.extend(["", "stage block:", "---", _extract_stage_block(plan_text, stage_id), "---"])
+
+    if mode == "implement" and retry_context_file:
+        if not retry_context_file.exists():
+            raise FileNotFoundError(f"retry context file not found: {retry_context_file}")
+        parts.extend(["", "retry context:", "---", retry_context_file.read_text(), "---"])
 
     if mode == "review":
         if diff_file and diff_file.exists():
@@ -135,12 +170,22 @@ def run(
     stage_id: str,
     cwd: Path,
     diff_file: Optional[Path],
+    retry_context_file: Optional[Path],
     test_results_file: Optional[Path],
     stack: Optional[str],
 ) -> dict:
     """High-level: build prompt, launch task, poll, fetch result."""
     companion = _locate_companion()
-    prompt = _build_prompt(mode, run_id, stage_id, cwd, diff_file, test_results_file, stack)
+    prompt = _build_prompt(
+        mode,
+        run_id,
+        stage_id,
+        cwd,
+        diff_file,
+        retry_context_file,
+        test_results_file,
+        stack,
+    )
 
     # Launch background task.
     launch = _run_companion(
@@ -194,6 +239,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_impl = sub.add_parser("implement")
     p_impl.add_argument("--run-id", required=True)
     p_impl.add_argument("--stage-id", required=True)
+    p_impl.add_argument("--retry-context-file")
 
     p_rev = sub.add_parser("review")
     p_rev.add_argument("--run-id", required=True)
@@ -206,6 +252,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cwd = Path.cwd()
     diff_file = Path(args.diff_file) if getattr(args, "diff_file", None) else None
+    retry_context_file = Path(args.retry_context_file) if getattr(args, "retry_context_file", None) else None
     test_results_file = Path(args.test_results_file) if getattr(args, "test_results_file", None) else None
     stack = getattr(args, "stack", None)
 
@@ -216,6 +263,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             stage_id=args.stage_id,
             cwd=cwd,
             diff_file=diff_file,
+            retry_context_file=retry_context_file,
             test_results_file=test_results_file,
             stack=stack,
         )
