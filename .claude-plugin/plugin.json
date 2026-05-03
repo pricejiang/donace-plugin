@@ -5,6 +5,9 @@
   "author": {
     "name": "Minghao Jiang"
   },
+  "skills": [
+    "skills/chat"
+  ],
   "agents": [
     "agents/planner.md",
     "agents/implementer.md",
