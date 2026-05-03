@@ -155,11 +155,10 @@ Invoked with `<run-id>`.
 
 Flow (main LLM follows this):
 1. Sanity-check: `.ai/runs/<id>/spec.md` exists.
-2. Dispatch planner subagent: `Agent(subagent_type=planner, prompt="<spec.md contents> + 'Write the implementation plan for run <id>. Output ONLY the plan markdown, nothing else.'", run_in_background=true)`.
+2. Dispatch planner subagent: `Agent(subagent_type=planner, prompt="run-id: <id>; cwd: <abs>; spec.md contents below; write the implementation plan to .ai/runs/<id>/plan.md and reply with a short confirmation.", run_in_background=true)`.
 3. While planner runs, main LLM is free — user can chat / clarify; main LLM resumes on completion.
-4. On completion, capture planner's text reply.
-5. Write it to `.ai/runs/<id>/plan.md`.
-6. Tell user: "Plan written. Edit `.ai/runs/<id>/plan.md` if needed (especially `implementer:` tags), then `/donace:execute <id>`."
+4. On completion, verify `.ai/runs/<id>/plan.md` exists and is non-empty. If not, surface the planner's text reply to the user (likely contains the failure reason) and stop.
+5. Tell user: "Plan written. Edit `.ai/runs/<id>/plan.md` if needed (especially `implementer:` tags), then `/donace:execute <id>`."
 
 Why subagent (not inline like `/donace:chat`): plan writing is a focused structured-output task that benefits from fresh context and a specialized prompt. Brainstorm needs main LLM's conversation context with the user (inline); plan writing needs isolation from that context (subagent). Two-level plan: spec.md (informal, conversational, written with user) → plan.md (structured, mechanical, written by planner).
 
@@ -169,9 +168,9 @@ User can hand-edit plan.md to override implementer tags or any other field.
 
 ### Planner subagent contract (`agents/planner.md`)
 
-- **Tools**: `Read`, `Grep`, `Glob`. No `Write` (main LLM writes plan.md from the planner's text reply). No `Bash` for v0.
-- **Input**: spec.md contents + run-id. Free to explore the codebase via Read/Grep/Glob to scope file paths realistically.
-- **Output**: plan.md content as plain markdown text. No conversational preamble.
+- **Tools**: `Read`, `Grep`, `Glob`, `Bash`, `Write`. Bash for context-gathering during planning (e.g., `git log` to see recent activity in target files, `wc -l` to size existing files, `npm test --listTests` to inventory tests, `find` with complex predicates). Write for emitting plan.md to disk directly.
+- **Input** (passed in prompt): run-id, absolute cwd, spec.md contents.
+- **Output**: writes `.ai/runs/<id>/plan.md` directly. Returns a short confirmation summary as the agent's text reply (e.g., "Plan written: 5 stages, 3 claude / 2 codex"). Main LLM uses the reply only for surfacing failure context if the file wasn't written.
 - **Stage decomposition**: sequential, file-bounded. Each stage should land as one bisect-friendly commit.
 - **`implementer:` tag heuristic**:
 
