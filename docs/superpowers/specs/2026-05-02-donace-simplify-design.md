@@ -83,15 +83,16 @@ Critical properties:
 | `agents/prompts/codex-implementer.md` | markdown | 50 | Prompt prefix for codex-as-implementer |
 | `agents/prompts/codex-reviewer.md` | markdown | 50 | Prompt prefix for codex-as-reviewer |
 | `sdk/codex_call.py` | python | ~200 | Subprocess wrapper around codex-companion (`task --background --json` + status + result) |
-| `sdk/cli.py` | python | ~80 | CLI: `donace run_start`, `donace list_runs`, `donace stage_status` |
+| `sdk/cli.py` | python | ~150 | CLI: `donace run_start`, `donace list_runs`, `donace stage_status` (with ASCII pipeline view per the section below) |
 | `sdk/tests/test_codex_call.py` | python | ~150 | Unit tests with mocked subprocess |
 | `sdk/tests/test_plan_parser.py` | python | ~80 | Plan-format parser tests (in `cli.py`) |
 | `sdk/tests/test_run_start.py` | python | ~60 | Run-id creation and `.ai/runs/<id>/` skeleton tests |
 | `sdk/tests/test_execute_test_commands.py` | python | ~100 | Stage `tests:` command parsing, skipping, persistence, and failure handling tests |
+| `sdk/tests/test_stage_status_render.py` | python | ~80 | ASCII pipeline view rendering: header line, glyph mapping, state-summary phrasing, tail extraction, terminal-width handling |
 | `.claude-plugin/plugin.json` | json | ~30 | Plugin metadata paired with skill wiring and README so `/donace:chat`, `/donace:plan`, `/donace:execute` are the public interface |
 | `CLAUDE.md` | markdown | ~100 | Project contract (create or rewrite; this branch may not currently have one) |
 
-Total new code: ~1580 lines. ~510 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, references, contract).
+Total new code: ~1730 lines. ~660 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, references, contract).
 
 ## Public interface / packaging
 
@@ -420,6 +421,57 @@ No "warning severity" advisory like current donace.
 `<id>` format: `run-<8-hex>` (e.g., `run-a1b2c3d4`).
 `<sid>` format: `stage-<n>` (e.g., `stage-1`, `stage-2`).
 
+## `donace stage_status` output
+
+`donace stage_status <run-id>` renders a one-screen ASCII pipeline view of the run from the on-disk artifacts. **No daemon, no event bus, no WebSocket** — purely a function from on-disk state to a rendered string. This is v0's lightweight equivalent of a dashboard: when a user wants to glance at run state, they invoke this; the conversation with main LLM remains the live-interactive surface.
+
+**Inputs read** (all already specified in `## State on disk`):
+- `meta.json` — overall run state, `created_at`.
+- `plan.md` — stage names and `implementer:` tags. Reuses the same parser the planner subagent and `/donace:execute` use; no duplicate parser.
+- `stages/<sid>/status.json` — per-stage state, `retry_count`, `reason?`.
+- `stages/<sid>/test-results.md` — tail extracted on demand for the active or blocked stage.
+- `stages/<sid>/review.md` — tail used when the active or blocked stage has a recorded P0 finding.
+
+**Output layout**:
+
+```
+Run <run-id>  •  <overall-status>  •  N/M stages passed  •  started <relative-time>
+
+  <glyph>  <sid>   <stage-name>             <implementer> → <reviewer>   <state-summary>
+  ...
+
+▼ <active-or-blocked-sid> latest <test-failure | P0-finding> (retry <n>):
+  <tail block>
+```
+
+**Glyphs** (single-character UTF-8, fallback to ASCII when `LANG` is plain):
+- `✓` (`*`) — passed
+- `⟳` (`>`) — running
+- `·` (`.`) — pending (not yet started)
+- `✗` (`!`) — blocked
+- `‖` (`|`) — interrupted
+
+**State-summary phrasing**:
+- `passed (1 try)` / `passed (3 tries)`
+- `running, retry 1/2`
+- `blocked: tests failed` / `blocked: P0 unresolved` / `blocked: resume baseline mismatch`
+- `interrupted: rate_limited` / `interrupted: user_interrupted`
+- `pending` (no qualifier)
+
+**Reviewer column** is derived from the implementer tag using the "opposite model" rule (claude impl → codex review; codex impl → claude review). Stage_status does not need `reviewer:` written into plan.md.
+
+**Tail extraction** (only for the single active or blocked stage, to keep output one-screen):
+- Status `running` or `blocked: tests failed` → last failing command line + last ~8 lines of its stderr/stdout from `test-results.md`.
+- Status `running` retrying after a [P0] (i.e., previous review.md had a P0) → first `### [P0]` block from `review.md`, truncated to ~8 lines.
+- Status `passed` / `pending` / `interrupted` / no clear evidence → omit the tail block.
+
+**Width**:
+- Default 80 columns. Uses `shutil.get_terminal_size()` to expand on wider terminals; never wraps stage rows mid-line.
+- Stage-name column truncates with `…` when the name is longer than the available column width.
+
+**No flags in v0**:
+- `donace stage_status <run-id>` is the only invocation. No `--json`, no `--watch`, no `--stage <sid>` filter, no `--no-color`. Add later if real usage demands it.
+
 ## What we delete from current donace
 
 (`simplify` branches from `main`, so most of these files are already absent on the implementation branch. This section is still useful because the simplification claim is relative to `orchestration`, where these layers exist today.)
@@ -475,6 +527,7 @@ Unit tests:
 - `test_plan_parser.py` — parse plan.md, extract stages, validate `implementer:` tag values, reject malformed.
 - `test_run_start.py` — mints run-id, creates `.ai/runs/<id>/` skeleton.
 - `test_execute_test_commands.py` — parse `tests:` bullets, skip `none:` markers, persist `test-results.md`, and surface failures as retry context.
+- `test_stage_status_render.py` — feed canned `meta.json` + `plan.md` + per-stage status/test-results/review fixtures; assert the exact ASCII output (header line, per-stage rows with glyphs and state-summary phrasing, tail extraction for the active or blocked stage). Cover: all 5 status glyphs, retry counter formatting, `none:` test bullets, missing review.md, narrow vs wide terminal width, and the ASCII fallback when `LANG` is plain.
 
 No tests for skills (prompt files, not code).
 No integration test for `/donace:execute` end-to-end — Claude Code session is the runtime, can't be unit-tested.
@@ -491,7 +544,7 @@ The new donace is bootstrapped on `simplify` branch. Since donace doesn't yet ex
    - Stage 1: skill scaffolding (`skills/chat/SKILL.md`, `skills/plan/SKILL.md`, `skills/execute/SKILL.md`) + package wiring (`plugin.json`, README install docs, contributor skill symlink instructions).
    - Stage 2: agent files (`planner.md`, `implementer.md`, `reviewer.md`) + 4 stack checklists in `agents/references/` + codex prompt prefixes.
    - Stage 3: `sdk/codex_call.py` + tests.
-   - Stage 4: `sdk/cli.py` (`run_start`, `list_runs`, `stage_status`) + tests for plan parsing and execute test-command handling.
+   - Stage 4: `sdk/cli.py` — three subcommands (`run_start`, `list_runs`, `stage_status`) plus the ASCII pipeline view renderer that `stage_status` calls. Tests cover plan parsing, execute test-command handling, and the renderer's glyph/state-summary/tail-extraction outputs.
    - Stage 5: create or rewrite `CLAUDE.md` to reflect the new contract.
 4. **Manually execute the plan** using main LLM + Agent tool. Two bootstrap-specific constraints: (a) all bootstrap stages must use `implementer: claude` because `codex_call.py` doesn't exist until stage 3 lands; (b) reviewer is also `claude` (i.e., subagent dispatch of `reviewer.md` once it lands in stage 2; before that, reviewer is the main LLM doing a manual diff read). Bootstrap is a one-shot dogfood, not a representative run.
 5. **First real run** (post-bootstrap): use `/donace:chat` + `/donace:plan` + `/donace:execute` on a small toy task to verify the full loop end-to-end with both implementer models actually exercised.
