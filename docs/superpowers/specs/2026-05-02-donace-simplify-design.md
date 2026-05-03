@@ -80,6 +80,32 @@ Critical property: **main LLM never blocks on a worker**. Both Agent and Bash us
 
 Total new code: ~1280 lines. ~480 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, contract).
 
+## Agents inventory (delta from `main`)
+
+`main` ships 11 agent files. The simplify pipeline only needs 2 of them; the rest split between "ad-hoc tools we leave alone" and "deleted because they're vestigial."
+
+| File on `main` | Action | Reason |
+|---|---|---|
+| `agents/architect.md` | DELETE | Planning lives in the `/donace:plan` skill, executed by main LLM directly |
+| `agents/implementer.md` | REWRITE | Per spec: TDD-focused, NEEDS_CONTEXT protocol; keep frontmatter, replace body |
+| `agents/ios-reviewer.md` | DELETE | Single `reviewer.md`, not stack-routed |
+| `agents/planner.md` | DELETE | Same as architect — main LLM does this |
+| `agents/qa.md` | KEEP UNCHANGED | Standalone ad-hoc tool, not part of donace pipeline |
+| `agents/runtime-evaluator.md` | DELETE | No runtime verification in v0 |
+| `agents/team-lead.md` | DELETE | Main LLM IS team-lead in new design |
+| `agents/templates/card.md` | DELETE | No card system in v0 |
+| `agents/test-engineer.md` | DELETE | TDD is implementer's responsibility (prompt-only) |
+| `agents/typescript-reviewer.md` | DELETE | Single `reviewer.md`, not stack-routed |
+| `agents/ui-designer.md` | KEEP UNCHANGED | Standalone ad-hoc tool, not part of donace pipeline |
+
+New files added by simplify:
+
+| File | Purpose |
+|---|---|
+| `agents/reviewer.md` | Single reviewer agent. Outputs `[P0]` / `[P1]` / `[P2]` markers per the severity contract below |
+| `agents/prompts/codex-implementer.md` | Prompt prefix used when implementer is `codex` |
+| `agents/prompts/codex-reviewer.md` | Prompt prefix used when reviewer is `codex` |
+
 ## Plan format
 
 ```markdown
@@ -180,6 +206,70 @@ No hook check enforces this. Reviewer can flag missing tests as P0/P1.
 - "what's stage 3 doing" → main LLM reads `status.json` and `BashOutput`, reports.
 - "kill stage 3" → main LLM calls KillShell on the background process; writes `status.json: {status: "blocked"}`.
 - "edit plan and restart" → main LLM stops current dispatch, user edits plan.md, user runs `/donace:execute <id>` again; resume picks up from first non-passed stage.
+
+## Reviewer severity contract: P0 / P1 / P2
+
+The reviewer agent (Claude `reviewer.md` or codex via `codex-reviewer.md` prompt prefix) must tag every finding with `[P0]`, `[P1]`, or `[P2]`. Severity drives execute-loop behavior in `/donace:execute` step 11:
+
+- **[P0]** gates the stage. Even one P0 sends the stage into retry.
+- **[P1]** and **[P2]** are advisory — saved to `review.md`, run continues.
+
+### What goes where
+
+**[P0] — must fix before stage passes**
+- Stage's `success criteria` not met by the diff.
+- Tests listed in the stage's `tests:` field are absent OR failing.
+- Diff introduces a bug that produces incorrect behavior in normal use.
+- Security regression: secret leak, command injection, SQL injection, XSS, auth bypass, sandbox escape.
+- Data corruption or data-loss path.
+- Breaking change to a public API contract not specified in the spec.
+- Stage `files:` listed a file but the diff doesn't actually modify it (implementer skipped a listed file).
+
+**[P1] — advisory; should fix soon, not now**
+- Code quality issue in the diff: deep nesting, unclear naming, duplication, dead code.
+- Missing error handling for a plausible failure mode (not a clear bug, but worth hardening).
+- Coverage gap: a code path in the diff isn't exercised by tests, even though the listed tests pass.
+- Clearly suboptimal complexity (e.g., O(n²) where O(n) is the obvious choice).
+- Project-convention deviation in the diff (a clear pattern in adjacent files not followed).
+
+**[P2] — nit; flag for awareness, no obligation**
+- Naming preferences.
+- Comment phrasing.
+- Cosmetic refactor opportunities ("you could use a list comprehension here").
+- Minor convention inconsistencies in non-load-bearing places.
+
+### Scope rule
+
+The reviewer flags things **on the diff only**. Pre-existing issues in untouched code are out of scope for the review. If a [P0] in the diff is symptomatic of a deeper architectural issue elsewhere, the reviewer flags the symptom in the diff as P0 and notes the architectural concern separately as P1 — it does NOT escalate pre-existing code to P0.
+
+### Reviewer output format
+
+The reviewer must produce a markdown document with this skeleton (parseable by `/donace:execute`):
+
+````markdown
+# Review: stage-<sid>
+
+## Summary
+<one-paragraph verdict>
+
+## Findings
+
+### [P0] <short title>
+<detail; cite file:line where possible>
+
+### [P1] <short title>
+<detail>
+
+### [P2] <short title>
+<detail>
+
+## Tests
+<note about whether listed tests passed, missing tests, parsing notes>
+````
+
+If no findings of a given severity: omit the corresponding `### [Px]` blocks. If no findings at all, `## Findings` reads `(none)`.
+
+The execute skill scans for `### [P0]` / `### [P1]` / `### [P2]` headers (anchored at start of line) to count findings per severity. Anything else in the document is human-facing prose.
 
 ## Codex shell helper (`sdk/codex_call.py`)
 
