@@ -68,7 +68,11 @@ Critical property: **main LLM never blocks on a worker**. Both Agent and Bash us
 | `skills/plan/SKILL.md` | markdown | 100 | spec.md → plan.md with implementer tags |
 | `skills/execute/SKILL.md` | markdown | 200 | The execute loop |
 | `agents/implementer.md` | markdown | 80 | Claude implementer; TDD-focused, NEEDS_CONTEXT protocol |
-| `agents/reviewer.md` | markdown | 60 | Claude reviewer; outputs [P0]/[P1]/[P2] markers |
+| `agents/reviewer.md` | markdown | 60 | Claude reviewer; receives an injected stack checklist + outputs [P0]/[P1]/[P2] markers |
+| `agents/references/review-checklist-python.md` | markdown | 60 | Stack-specific items reviewer looks for in Python diffs |
+| `agents/references/review-checklist-typescript.md` | markdown | 60 | TypeScript / JS items |
+| `agents/references/review-checklist-ios.md` | markdown | 60 | Swift / Objective-C / iOS items |
+| `agents/references/review-checklist-general.md` | markdown | 40 | Stack-agnostic catchall |
 | `agents/prompts/codex-implementer.md` | markdown | 50 | Prompt prefix for codex-as-implementer |
 | `agents/prompts/codex-reviewer.md` | markdown | 50 | Prompt prefix for codex-as-reviewer |
 | `sdk/codex_call.py` | python | ~200 | Subprocess wrapper around codex-companion (`task --background --json` + status + result) |
@@ -78,7 +82,7 @@ Critical property: **main LLM never blocks on a worker**. Both Agent and Bash us
 | `.claude-plugin/plugin.json` | json | ~30 | Plugin manifest |
 | `CLAUDE.md` | markdown | ~100 | Project contract (rewritten, much shorter) |
 
-Total new code: ~1280 lines. ~480 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, contract).
+Total new code: ~1480 lines. ~510 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, references, contract).
 
 ## Agents inventory (delta from `main`)
 
@@ -88,21 +92,22 @@ Total new code: ~1280 lines. ~480 of that is Python (codex_call + cli + tests); 
 |---|---|---|
 | `agents/architect.md` | DELETE | Planning lives in the `/donace:plan` skill, executed by main LLM directly |
 | `agents/implementer.md` | REWRITE | Per spec: TDD-focused, NEEDS_CONTEXT protocol; keep frontmatter, replace body |
-| `agents/ios-reviewer.md` | DELETE | Single `reviewer.md`, not stack-routed |
+| `agents/ios-reviewer.md` | DELETE | Replaced by single `reviewer.md` + `references/review-checklist-ios.md` (orchestration's `code-reviewer + references/` pattern) |
 | `agents/planner.md` | DELETE | Same as architect — main LLM does this |
 | `agents/qa.md` | KEEP UNCHANGED | Standalone ad-hoc tool, not part of donace pipeline |
 | `agents/runtime-evaluator.md` | DELETE | No runtime verification in v0 |
 | `agents/team-lead.md` | DELETE | Main LLM IS team-lead in new design |
 | `agents/templates/card.md` | DELETE | No card system in v0 |
 | `agents/test-engineer.md` | DELETE | TDD is implementer's responsibility (prompt-only) |
-| `agents/typescript-reviewer.md` | DELETE | Single `reviewer.md`, not stack-routed |
+| `agents/typescript-reviewer.md` | DELETE | Replaced by single `reviewer.md` + `references/review-checklist-typescript.md` |
 | `agents/ui-designer.md` | KEEP UNCHANGED | Standalone ad-hoc tool, not part of donace pipeline |
 
 New files added by simplify:
 
 | File | Purpose |
 |---|---|
-| `agents/reviewer.md` | Single reviewer agent. Outputs `[P0]` / `[P1]` / `[P2]` markers per the severity contract below |
+| `agents/reviewer.md` | Single reviewer agent. Receives a stack-specific checklist via injected payload + outputs `[P0]` / `[P1]` / `[P2]` markers per the severity contract below |
+| `agents/references/review-checklist-{python,typescript,ios,general}.md` | Stack-specific checklist items. Reviewer reads the matching one for the stage's stack |
 | `agents/prompts/codex-implementer.md` | Prompt prefix used when implementer is `codex` |
 | `agents/prompts/codex-reviewer.md` | Prompt prefix used when reviewer is `codex` |
 
@@ -183,14 +188,15 @@ Flow:
       - codex:  `Bash("python sdk/codex_call.py implement --run-id <id> --stage-id <sid>", run_in_background=true)`
    6. Wait for completion (notification or BashOutput drain).
    7. Capture diff: `git diff <pre_stage_sha>`.
-   8. Build reviewer payload: stage block + diff + success criteria.
-   9. Dispatch reviewer (OPPOSITE model, background, same pattern).
-   10. Parse reviewer output for `[P0]` / `[P1]` / `[P2]` markers.
-   11. If implementer worker errored at step 6 OR reviewer worker errored at step 9 OR review parsed at least one [P0]:
+   8. Detect stack from diff file extensions (`.py` → python, `.ts`/`.tsx`/`.js`/`.jsx` → typescript, `.swift`/`.m`/`.mm` → ios, else → general). Read `agents/references/review-checklist-<stack>.md`.
+   9. Build reviewer payload: stage block + diff + stack checklist contents + success criteria.
+   10. Dispatch reviewer (OPPOSITE model, background, same pattern). Codex path: `codex_call.py review --stack <name>` so the helper loads the same checklist on its side.
+   11. Parse reviewer output for `[P0]` / `[P1]` / `[P2]` markers.
+   12. If implementer worker errored at step 6 OR reviewer worker errored at step 10 OR review parsed at least one [P0]:
        - retry_count++
        - If retry_count > 2: write `status.json: {status: "blocked", reason}`, stop run, report.
        - Else: feed retry context (worker error message OR P0 findings) into implementer payload, GOTO step 5.
-   12. No P0 and both workers succeeded:
+   13. No P0 and both workers succeeded:
        - `git add -A && git commit` of all working-tree changes from this stage. The stage's `files:` field is a hint to planner+implementer, NOT a hard commit boundary — out-of-scope writes are allowed (and reviewer flags them P0 if problematic).
        - Write `status.json: {status: "passed"}`.
        - Save P1/P2 findings to `.ai/runs/<id>/stages/<sid>/review.md`.
@@ -211,7 +217,7 @@ No hook check enforces this. Reviewer can flag missing tests as P0/P1.
 
 The reviewer agent (Claude `reviewer.md` or codex via `codex-reviewer.md` prompt prefix) must tag every finding with `[P0]`, `[P1]`, or `[P2]`. Severity drives execute-loop behavior in `/donace:execute` step 11:
 
-- **[P0]** gates the stage. Even one P0 sends the stage into retry.
+- **[P0]** gates the stage. Even one P0 sends the stage into retry (see `/donace:execute` step 12).
 - **[P1]** and **[P2]** are advisory — saved to `review.md`, run continues.
 
 ### What goes where
@@ -271,18 +277,47 @@ If no findings of a given severity: omit the corresponding `### [Px]` blocks. If
 
 The execute skill scans for `### [P0]` / `### [P1]` / `### [P2]` headers (anchored at start of line) to count findings per severity. Anything else in the document is human-facing prose.
 
+### Stack-specific items via `references/`
+
+The severity rubric above is universal. Stack-specific anti-patterns and idiomatic concerns live in `agents/references/review-checklist-<stack>.md`. Execute detects the stage's stack from the diff and injects the matching checklist into the reviewer payload.
+
+**Stack detection** (`/donace:execute` between steps 7 and 9):
+1. Look at file extensions in the diff:
+   - `.py` → `python`
+   - `.ts` / `.tsx` / `.js` / `.jsx` → `typescript`
+   - `.swift` / `.m` / `.mm` (or `.h` colocated with `.swift`/`.m`) → `ios`
+   - Mixed / no match / can't tell → `general`
+2. Read `agents/references/review-checklist-<stack>.md`.
+3. Include its contents verbatim in the reviewer payload, between the diff and the "produce a [P0]/[P1]/[P2] review" instruction.
+
+For codex reviewer, `codex_call.py review --stack <name>` loads the same file and injects it the same way before composing the codex prompt.
+
+**Checklist file format** — each `references/review-checklist-<stack>.md`:
+- Markdown bullets organized under `## P0 (block stage)` / `## P1 (advisory)` / `## P2 (nit)` headings.
+- Each bullet: a stack-specific anti-pattern with a one-line "why" and a code example.
+- Length target: 40-80 lines.
+- Severity buckets are advisory to the reviewer — the universal contract above takes precedence if they conflict (e.g., a checklist item listed under P1 that becomes P0 in a particular case because it's a security regression).
+
+Sample items to seed each file:
+- **python**: bare `except:` → P1; `subprocess(..., shell=True)` with user input → P0; mutable default arg → P1; `# type: ignore` without comment → P2.
+- **typescript**: `any` type when concrete is feasible → P1; non-null assertion `!` on user-provided value → P0; `console.log` left in non-debug code → P2; `as` casts of network responses without validation → P0.
+- **ios**: force-unwrap of optionals from user input or network → P0; force-cast `as!` → P0 if user-controlled; implicitly-unwrapped optional on lazy property → P1; `print()` left in shipped code → P2.
+- **general**: function > 100 lines → P1; magic numbers in business logic → P2; commented-out code in the diff → P2.
+
 ## Codex shell helper (`sdk/codex_call.py`)
 
 Single Python script with two CLI modes:
 
 ```
 codex_call.py implement --run-id <id> --stage-id <sid>
-codex_call.py review    --run-id <id> --stage-id <sid> --diff-file <path>
+codex_call.py review    --run-id <id> --stage-id <sid> --diff-file <path> --stack <python|typescript|ios|general>
 ```
 
 Behavior (mirrors orchestration commit `2317a3f`):
 1. Locate codex companion: `~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs`.
-2. Build prompt = role-specific prefix file (`agents/prompts/codex-{implementer,reviewer}.md`) + stage payload.
+2. Build prompt:
+   - For `implement`: `codex-implementer.md` prefix + stage payload.
+   - For `review`: `codex-reviewer.md` prefix + diff + `references/review-checklist-<stack>.md` contents + stage success criteria + the universal severity rubric (echoed inline so codex doesn't have to remember it).
 3. Run `node codex-companion.mjs task --background --json --prompt <prompt> --cwd <cwd>` → capture jobId.
 4. Poll: `node codex-companion.mjs status <jobId>` every 5s, max 600s.
 5. Fetch: `node codex-companion.mjs result <jobId>` → final message.
@@ -379,7 +414,7 @@ The new donace is bootstrapped on `simplify` branch. Since donace doesn't yet ex
 2. **Write spec doc** (this) — in progress.
 3. **Write implementation plan** — `.ai/runs/<bootstrap-id>/plan.md` by hand. Stages:
    - Stage 1: skill scaffolding (`skills/chat/SKILL.md`, `skills/plan/SKILL.md`, `skills/execute/SKILL.md`) + plugin.json.
-   - Stage 2: agent files (`implementer.md`, `reviewer.md`) + codex prompt prefixes.
+   - Stage 2: agent files (`implementer.md`, `reviewer.md`) + 4 stack checklists in `agents/references/` + codex prompt prefixes.
    - Stage 3: `sdk/codex_call.py` + tests.
    - Stage 4: `sdk/cli.py` (`run_start`, `list_runs`, `stage_status`) + tests.
    - Stage 5: rewrite `CLAUDE.md` to reflect new contract.
