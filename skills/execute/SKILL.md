@@ -5,7 +5,7 @@ description: Run the execute loop on a plan.md — for each stage, dispatch impl
 
 # /donace:execute
 
-Iterate the stages of `.ai/runs/<id>/plan.md`, dispatching implementer + reviewer per stage with the contracts in [the spec](../../docs/superpowers/specs/2026-05-02-donace-simplify-design.md) sections "/donace:execute skill" and "Reviewer severity contract".
+Iterate the stages of `.ai/runs/<id>/plan.md`, dispatching implementer + reviewer per stage. Per-stage gate: P0 review findings or test failures retry the stage up to 2 times; rate-limit hits drive the stage to `interrupted` without consuming a retry. The 15-step loop, severity contract, and stop-state semantics are all defined inline below.
 
 ## Inputs
 

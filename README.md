@@ -54,7 +54,7 @@ python3 sdk/cli.py stage_status run-a1b2c3d4
 
 ## Design
 
-See [docs/superpowers/specs/2026-05-02-donace-simplify-design.md](docs/superpowers/specs/2026-05-02-donace-simplify-design.md) for the full spec, including the reviewer severity contract, stop-state semantics, and bootstrap order.
+See [docs/specs/2026-05-02-donace-simplify-design.md](docs/specs/2026-05-02-donace-simplify-design.md) for the full spec, including the reviewer severity contract, stop-state semantics, and bootstrap order.
 
 ## License
 

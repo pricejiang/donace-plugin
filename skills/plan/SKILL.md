@@ -36,10 +36,9 @@ Dispatch the planner subagent to convert `.ai/runs/<id>/spec.md` into `.ai/runs/
    <verbatim contents of .ai/runs/<id>/spec.md>
    ---
 
-   Write the implementation plan to .ai/runs/<id>/plan.md per the planner contract
-   in docs/superpowers/specs/2026-05-02-donace-simplify-design.md (section
-   "Planner subagent contract"). When done, reply with a short confirmation
-   summary like "Plan written: 5 stages, 3 claude / 2 codex".
+   Write the implementation plan to .ai/runs/<id>/plan.md. When done, reply
+   with a short confirmation summary like "Plan written: 5 stages, 3 claude
+   / 2 codex".
    ```
 
 3. **Stay interactive.** While the planner runs, the main LLM is free. The user can chat, clarify, or interrupt. When the Agent completes, you'll be notified.

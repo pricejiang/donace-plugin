@@ -92,7 +92,7 @@ Parallel stages via worktrees (v1), unattended overnight runs / detach (v2), `/d
 
 ## Spec source of truth
 
-[docs/superpowers/specs/2026-05-02-donace-simplify-design.md](docs/superpowers/specs/2026-05-02-donace-simplify-design.md)
+[docs/specs/2026-05-02-donace-simplify-design.md](docs/specs/2026-05-02-donace-simplify-design.md)
 
 ## Non-contracts
 
