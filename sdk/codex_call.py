@@ -32,6 +32,18 @@ _PLUGIN_CACHE = Path.home() / ".claude" / "plugins" / "cache" / "openai-codex" /
 _POLL_INTERVAL_SEC = 5
 _POLL_MAX_SEC = 600
 
+# Sentinel substrings codex-companion's status response may surface for rate limit.
+_RATE_LIMIT_HINTS = (
+    "rate limit",
+    "rate-limit",
+    "429",
+    "RateLimitError",
+)
+
+
+class RateLimited(Exception):
+    """Raised when codex / its upstream model hits a rate limit. Exit code 2."""
+
 
 def _locate_companion() -> Path:
     """Find the most recent codex-companion.mjs under ~/.claude/plugins/cache/openai-codex."""
@@ -159,6 +171,11 @@ def run(
         raise TimeoutError(f"codex job {job_id} did not finish within {_POLL_MAX_SEC}s")
 
     if st != "completed":
+        # Inspect the entire status response for rate-limit hints before
+        # falling through to a generic worker_failed.
+        status_text = json.dumps(status_resp).lower()
+        if any(hint.lower() in status_text for hint in _RATE_LIMIT_HINTS):
+            raise RateLimited(f"codex job {job_id} rate-limited: {status_resp.get('error', '')[:200]}")
         raise RuntimeError(f"codex job {job_id} terminal status: {st} ({status_resp.get('error', '')[:200]})")
 
     # Fetch result.
@@ -204,9 +221,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         print(json.dumps(out))
         return 0
+    except RateLimited as exc:
+        print(json.dumps({"status": "error", "error_class": "rate_limited", "message": str(exc)}))
+        return 2
+    except FileNotFoundError as exc:
+        print(json.dumps({"status": "error", "error_class": "plugin_missing", "message": str(exc)}))
+        return 1
+    except TimeoutError as exc:
+        print(json.dumps({"status": "error", "error_class": "timeout", "message": str(exc)}))
+        return 1
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "error_class": "parse_fail", "message": str(exc)}))
+        return 1
     except Exception as exc:
-        # Task 10 elaborates the error_class taxonomy + rate-limit detection.
-        # Happy-path build only.
         print(json.dumps({"status": "error", "error_class": "worker_failed", "message": str(exc)}))
         return 1
 
