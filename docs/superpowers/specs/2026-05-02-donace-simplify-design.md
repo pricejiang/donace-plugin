@@ -214,35 +214,45 @@ Flow:
 1. Preflight:
    - **Fresh run** (no stage has started yet): require `git status --porcelain` to be empty. If the worktree is dirty, stop and tell the user to commit/stash first. v0 deliberately uses a shared worktree; clean start is the safety boundary.
    - **Resume of an `interrupted` stage**: allow the dirty worktree to remain, because those edits are presumed to be the partial progress of that interrupted stage. Before resuming, verify that the current branch/HEAD still match the interrupted stage's recorded `pre_stage_sha` baseline (that is: no new commit, branch switch, or unrelated git move happened after interruption). If that check fails, stop and mark the stage `blocked` with a reason like `resume baseline mismatch`; do not auto-reset away partial work.
+   - **Resume with a stale `running` stage**: if a previous session died mid-stage and left `status.json.status == "running"`, first rewrite it to `{"status": "interrupted", "reason": "session_ended", ...}` and then follow the interrupted-resume path. Do not treat stale `running` as a fresh entry.
+   - **Resume with a `blocked` stage**: do not auto-rerun it. Stop, show the blocked reason, and have the user choose whether to keep the partial work for manual fixes or explicitly discard it and restart the stage.
 2. Read `.ai/runs/<id>/plan.md`, parse stages.
 3. For each stage in order:
-   1. Skip if `status.json` says `passed` (resume support). If it says `interrupted`, resume that stage from the current worktree instead of discarding partial progress.
+   1. Stage-entry gate:
+      - `status.json.status == "passed"` → skip, advance to next stage.
+      - `status.json.status == "interrupted"` → resume that stage from the current worktree; preserve `pre_stage_sha` and `retry_count`.
+      - `status.json.status == "running"` → treat as stale in-flight state from a previous session; rewrite to `interrupted: session_ended`, then resume using the same `pre_stage_sha` and `retry_count`.
+      - `status.json.status == "blocked"` → stop immediately and tell the user why the stage is blocked. Do not re-enter automatically.
+      - No `status.json` yet → fresh entry.
    2. Establish `pre_stage_sha`: on first entry to the stage, capture `git rev-parse HEAD`. On resume from `interrupted`, read the value already in `status.json` — the preflight has already verified HEAD still matches it.
    3. Write `status.json: {status: "running", retry_count: 0, pre_stage_sha}` on first entry to the stage. On resume from `interrupted`, preserve the original `pre_stage_sha` and `retry_count`; only flip `status` back to `running`.
    4. Build implementer payload: stage block + TDD reminder.
    5. Dispatch implementer (background):
       - claude: `Agent(subagent_type=implementer, prompt=payload, run_in_background=true)`
       - codex:  `Bash("python sdk/codex_call.py implement --run-id <id> --stage-id <sid>", run_in_background=true)`
+        On retries, append `--retry-context-file .ai/runs/<id>/stages/<sid>/retry-context.md`.
    6. Wait for completion (notification or BashOutput drain). If the worker reports rate-limit (codex_call.py exit 2 OR Agent surfaces a `RateLimitError`), write `status.json: {status: "interrupted", reason: "rate_limited"}`, stop the run, report to user; resume preserves partial work and picks up the same stage **without consuming a retry**. Otherwise proceed to step 7.
    7. Run the stage's `tests:` commands from repo root, skipping only bullets that begin with `none:`. Save command, exit code, and stdout/stderr snapshot to `.ai/runs/<id>/stages/<sid>/test-results.md`.
    8. If any runnable test command failed:
        - retry_count++
+       - Persist the failure surface to `.ai/runs/<id>/stages/<sid>/retry-context.md`.
        - If retry_count > 2: write `status.json: {status: "blocked", reason: "tests failed"}`, stop run, report.
        - Else: feed the failing test output back to implementer and GOTO step 5.
    9. Capture diff: `git diff <pre_stage_sha>`.
       - Persist that diff to `.ai/runs/<id>/stages/<sid>/diff.patch` before review dispatch. This file is the reviewer/codex-review input artifact for the current attempt.
    10. Detect stack from diff file extensions (`.py` → python, `.ts`/`.tsx`/`.js`/`.jsx` → typescript, `.swift`/`.m`/`.mm` → ios, else → general). Read `agents/references/review-checklist-<stack>.md`.
    11. Build reviewer payload: stage block + diff + test-results + stack checklist contents + success criteria.
-   12. Dispatch reviewer (OPPOSITE model, background, same pattern). Codex path: `codex_call.py review --diff-file .ai/runs/<id>/stages/<sid>/diff.patch --test-results-file .ai/runs/<id>/stages/<sid>/test-results.md --stack <name>` so the helper loads the same checklist and the same collected evidence on its side.
-   13. Parse reviewer output for `[P0]` / `[P1]` / `[P2]` markers.
+   12. Dispatch reviewer (OPPOSITE model, background, same pattern). Codex path: `codex_call.py review --diff-file .ai/runs/<id>/stages/<sid>/diff.patch --test-results-file .ai/runs/<id>/stages/<sid>/test-results.md --stack <name>` so the helper loads the same checklist and the same collected evidence on its side. On successful completion, save the returned markdown immediately to `.ai/runs/<id>/stages/<sid>/review.md`.
+   13. Parse reviewer output for `[P0]` / `[P1]` / `[P2]` markers from `review.md`.
    14. If implementer worker errored at step 6 OR reviewer worker errored at step 12 OR review parsed at least one [P0]:
        - retry_count++
+       - Persist the failure surface to `.ai/runs/<id>/stages/<sid>/retry-context.md`.
        - If retry_count > 2: write `status.json: {status: "blocked", reason}`, stop run, report.
-       - Else: feed retry context (worker error message OR failing test output OR P0 findings) into implementer payload, GOTO step 5.
+       - Else: feed retry context (worker error message OR failing test output OR P0 findings) into implementer payload; for codex implementer, include `--retry-context-file .ai/runs/<id>/stages/<sid>/retry-context.md`; GOTO step 5.
    15. No P0, all runnable tests passed, and both workers succeeded:
        - `git add -A && git commit` of the reviewed working-tree changes from this stage.
        - Write `status.json: {status: "passed"}`.
-       - Save the reviewer's final output to `.ai/runs/<id>/stages/<sid>/review.md` (it contains only P1/P2 findings by definition — any P0 caused an earlier retry).
+       - The reviewer's latest output already lives at `.ai/runs/<id>/stages/<sid>/review.md` from the review step. By the time the stage passes, it contains only P1/P2 findings by definition — any P0 caused an earlier retry.
        - Next stage.
 4. All stages PASS: write `meta.json: {status: "completed"}`, report to user.
 
@@ -281,7 +291,10 @@ Flow:
 **User interruption during execution**:
 - "what's stage 3 doing" → main LLM reads `status.json` and `BashOutput`, reports.
 - "kill stage 3" → main LLM calls KillShell on the background process; writes `status.json: {status: "interrupted", reason: "user_interrupted"}` and preserves the current worktree for resume.
-- "edit plan and restart" → main LLM stops current dispatch. If the user wants to change the current stage's intended work, they decide first: **keep partial work** (do nothing; resume picks it up) OR **discard partial work** (`git checkout -- .` to reset tracked files to `pre_stage_sha` + `rm -f .ai/runs/<id>/stages/<sid>/status.json` so resume restarts the stage fresh). Then user edits plan.md and runs `/donace:execute <id>` again.
+- "edit plan and restart" → main LLM stops current dispatch. If the user wants to change the current stage's intended work, they decide first:
+  - **keep partial work**: do nothing; resume picks it up.
+  - **discard partial work**: only on explicit user choice, run `git reset --hard <pre_stage_sha>` and `git clean -fd`, then remove the stage's old evidence files (`status.json`, `retry-context.md`, `diff.patch`, `review.md`, `test-results.md`) so the next `/donace:execute <id>` starts that stage fresh.
+  Then user edits plan.md and runs `/donace:execute <id>` again.
 
 ## Reviewer severity contract: P0 / P1 / P2
 
@@ -380,15 +393,15 @@ Sample items to seed each file:
 Single Python script with two CLI modes:
 
 ```
-codex_call.py implement --run-id <id> --stage-id <sid>
+codex_call.py implement --run-id <id> --stage-id <sid> [--retry-context-file <path>]
 codex_call.py review    --run-id <id> --stage-id <sid> --diff-file <path> --test-results-file <path> --stack <python|typescript|ios|general>
 ```
 
 Behavior (mirrors orchestration commit `2317a3f`):
 1. Locate codex companion: `~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs`.
 2. Build prompt:
-   - For `implement`: `codex-implementer.md` prefix + stage payload.
-   - For `review`: `codex-reviewer.md` prefix + diff + `test-results.md` contents + `references/review-checklist-<stack>.md` contents + stage success criteria + the universal severity rubric (echoed inline so codex doesn't have to remember it).
+   - For `implement`: `codex-implementer.md` prefix + current stage block + optional retry context.
+   - For `review`: `codex-reviewer.md` prefix + current stage block + diff + `test-results.md` contents + `references/review-checklist-<stack>.md` contents + the universal severity rubric (echoed inline so codex doesn't have to remember it).
 3. Run `node codex-companion.mjs task --background --json --prompt <prompt> --cwd <cwd>` → capture jobId.
 4. Poll: `node codex-companion.mjs status <jobId>` every 5s, max 600s.
 5. Fetch: `node codex-companion.mjs result <jobId>` → final message.
@@ -410,9 +423,9 @@ No "warning severity" advisory like current donace.
   stages/
     <sid>/
       status.json        # {status, retry_count, pre_stage_sha, reason?}
-      impl.md            # latest implementer output
+      retry-context.md   # latest failure surface fed into the next retry (tests / worker error / P0 block)
       test-results.md    # listed test commands + exit codes + output snapshots
-      review.md          # latest reviewer output (P1/P2 advisory findings)
+      review.md          # latest reviewer output; saved immediately after each review attempt
       diff.patch         # current-attempt diff used for review; after PASS it also serves as the final stage diff snapshot
 ```
 
