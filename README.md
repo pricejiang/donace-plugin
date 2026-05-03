@@ -1,68 +1,61 @@
-# Donace
+# donace
 
-Generator-Evaluator agent harness for Claude Code. Sprint-based development workflow with cross-model review (Claude + Codex) and knowledge persistence.
+Plan / execute / review pipeline that orchestrates Claude Code and Codex on a per-stage basis.
 
-## Agents
+## What it does
 
-| Agent | Model | Role |
-|---|---|---|
-| **team-lead** | opus | Orchestrator — coordinates the full workflow |
-| **planner** | opus | Expands brief into product spec |
-| **architect** | opus | Designs staged implementation plan |
-| **implementer** | sonnet | Writes production code following the plan |
-| **runtime-evaluator** | opus | Runtime verification via Playwright / Xcode Simulator / curl |
-| **test-engineer** | sonnet | Writes and runs unit tests |
-| **ios-reviewer** | opus | Deep iOS/Swift code review |
-| **typescript-reviewer** | opus | Deep TypeScript/React code review |
-| **ui-designer** | opus | On-demand UI/UX design specs |
+- `/donace:chat` — brainstorm with the main LLM, write `spec.md`.
+- `/donace:plan <run-id>` — planner subagent reads `spec.md`, emits `plan.md` with stages tagged `implementer: claude|codex`.
+- `/donace:execute <run-id>` — for each stage: dispatch implementer (background), run listed `tests:`, dispatch reviewer (the opposite model), commit on PASS. P0 findings or test failures retry the stage up to 2 times; rate-limit hits drive the stage to `interrupted` and resume cleanly.
 
-## Workflow
+The main LLM in your Claude Code session orchestrates everything — there is no team-lead subagent. Workers run in the background so you can chat / clarify / interrupt at any time.
 
-```
-Phase 0: Boot (restore context from .ai/sessions/ and .ai/cards/)
-Phase 1: Planning (planner → architect)
-Phase 2: Sprint Loop
-  ├── Sprint contract (runtime-evaluator)
-  ├── Implement (implementer)
-  ├── Verify (test-engineer + Codex review + runtime-evaluator)
-  └── Fix loop (max 3 cycles)
-Phase 3: Completion (final Claude review + session log + knowledge cards)
-```
+## Install
 
-## Install as Plugin
+This is a Claude Code plugin. To install for development:
 
 ```bash
-/plugin marketplace add pricejiang/donace-plugin
-/plugin install donace@pricejiang-donace-plugin
+cd ~/.claude/plugins/local
+ln -s /path/to/donace donace
 ```
 
-Then use agents with the `donace:` prefix:
+Then restart Claude Code (or run `/plugin reload donace`). Skills `/donace:chat`, `/donace:plan`, and `/donace:execute` will be available.
+
+Codex stages additionally require the `openai-codex` plugin to be installed (donace shells out to its `codex-companion.mjs`).
+
+## Quick tour
 
 ```bash
-claude --agent donace:team-lead
+# Create a fresh run
+/donace:chat
+# ... brainstorm with the main LLM, it writes spec.md ...
+
+# Plan it
+/donace:plan run-a1b2c3d4
+
+# Edit plan.md if needed (especially `implementer:` tags)
+
+# Run it
+/donace:execute run-a1b2c3d4
+
+# At any time, glance at the pipeline
+python3 sdk/cli.py stage_status run-a1b2c3d4
 ```
 
-## Install via Symlink (for contributors)
+## Layout
 
-```bash
-git clone https://github.com/pricejiang/donace-plugin.git
-ln -sf $(pwd)/donace-plugin/agents/*.md ~/.claude/agents/
-```
+- `skills/{chat,plan,execute}/SKILL.md` — main LLM instructions per skill
+- `agents/{planner,implementer,reviewer}.md` — subagent definitions
+- `agents/references/review-checklist-{python,typescript,ios,general}.md` — stack-specific reviewer hints
+- `agents/prompts/codex-{implementer,reviewer}.md` — codex prompt prefixes
+- `sdk/codex_call.py` — wrapper around codex-companion.mjs (`task --background --json` + status + result)
+- `sdk/cli.py` — `donace run_start | list_runs | parse_plan | stage_status | mark_completed`
+- `.ai/runs/<run-id>/` — run state (gitignored)
 
-Then use agents directly:
+## Design
 
-```bash
-claude --agent team-lead
-```
-
-## Key Design Decisions
-
-- **Generator-Evaluator pattern** — inspired by [Anthropic's harness design blog](https://www.anthropic.com/engineering/harness-design-long-running-apps)
-- **Cross-model review** — Codex reviews Claude's code every sprint via `/codex:review`
-- **Claude reviewer at ship time** — deep stack-specific review runs once at the end, not every sprint (saves tokens)
-- **Knowledge persistence** — `.ai/cards/` for reusable insights, `.ai/sessions/` for session logs
-- **Ralph Loop compatible** — resumption check skips re-planning on restart
+See [docs/superpowers/specs/2026-05-02-donace-simplify-design.md](docs/superpowers/specs/2026-05-02-donace-simplify-design.md) for the full spec, including the reviewer severity contract, stop-state semantics, and bootstrap order.
 
 ## License
 
-MIT
+MIT (see LICENSE).
