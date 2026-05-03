@@ -13,6 +13,7 @@
   "agents": [
     "agents/planner.md",
     "agents/implementer.md",
+    "agents/reviewer.md",
     "agents/qa.md",
     "agents/ui-designer.md"
   ]
