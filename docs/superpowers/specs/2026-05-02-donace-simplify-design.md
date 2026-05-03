@@ -67,6 +67,7 @@ Critical property: **main LLM never blocks on a worker**. Both Agent and Bash us
 | `skills/chat/SKILL.md` | markdown | 80 | Brainstorm spec.md from user |
 | `skills/plan/SKILL.md` | markdown | 100 | spec.md → plan.md with implementer tags |
 | `skills/execute/SKILL.md` | markdown | 200 | The execute loop |
+| `agents/planner.md` | markdown | 100 | Claude subagent; reads spec.md + emits plan.md with stages tagged `implementer:` per heuristic |
 | `agents/implementer.md` | markdown | 80 | Claude implementer; TDD-focused, NEEDS_CONTEXT protocol |
 | `agents/reviewer.md` | markdown | 60 | Claude reviewer; receives an injected stack checklist + outputs [P0]/[P1]/[P2] markers |
 | `agents/references/review-checklist-python.md` | markdown | 60 | Stack-specific items reviewer looks for in Python diffs |
@@ -82,7 +83,7 @@ Critical property: **main LLM never blocks on a worker**. Both Agent and Bash us
 | `.claude-plugin/plugin.json` | json | ~30 | Plugin manifest |
 | `CLAUDE.md` | markdown | ~100 | Project contract (rewritten, much shorter) |
 
-Total new code: ~1480 lines. ~510 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, references, contract).
+Total new code: ~1580 lines. ~510 of that is Python (codex_call + cli + tests); rest is markdown (skills, agents, references, contract).
 
 ## Agents inventory (delta from `main`)
 
@@ -93,7 +94,7 @@ Total new code: ~1480 lines. ~510 of that is Python (codex_call + cli + tests); 
 | `agents/architect.md` | DELETE | Planning lives in the `/donace:plan` skill, executed by main LLM directly |
 | `agents/implementer.md` | REWRITE | Per spec: TDD-focused, NEEDS_CONTEXT protocol; keep frontmatter, replace body |
 | `agents/ios-reviewer.md` | DELETE | Replaced by single `reviewer.md` + `references/review-checklist-ios.md` (orchestration's `code-reviewer + references/` pattern) |
-| `agents/planner.md` | DELETE | Same as architect — main LLM does this |
+| `agents/planner.md` | REWRITE | Subagent that writes the implementation plan (stages with `files:`, `success criteria:`, `tests:`, `implementer:` tag) from spec.md. Brainstorm/spec-writing stays between user and main LLM in `/donace:chat`; planner runs only in `/donace:plan`. Body rewritten for new prompt; frontmatter kept |
 | `agents/qa.md` | KEEP UNCHANGED | Standalone ad-hoc tool, not part of donace pipeline |
 | `agents/runtime-evaluator.md` | DELETE | No runtime verification in v0 |
 | `agents/team-lead.md` | DELETE | Main LLM IS team-lead in new design |
@@ -152,10 +153,27 @@ Flow:
 
 Invoked with `<run-id>`.
 
-Flow:
-1. Read `.ai/runs/<id>/spec.md`.
-2. Decompose into sequential, file-bounded stages.
-3. For each stage, pick `implementer:` based on heuristic:
+Flow (main LLM follows this):
+1. Sanity-check: `.ai/runs/<id>/spec.md` exists.
+2. Dispatch planner subagent: `Agent(subagent_type=planner, prompt="<spec.md contents> + 'Write the implementation plan for run <id>. Output ONLY the plan markdown, nothing else.'", run_in_background=true)`.
+3. While planner runs, main LLM is free — user can chat / clarify; main LLM resumes on completion.
+4. On completion, capture planner's text reply.
+5. Write it to `.ai/runs/<id>/plan.md`.
+6. Tell user: "Plan written. Edit `.ai/runs/<id>/plan.md` if needed (especially `implementer:` tags), then `/donace:execute <id>`."
+
+Why subagent (not inline like `/donace:chat`): plan writing is a focused structured-output task that benefits from fresh context and a specialized prompt. Brainstorm needs main LLM's conversation context with the user (inline); plan writing needs isolation from that context (subagent). Two-level plan: spec.md (informal, conversational, written with user) → plan.md (structured, mechanical, written by planner).
+
+No automatic plan review (no codex plan review gate). User reads it, edits if needed, runs.
+
+User can hand-edit plan.md to override implementer tags or any other field.
+
+### Planner subagent contract (`agents/planner.md`)
+
+- **Tools**: `Read`, `Grep`, `Glob`. No `Write` (main LLM writes plan.md from the planner's text reply). No `Bash` for v0.
+- **Input**: spec.md contents + run-id. Free to explore the codebase via Read/Grep/Glob to scope file paths realistically.
+- **Output**: plan.md content as plain markdown text. No conversational preamble.
+- **Stage decomposition**: sequential, file-bounded. Each stage should land as one bisect-friendly commit.
+- **`implementer:` tag heuristic**:
 
    | Stage character | Implementer |
    |---|---|
@@ -163,13 +181,6 @@ Flow:
    | Algorithmic / dense logic / single-file dense impl | codex |
    | Cross-file judgment / needs Claude skills / context-heavy | claude |
    | Default when uncertain | claude |
-
-4. Write `plan.md` to `.ai/runs/<id>/`.
-5. Tell user: "Plan written. Edit `.ai/runs/<id>/plan.md` if needed (especially `implementer:` tags), then `/donace:execute <id>`."
-
-No automatic plan review (no codex plan review gate). User reads it, edits if needed, runs.
-
-User can hand-edit plan.md to override implementer tags or any other field.
 
 ## /donace:execute skill
 
@@ -414,7 +425,7 @@ The new donace is bootstrapped on `simplify` branch. Since donace doesn't yet ex
 2. **Write spec doc** (this) — in progress.
 3. **Write implementation plan** — `.ai/runs/<bootstrap-id>/plan.md` by hand. Stages:
    - Stage 1: skill scaffolding (`skills/chat/SKILL.md`, `skills/plan/SKILL.md`, `skills/execute/SKILL.md`) + plugin.json.
-   - Stage 2: agent files (`implementer.md`, `reviewer.md`) + 4 stack checklists in `agents/references/` + codex prompt prefixes.
+   - Stage 2: agent files (`planner.md`, `implementer.md`, `reviewer.md`) + 4 stack checklists in `agents/references/` + codex prompt prefixes.
    - Stage 3: `sdk/codex_call.py` + tests.
    - Stage 4: `sdk/cli.py` (`run_start`, `list_runs`, `stage_status`) + tests.
    - Stage 5: rewrite `CLAUDE.md` to reflect new contract.
@@ -434,6 +445,7 @@ The new donace is bootstrapped on `simplify` branch. Since donace doesn't yet ex
 | Reviewer behavior | Mixed: P0 gates, P1/P2 advisory | Pure gate is too rigid; pure advisory removes the point of having a reviewer |
 | Reviewer model | Opposite of implementer | Independence is review's value |
 | Worker selection | Planner-tagged at `/plan` time | Planner reads stage anyway; user can override by editing |
+| Plan vs spec separation | Two levels: spec.md (main LLM + user, conversational) → plan.md (planner subagent, structured) | Brainstorm needs main LLM's chat context with user; plan writing benefits from a focused subagent with a specialized prompt and fresh context window |
 | TDD enforcement | Prompt-only, reviewer flags missing tests | Hook check too brittle; prompt + review covers it |
 | P0 retry budget | 2 retries (3 total tries) | Tighter than current donace's 3-strike; covers hallucination correction without indefinite loops |
 | /chat output | Free-form prose | Templating restricts brainstorm; planner is flexible |
