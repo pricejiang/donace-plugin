@@ -4,17 +4,5 @@
   "description": "Plan / execute / review pipeline orchestrating Claude and Codex; per-stage worker selection, P0 review gating with retries, ASCII pipeline view.",
   "author": {
     "name": "Minghao Jiang"
-  },
-  "skills": [
-    "skills/chat",
-    "skills/plan",
-    "skills/execute"
-  ],
-  "agents": [
-    "agents/planner.md",
-    "agents/implementer.md",
-    "agents/reviewer.md",
-    "agents/qa.md",
-    "agents/ui-designer.md"
-  ]
+  }
 }

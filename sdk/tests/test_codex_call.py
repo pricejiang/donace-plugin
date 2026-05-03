@@ -169,8 +169,8 @@ class PromptBuildTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             cwd = Path(tmp)
             plugin_root = cwd / "plugin"
-            (plugin_root / "agents" / "prompts").mkdir(parents=True)
-            (plugin_root / "agents" / "prompts" / "codex-implementer.md").write_text("IMPLEMENT PREFIX")
+            (plugin_root / "prompts").mkdir(parents=True)
+            (plugin_root / "prompts" / "codex-implementer.md").write_text("IMPLEMENT PREFIX")
 
             run_dir = cwd / ".ai" / "runs" / "run-test"
             run_dir.mkdir(parents=True)
@@ -227,10 +227,10 @@ class PromptBuildTest(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             cwd = Path(tmp)
             plugin_root = cwd / "plugin"
-            (plugin_root / "agents" / "prompts").mkdir(parents=True)
-            (plugin_root / "agents" / "references").mkdir(parents=True)
-            (plugin_root / "agents" / "prompts" / "codex-reviewer.md").write_text("REVIEW PREFIX")
-            (plugin_root / "agents" / "references" / "review-checklist-python.md").write_text("CHECKLIST")
+            (plugin_root / "prompts").mkdir(parents=True)
+            (plugin_root / "references").mkdir(parents=True)
+            (plugin_root / "prompts" / "codex-reviewer.md").write_text("REVIEW PREFIX")
+            (plugin_root / "references" / "review-checklist-python.md").write_text("CHECKLIST")
 
             run_dir = cwd / ".ai" / "runs" / "run-test"
             run_dir.mkdir(parents=True)

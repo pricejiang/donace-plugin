@@ -46,8 +46,8 @@ python3 sdk/cli.py stage_status run-a1b2c3d4
 
 - `skills/{chat,plan,execute}/SKILL.md` — main LLM instructions per skill
 - `agents/{planner,implementer,reviewer}.md` — subagent definitions
-- `agents/references/review-checklist-{python,typescript,ios,general}.md` — stack-specific reviewer hints
-- `agents/prompts/codex-{implementer,reviewer}.md` — codex prompt prefixes
+- `references/review-checklist-{python,typescript,ios,general}.md` — stack-specific reviewer hints
+- `prompts/codex-{implementer,reviewer}.md` — codex prompt prefixes
 - `sdk/codex_call.py` — wrapper around codex-companion.mjs (`task --background --json` + status + result)
 - `sdk/cli.py` — `donace run_start | list_runs | parse_plan | stage_status | mark_completed`
 - `.ai/runs/<run-id>/` — run state (gitignored)

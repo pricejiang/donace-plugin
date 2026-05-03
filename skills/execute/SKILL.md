@@ -1,6 +1,6 @@
 ---
 name: donace-execute
-description: Run the execute loop on a plan.md — for each stage, dispatch implementer (Claude or Codex), run tests, dispatch reviewer (the opposite model), retry on P0 or test failure, commit on PASS. Stays interactive: long-running workers run in background, the main LLM responds to the user between dispatches.
+description: "Run the execute loop on a plan.md. For each stage, dispatch implementer (Claude or Codex), run tests, dispatch reviewer (the opposite model), retry on P0 or test failure, commit on PASS. Stays interactive — long-running workers run in background, the main LLM responds to the user between dispatches."
 ---
 
 # /donace:execute
@@ -141,7 +141,7 @@ Read `.ai/runs/<id>/stages/<sid>/diff.patch`. Look at file extensions:
 - Else any `.swift`/`.m`/`.mm` (or `.h` colocated with `.swift`/`.m`) → `ios`
 - Else → `general`
 
-Read `agents/references/review-checklist-<stack>.md` from `${CLAUDE_PLUGIN_ROOT}`.
+Read `references/review-checklist-<stack>.md` from `${CLAUDE_PLUGIN_ROOT}`.
 
 ### 8. Dispatch reviewer (opposite model, background)
 

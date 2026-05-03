@@ -15,9 +15,9 @@ agents/
   planner.md          spec.md → plan.md (Read/Grep/Glob/Bash/Write)
   implementer.md      one stage at a time (Read/Grep/Glob/Bash/Write/Edit)
   reviewer.md         diff + test-results → [P0]/[P1]/[P2] markdown (Read/Grep/Glob/Bash; no Write)
-  references/         review-checklist-{python,typescript,ios,general}.md
-  prompts/            codex-{implementer,reviewer}.md (used by codex_call.py)
   qa.md, ui-designer.md   standalone ad-hoc tools (not part of the pipeline)
+references/         review-checklist-{python,typescript,ios,general}.md (injected into reviewer payload)
+prompts/            codex-{implementer,reviewer}.md (used by codex_call.py)
 sdk/
   codex_call.py       wraps codex-companion.mjs: task → status → result
   cli.py              donace run_start | list_runs | parse_plan | stage_status | mark_completed

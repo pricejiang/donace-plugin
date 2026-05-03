@@ -130,9 +130,9 @@ def _build_prompt(
     plugin_root = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", cwd))
 
     if mode == "implement":
-        prefix_path = plugin_root / "agents" / "prompts" / "codex-implementer.md"
+        prefix_path = plugin_root / "prompts" / "codex-implementer.md"
     elif mode == "review":
-        prefix_path = plugin_root / "agents" / "prompts" / "codex-reviewer.md"
+        prefix_path = plugin_root / "prompts" / "codex-reviewer.md"
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -156,7 +156,7 @@ def _build_prompt(
         if test_results_file and test_results_file.exists():
             parts.extend(["", "test results:", "---", test_results_file.read_text(), "---"])
         if stack:
-            checklist_path = plugin_root / "agents" / "references" / f"review-checklist-{stack}.md"
+            checklist_path = plugin_root / "references" / f"review-checklist-{stack}.md"
             if checklist_path.exists():
                 parts.extend(["", f"stack checklist ({stack}):", "---", checklist_path.read_text(), "---"])
 
