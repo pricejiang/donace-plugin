@@ -12,14 +12,21 @@ The main LLM in your Claude Code session orchestrates everything — there is no
 
 ## Install
 
-This is a Claude Code plugin. To install for development:
+This is a Claude Code plugin. To run from the local checkout, pass `--plugin-dir` to `claude`:
 
 ```bash
-cd ~/.claude/plugins/local
-ln -s /path/to/donace donace
+claude --plugin-dir /path/to/donace
 ```
 
-Then restart Claude Code (or run `/plugin reload donace`). Skills `/donace:chat`, `/donace:plan`, and `/donace:execute` will be available.
+Skills `/donace:chat`, `/donace:plan`, and `/donace:execute` become available, plus the `planner` / `implementer` / `reviewer` agents.
+
+To verify the manifest is valid before launching:
+
+```bash
+claude plugin validate /path/to/donace
+```
+
+If you previously had a `~/.claude/agents` symlink pointing at this repo's `agents/` (the old install method), remove it before loading the plugin — otherwise agents get registered twice.
 
 Codex stages additionally require the `openai-codex` plugin to be installed (donace shells out to its `codex-companion.mjs`).
 
