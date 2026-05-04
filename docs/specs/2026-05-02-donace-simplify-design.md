@@ -402,9 +402,9 @@ Behavior (mirrors orchestration commit `2317a3f`):
 2. Build prompt:
    - For `implement`: `codex-implementer.md` prefix + current stage block + optional retry context.
    - For `review`: `codex-reviewer.md` prefix + current stage block + diff + `test-results.md` contents + `references/review-checklist-<stack>.md` contents + the universal severity rubric (echoed inline so codex doesn't have to remember it).
-3. Run `node codex-companion.mjs task --background --json --prompt <prompt> --cwd <cwd>` → capture jobId.
-4. Poll: `node codex-companion.mjs status <jobId>` every 5s, max 600s.
-5. Fetch: `node codex-companion.mjs result <jobId>` → final message.
+3. Persist prompt to `.ai/runs/<id>/stages/<sid>/codex-<mode>-prompt.txt`, then run `node codex-companion.mjs task --background --json [--write] --prompt-file <path> --cwd <cwd>` → capture `jobId` from JSON. `--write` is added for `implement` only (review is read-only).
+4. Poll: `node codex-companion.mjs status <jobId> --json` every 5s, max 600s; read terminal status from `job.status`.
+5. Fetch: `node codex-companion.mjs result <jobId> --json` → read final message from `storedJob.result.rawOutput` (with `storedJob.result.codex.stdout` / `storedJob.rendered` as fallbacks).
 6. Print result to stdout (JSON: `{status, summary, raw_output}` on success; `{status: "error", error_class, message}` on failure where `error_class ∈ {rate_limited, timeout, plugin_missing, worker_failed, parse_fail}`).
 7. Exit codes:
    - `0` — success; main LLM parses stdout for the review/impl artifact.

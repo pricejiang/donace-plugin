@@ -174,7 +174,12 @@ def run(
     test_results_file: Optional[Path],
     stack: Optional[str],
 ) -> dict:
-    """High-level: build prompt, launch task, poll, fetch result."""
+    """High-level: build prompt, launch task, poll, fetch result.
+
+    Targets codex-companion 1.0.2's CLI: prompt is delivered via `--prompt-file`
+    (positional + `--prompt` are no longer accepted), `status` / `result` need
+    `--json`, and `task` needs `--write` so codex can edit files in implement mode.
+    """
     companion = _locate_companion()
     prompt = _build_prompt(
         mode,
@@ -187,12 +192,19 @@ def run(
         stack,
     )
 
-    # Launch background task.
-    launch = _run_companion(
-        companion,
-        ["task", "--background", "--json", "--prompt", prompt, "--cwd", str(cwd)],
-        cwd=cwd,
-    )
+    # Persist the prompt to disk inside the stage dir so codex-companion can
+    # read it via --prompt-file. Kept as evidence (gitignored).
+    stage_dir = cwd / ".ai" / "runs" / run_id / "stages" / stage_id
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = stage_dir / f"codex-{mode}-prompt.txt"
+    prompt_path.write_text(prompt)
+
+    # Launch background task. `--write` only for implement (review is read-only).
+    task_args = ["task", "--background", "--json"]
+    if mode == "implement":
+        task_args.append("--write")
+    task_args.extend(["--prompt-file", str(prompt_path), "--cwd", str(cwd)])
+    launch = _run_companion(companion, task_args, cwd=cwd)
     job_id = launch.get("jobId")
     if not job_id:
         raise RuntimeError(f"task launch returned no jobId: {launch}")
@@ -202,11 +214,12 @@ def run(
     status_resp: dict = {}
     st: str = ""
     while elapsed < _POLL_MAX_SEC:
-        status_resp = _run_companion(companion, ["status", job_id], cwd=cwd)
-        st = status_resp.get("status", "")
+        status_resp = _run_companion(companion, ["status", job_id, "--json"], cwd=cwd)
+        job_obj = status_resp.get("job") or {}
+        st = job_obj.get("status", "")
         if st in ("completed", "failed", "cancelled"):
             break
-        if st == "running":
+        if st in ("queued", "running"):
             _sleep(_POLL_INTERVAL_SEC)
             elapsed += _POLL_INTERVAL_SEC
             continue
@@ -220,14 +233,22 @@ def run(
         # falling through to a generic worker_failed.
         status_text = json.dumps(status_resp).lower()
         if any(hint.lower() in status_text for hint in _RATE_LIMIT_HINTS):
-            raise RateLimited(f"codex job {job_id} rate-limited: {status_resp.get('error', '')[:200]}")
-        raise RuntimeError(f"codex job {job_id} terminal status: {st} ({status_resp.get('error', '')[:200]})")
+            err = (status_resp.get("job") or {}).get("errorMessage", "")
+            raise RateLimited(f"codex job {job_id} rate-limited: {str(err)[:200]}")
+        err = (status_resp.get("job") or {}).get("errorMessage", "")
+        raise RuntimeError(f"codex job {job_id} terminal status: {st} ({str(err)[:200]})")
 
-    # Fetch result.
-    result = _run_companion(companion, ["result", job_id], cwd=cwd)
-    final_msg = result.get("finalMessage") or ""
+    # Fetch result. 1.0.2 returns {job, storedJob}; the worker output lives
+    # under storedJob.result.rawOutput (with codex.stdout / rendered as fallbacks).
+    result = _run_companion(companion, ["result", job_id, "--json"], cwd=cwd)
+    stored = result.get("storedJob") or {}
+    result_block = stored.get("result") or {}
+    final_msg = result_block.get("rawOutput") or ""
     if not final_msg.strip():
-        raise ValueError("codex result had empty finalMessage")
+        codex_block = result_block.get("codex") or {}
+        final_msg = codex_block.get("stdout") or stored.get("rendered") or ""
+    if not final_msg.strip():
+        raise ValueError("codex result had empty rawOutput / rendered")
 
     return {"status": "completed", "summary": final_msg, "raw_output": json.dumps(result)}
 

@@ -29,36 +29,93 @@ class _FakeCompletedProcess:
 
 
 class HappyPathTest(unittest.TestCase):
-    def test_implement_completes_with_summary(self):
+    def test_implement_completes_with_summary_and_passes_write_flag(self):
         # Sequence: task → status (running x1, completed x1) → result.
+        # 1.0.2 shape: status returns {job:{status}}, result returns {storedJob:{result:{rawOutput}}}.
         responses = iter([
-            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-123"})),
-            _FakeCompletedProcess(stdout=json.dumps({"status": "running"})),
-            _FakeCompletedProcess(stdout=json.dumps({"status": "completed"})),
+            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-123", "status": "queued"})),
+            _FakeCompletedProcess(stdout=json.dumps({"job": {"status": "running"}})),
+            _FakeCompletedProcess(stdout=json.dumps({"job": {"status": "completed"}})),
             _FakeCompletedProcess(stdout=json.dumps({
-                "finalMessage": "stage implemented; tests pass"
+                "storedJob": {"result": {"rawOutput": "stage implemented; tests pass"}}
             })),
         ])
 
-        def fake_run(*args, **kwargs):
+        captured_calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            captured_calls.append(list(args))
             return next(responses)
 
-        with patch.object(subprocess, "run", side_effect=fake_run):
-            with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
-                with patch.object(codex_call, "_sleep", lambda _: None):  # skip the 5s waits
-                    out = codex_call.run(
-                        mode="implement",
-                        run_id="run-test",
-                        stage_id="stage-1",
-                        cwd=Path("/fake/project"),
-                        diff_file=None,
-                        retry_context_file=None,
-                        test_results_file=None,
-                        stack=None,
-                    )
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            with patch.object(subprocess, "run", side_effect=fake_run):
+                with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                    with patch.object(codex_call, "_sleep", lambda _: None):  # skip the 5s waits
+                        out = codex_call.run(
+                            mode="implement",
+                            run_id="run-test",
+                            stage_id="stage-1",
+                            cwd=cwd,
+                            diff_file=None,
+                            retry_context_file=None,
+                            test_results_file=None,
+                            stack=None,
+                        )
 
-        self.assertEqual(out["status"], "completed")
-        self.assertIn("stage implemented", out["summary"])
+            self.assertEqual(out["status"], "completed")
+            self.assertIn("stage implemented", out["summary"])
+
+            # First subprocess call is the task launch — must include --write and --prompt-file.
+            launch_args = captured_calls[0]
+            self.assertIn("task", launch_args)
+            self.assertIn("--background", launch_args)
+            self.assertIn("--json", launch_args)
+            self.assertIn("--write", launch_args)
+            self.assertIn("--prompt-file", launch_args)
+            # status / result calls must include --json.
+            self.assertIn("--json", captured_calls[1])  # status
+            self.assertIn("--json", captured_calls[-1])  # result
+
+            # Prompt file should have been written for evidence.
+            prompt_file = cwd / ".ai" / "runs" / "run-test" / "stages" / "stage-1" / "codex-implement-prompt.txt"
+            self.assertTrue(prompt_file.exists())
+
+    def test_review_mode_does_not_pass_write_flag(self):
+        # Review is read-only: codex must NOT be allowed to mutate files.
+        responses = iter([
+            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-rev", "status": "queued"})),
+            _FakeCompletedProcess(stdout=json.dumps({"job": {"status": "completed"}})),
+            _FakeCompletedProcess(stdout=json.dumps({
+                "storedJob": {"result": {"rawOutput": "### [P0]\nnone\n"}}
+            })),
+        ])
+
+        captured_calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            captured_calls.append(list(args))
+            return next(responses)
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            with patch.object(subprocess, "run", side_effect=fake_run):
+                with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                    with patch.object(codex_call, "_sleep", lambda _: None):
+                        codex_call.run(
+                            mode="review",
+                            run_id="run-test",
+                            stage_id="stage-1",
+                            cwd=cwd,
+                            diff_file=None,
+                            retry_context_file=None,
+                            test_results_file=None,
+                            stack=None,
+                        )
+
+            launch_args = captured_calls[0]
+            self.assertIn("task", launch_args)
+            self.assertNotIn("--write", launch_args)
 
 
 class ErrorPathTest(unittest.TestCase):
@@ -66,26 +123,30 @@ class ErrorPathTest(unittest.TestCase):
         def fake_run(*args, **kwargs):
             return next(responses_iter)
 
-        with patch.object(subprocess, "run", side_effect=fake_run):
-            with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
-                with patch.object(codex_call, "_sleep", lambda _: None):
-                    return codex_call.run(
-                        mode="implement",
-                        run_id="run-test",
-                        stage_id="stage-1",
-                        cwd=Path("/fake/project"),
-                        diff_file=None,
-                        retry_context_file=None,
-                        test_results_file=None,
-                        stack=None,
-                    )
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            with patch.object(subprocess, "run", side_effect=fake_run):
+                with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                    with patch.object(codex_call, "_sleep", lambda _: None):
+                        return codex_call.run(
+                            mode="implement",
+                            run_id="run-test",
+                            stage_id="stage-1",
+                            cwd=cwd,
+                            diff_file=None,
+                            retry_context_file=None,
+                            test_results_file=None,
+                            stack=None,
+                        )
 
     def test_rate_limited_raises_rate_limit_error(self):
         responses = iter([
-            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-rl"})),
+            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-rl", "status": "queued"})),
             _FakeCompletedProcess(stdout=json.dumps({
-                "status": "failed",
-                "error": "Anthropic API returned 429: rate limit exceeded"
+                "job": {
+                    "status": "failed",
+                    "errorMessage": "Anthropic API returned 429: rate limit exceeded",
+                }
             })),
         ])
         with self.assertRaises(codex_call.RateLimited):
@@ -94,23 +155,23 @@ class ErrorPathTest(unittest.TestCase):
     def test_plugin_missing_raises_file_not_found(self):
         with patch.object(codex_call, "_locate_companion", side_effect=FileNotFoundError("plugin missing")):
             with self.assertRaises(FileNotFoundError):
-                codex_call.run(
-                    mode="implement",
-                    run_id="run-test",
-                    stage_id="stage-1",
-                    cwd=Path("/fake/project"),
-                    diff_file=None,
-                    retry_context_file=None,
-                    test_results_file=None,
-                    stack=None,
-                )
+                with TemporaryDirectory() as tmp:
+                    codex_call.run(
+                        mode="implement",
+                        run_id="run-test",
+                        stage_id="stage-1",
+                        cwd=Path(tmp),
+                        diff_file=None,
+                        retry_context_file=None,
+                        test_results_file=None,
+                        stack=None,
+                    )
 
     def test_main_rate_limited_exits_2(self):
         responses = iter([
-            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-rl"})),
+            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-rl", "status": "queued"})),
             _FakeCompletedProcess(stdout=json.dumps({
-                "status": "failed",
-                "error": "rate limit"
+                "job": {"status": "failed", "errorMessage": "rate limit"}
             })),
         ])
 
@@ -118,15 +179,19 @@ class ErrorPathTest(unittest.TestCase):
             return next(responses)
 
         argv_backup = sys.argv[:]
-        sys.argv = ["codex_call.py", "implement", "--run-id", "run-x", "--stage-id", "stage-1"]
-        try:
-            with patch.object(subprocess, "run", side_effect=fake_run):
-                with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
-                    with patch.object(codex_call, "_sleep", lambda _: None):
-                        rc = codex_call.main()
-            self.assertEqual(rc, 2)
-        finally:
-            sys.argv = argv_backup
+        cwd_backup = os.getcwd()
+        with TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            sys.argv = ["codex_call.py", "implement", "--run-id", "run-x", "--stage-id", "stage-1"]
+            try:
+                with patch.object(subprocess, "run", side_effect=fake_run):
+                    with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                        with patch.object(codex_call, "_sleep", lambda _: None):
+                            rc = codex_call.main()
+                self.assertEqual(rc, 2)
+            finally:
+                sys.argv = argv_backup
+                os.chdir(cwd_backup)
 
     def test_main_other_error_exits_1(self):
         # Simulate task launch failure — no jobId returned.
@@ -138,14 +203,18 @@ class ErrorPathTest(unittest.TestCase):
             return next(responses)
 
         argv_backup = sys.argv[:]
-        sys.argv = ["codex_call.py", "implement", "--run-id", "run-x", "--stage-id", "stage-1"]
-        try:
-            with patch.object(subprocess, "run", side_effect=fake_run):
-                with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
-                    rc = codex_call.main()
-            self.assertEqual(rc, 1)
-        finally:
-            sys.argv = argv_backup
+        cwd_backup = os.getcwd()
+        with TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            sys.argv = ["codex_call.py", "implement", "--run-id", "run-x", "--stage-id", "stage-1"]
+            try:
+                with patch.object(subprocess, "run", side_effect=fake_run):
+                    with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                        rc = codex_call.main()
+                self.assertEqual(rc, 1)
+            finally:
+                sys.argv = argv_backup
+                os.chdir(cwd_backup)
 
 
 class PromptBuildTest(unittest.TestCase):
