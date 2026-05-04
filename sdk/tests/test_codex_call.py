@@ -344,6 +344,115 @@ class PromptBuildTest(unittest.TestCase):
             self.assertIn("# Test results", prompt)
             self.assertIn("CHECKLIST", prompt)
 
+    def test_build_prompt_for_review_plan_includes_spec_and_plan(self):
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            plugin_root = cwd / "plugin"
+            (plugin_root / "prompts").mkdir(parents=True)
+            (plugin_root / "prompts" / "codex-plan-reviewer.md").write_text("PLAN REVIEW PREFIX")
+
+            run_dir = cwd / ".ai" / "runs" / "run-test"
+            run_dir.mkdir(parents=True)
+            (run_dir / "spec.md").write_text("# Spec\n\nThe spec body.\n")
+            (run_dir / "plan.md").write_text(
+                "# Plan: example\n\n"
+                "## Stage 1: do something\n"
+                "- implementer: claude\n"
+            )
+
+            old_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+            os.environ["CLAUDE_PLUGIN_ROOT"] = str(plugin_root)
+            try:
+                prompt = codex_call._build_prompt(
+                    "review-plan",
+                    "run-test",
+                    None,  # no stage-id for plan review
+                    cwd,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            finally:
+                if old_plugin_root is None:
+                    os.environ.pop("CLAUDE_PLUGIN_ROOT", None)
+                else:
+                    os.environ["CLAUDE_PLUGIN_ROOT"] = old_plugin_root
+
+            self.assertIn("PLAN REVIEW PREFIX", prompt)
+            self.assertIn("spec.md:", prompt)
+            self.assertIn("The spec body.", prompt)
+            self.assertIn("plan.md:", prompt)
+            self.assertIn("## Stage 1: do something", prompt)
+            # No per-stage scaffolding for review-plan.
+            self.assertNotIn("stage-id:", prompt)
+            self.assertNotIn("stage block:", prompt)
+
+
+class ReviewPlanModeTest(unittest.TestCase):
+    def test_review_plan_does_not_pass_write_flag_and_writes_run_level_prompt(self):
+        responses = iter([
+            _FakeCompletedProcess(stdout=json.dumps({"jobId": "j-pr", "status": "queued"})),
+            _FakeCompletedProcess(stdout=json.dumps({"job": {"status": "completed"}})),
+            _FakeCompletedProcess(stdout=json.dumps({
+                "storedJob": {"result": {"rawOutput": "# Plan Review\n\n## Findings\n(none)\n"}}
+            })),
+        ])
+
+        captured_calls: list[list[str]] = []
+
+        def fake_run(args, **kwargs):
+            captured_calls.append(list(args))
+            return next(responses)
+
+        with TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            run_dir = cwd / ".ai" / "runs" / "run-test"
+            run_dir.mkdir(parents=True)
+            (run_dir / "spec.md").write_text("# Spec\n\nbody.\n")
+            (run_dir / "plan.md").write_text("# Plan\n\n## Stage 1: x\n- implementer: claude\n")
+
+            with patch.object(subprocess, "run", side_effect=fake_run):
+                with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                    with patch.object(codex_call, "_sleep", lambda _: None):
+                        out = codex_call.run(
+                            mode="review-plan",
+                            run_id="run-test",
+                            stage_id=None,
+                            cwd=cwd,
+                            diff_file=None,
+                            retry_context_file=None,
+                            test_results_file=None,
+                            stack=None,
+                        )
+
+            self.assertEqual(out["status"], "completed")
+            self.assertIn("Plan Review", out["summary"])
+
+            launch_args = captured_calls[0]
+            self.assertIn("task", launch_args)
+            self.assertNotIn("--write", launch_args)
+            self.assertIn("--prompt-file", launch_args)
+
+            # Plan-review prompt sits at the run level, not under any stage dir.
+            run_level_prompt = run_dir / "codex-review-plan-prompt.txt"
+            self.assertTrue(run_level_prompt.exists())
+
+    def test_implement_without_stage_id_raises(self):
+        with TemporaryDirectory() as tmp:
+            with patch.object(codex_call, "_locate_companion", return_value=Path("/fake/companion.mjs")):
+                with self.assertRaises(ValueError):
+                    codex_call.run(
+                        mode="implement",
+                        run_id="run-test",
+                        stage_id=None,
+                        cwd=Path(tmp),
+                        diff_file=None,
+                        retry_context_file=None,
+                        test_results_file=None,
+                        stack=None,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

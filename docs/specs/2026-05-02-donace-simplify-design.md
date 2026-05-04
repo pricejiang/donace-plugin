@@ -181,11 +181,12 @@ Flow (main LLM follows this):
 2. Dispatch planner subagent: `Agent(subagent_type=planner, prompt="run-id: <id>; cwd: <abs>; spec.md contents below; write the implementation plan to .ai/runs/<id>/plan.md and reply with a short confirmation.", run_in_background=true)`.
 3. While planner runs, main LLM is free — user can chat / clarify. If the same session is still active, main LLM can poll and continue; if not, the user can re-run `/donace:plan <id>` to check whether `plan.md` was written.
 4. On completion, verify `.ai/runs/<id>/plan.md` exists and is non-empty. If not, surface the planner's text reply to the user (likely contains the failure reason) and stop.
-5. Tell user: "Plan written. Edit `.ai/runs/<id>/plan.md` if needed (especially `implementer:` tags), then `/donace:execute <id>`."
+5. Dispatch codex plan review in the background (`Bash("python3 sdk/codex_call.py review-plan --run-id <id>", run_in_background=true)`). Planner is Claude, so the reviewer is codex — opposite-model independence, same policy as per-stage review. Persist the review markdown to `.ai/runs/<id>/plan-review.md` when the job completes.
+6. Tell user: "Plan written. Plan review at `.ai/runs/<id>/plan-review.md` (advisory). Edit `.ai/runs/<id>/plan.md` if needed (especially `implementer:` tags), then `/donace:execute <id>`."
 
 Why subagent (not inline like `/donace:chat`): plan writing is a focused structured-output task that benefits from fresh context and a specialized prompt. Brainstorm needs main LLM's conversation context with the user (inline); plan writing needs isolation from that context (subagent). Two-level plan: spec.md (informal, conversational, written with user) → plan.md (structured, mechanical, written by planner).
 
-No automatic plan review (no codex plan review gate). User reads it, edits if needed, runs.
+Plan review is **advisory, not a gate** — the orchestrator persists `plan-review.md` and surfaces `[P0]` findings inline if any, but does NOT block `/donace:execute`. The user reads, decides whether to edit `plan.md`, and proceeds. A flaky codex run that fails the plan review does not stop planning hand-off.
 
 User can hand-edit plan.md to override implementer tags or any other field.
 
@@ -390,11 +391,12 @@ Sample items to seed each file:
 
 ## Codex shell helper (`sdk/codex_call.py`)
 
-Single Python script with two CLI modes:
+Single Python script with three CLI modes:
 
 ```
-codex_call.py implement --run-id <id> --stage-id <sid> [--retry-context-file <path>]
-codex_call.py review    --run-id <id> --stage-id <sid> --diff-file <path> --test-results-file <path> --stack <python|typescript|ios|general>
+codex_call.py implement   --run-id <id> --stage-id <sid> [--retry-context-file <path>]
+codex_call.py review      --run-id <id> --stage-id <sid> --diff-file <path> --test-results-file <path> --stack <python|typescript|ios|general>
+codex_call.py review-plan --run-id <id>
 ```
 
 Behavior (mirrors orchestration commit `2317a3f`):
@@ -402,7 +404,8 @@ Behavior (mirrors orchestration commit `2317a3f`):
 2. Build prompt:
    - For `implement`: `codex-implementer.md` prefix + current stage block + optional retry context.
    - For `review`: `codex-reviewer.md` prefix + current stage block + diff + `test-results.md` contents + `references/review-checklist-<stack>.md` contents + the universal severity rubric (echoed inline so codex doesn't have to remember it).
-3. Persist prompt to `.ai/runs/<id>/stages/<sid>/codex-<mode>-prompt.txt`, then run `node codex-companion.mjs task --background --json [--write] --prompt-file <path> --cwd <cwd>` → capture `jobId` from JSON. `--write` is added for `implement` only (review is read-only).
+   - For `review-plan`: `codex-plan-reviewer.md` prefix + full `spec.md` + full `plan.md` (no diff, no stage scope; the whole plan is the unit of review).
+3. Persist prompt to `.ai/runs/<id>/stages/<sid>/codex-<mode>-prompt.txt` (per-stage modes) or `.ai/runs/<id>/codex-review-plan-prompt.txt` (plan-review), then run `node codex-companion.mjs task --background --json [--write] --prompt-file <path> --cwd <cwd>` → capture `jobId` from JSON. `--write` is added for `implement` only (both review modes are read-only).
 4. Poll: `node codex-companion.mjs status <jobId> --json` every 5s, max 600s; read terminal status from `job.status`.
 5. Fetch: `node codex-companion.mjs result <jobId> --json` → read final message from `storedJob.result.rawOutput` (with `storedJob.result.codex.stdout` / `storedJob.rendered` as fallbacks).
 6. Print result to stdout (JSON: `{status, summary, raw_output}` on success; `{status: "error", error_class, message}` on failure where `error_class ∈ {rate_limited, timeout, plugin_missing, worker_failed, parse_fail}`).
@@ -500,7 +503,7 @@ Run <run-id>  •  <overall-status>  •  N/M stages passed  •  started <relat
 - `agents/team-lead.md`, `agents/test-engineer.md`, `agents/runtime-verifier.md`, `agents/documenter.md`, `agents/code-reviewer.md`, `agents/references/`.
 - `cmd_verify`, `cmd_review`, `cmd_document` (the wrap phase).
 - Plan auto-fix via codex (`run_codex_plan_fix`).
-- Two-pass codex plan review + missed-finding audit.
+- Two-pass codex plan review + missed-finding audit. (We DO carry forward a single-pass advisory plan review; see `/donace:plan` step 5.)
 - Three-strike repeat-failure detection.
 - Idle-heartbeat watchdog.
 - Token budget hints / SharedContext levels / routing hints (EMA stats).

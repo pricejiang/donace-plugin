@@ -51,14 +51,30 @@ Dispatch the planner subagent to convert `.ai/runs/<id>/spec.md` into `.ai/runs/
 
    If the file is missing or empty, surface the planner's text reply (likely contains the failure reason) and stop.
 
-5. **Hand off.** Tell the user:
+5. **Dispatch codex plan review (background, advisory).** Planner is Claude, so the reviewer is codex (opposite-model independence — same policy as per-stage review).
 
    ```
-   Plan written. Edit .ai/runs/<id>/plan.md if needed (especially `implementer:` tags), then /donace:execute <id>
+   Bash(
+     "python3 sdk/codex_call.py review-plan --run-id <id>",
+     run_in_background=true,
+   )
    ```
+
+   While codex reviews, the main LLM stays interactive — same pattern as background planner dispatch. When the Bash job completes, parse stdout JSON `{status, summary, ...}` and persist `summary` to `.ai/runs/<id>/plan-review.md`. On non-zero exit, surface the `error_class` + `message` from stdout JSON to the user but do NOT block hand-off (this review is advisory; a flaky codex run shouldn't stop planning).
+
+6. **Hand off.** Tell the user:
+
+   ```
+   Plan written: .ai/runs/<id>/plan.md
+   Plan review:  .ai/runs/<id>/plan-review.md  (advisory; read before /donace:execute)
+
+   Edit plan.md if needed (especially `implementer:` tags), then /donace:execute <id>
+   ```
+
+   If the plan review surfaced any `[P0]` findings, surface them inline so the user sees them without having to open the file.
 
 ## What `/donace:plan` is NOT
 
-- Not a plan reviewer — no codex auto-review of the plan, no AWAIT_APPROVAL state. The user reads plan.md and edits it. If they want a second opinion, they ask the main LLM directly.
+- Not a plan-review **gate** — codex's findings are advisory; the orchestrator does not block `/donace:execute` on them. The user reads `plan-review.md` and decides whether to edit `plan.md`.
 - Not interactive after dispatch — the planner runs in isolation. If the user wants to clarify mid-plan, they cancel the agent (KillShell) and re-invoke with a refined spec.
 - Not retryable per stage — the planner writes the whole plan in one shot.

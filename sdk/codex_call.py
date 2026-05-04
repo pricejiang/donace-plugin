@@ -1,13 +1,17 @@
 """Subprocess wrapper around the openai-codex `codex-companion.mjs` script.
 
-Two CLI modes (mirrors the spec section "Codex shell helper"):
+Three CLI modes (mirrors the spec section "Codex shell helper"):
 
-    codex_call.py implement --run-id <id> --stage-id <sid> \
-                            [--retry-context-file <path>]
-    codex_call.py review    --run-id <id> --stage-id <sid> \
-                            --diff-file <path> \
-                            --test-results-file <path> \
-                            --stack <python|typescript|ios|general>
+    codex_call.py implement   --run-id <id> --stage-id <sid> \
+                              [--retry-context-file <path>]
+    codex_call.py review      --run-id <id> --stage-id <sid> \
+                              --diff-file <path> \
+                              --test-results-file <path> \
+                              --stack <python|typescript|ios|general>
+    codex_call.py review-plan --run-id <id>
+
+`review-plan` is dispatched by `/donace:plan` after the planner subagent finishes.
+It is advisory (the orchestrator does NOT gate on its findings).
 
 Stdout JSON contract:
     {"status": "completed", "summary": "...", "raw_output": "..."}    # success
@@ -119,28 +123,49 @@ def _extract_stage_block(plan_text: str, stage_id: str) -> str:
 def _build_prompt(
     mode: str,
     run_id: str,
-    stage_id: str,
+    stage_id: Optional[str],
     cwd: Path,
     diff_file: Optional[Path],
     retry_context_file: Optional[Path],
     test_results_file: Optional[Path],
     stack: Optional[str],
 ) -> str:
-    """Compose the prompt: prefix file + payload."""
+    """Compose the prompt: prefix file + payload.
+
+    `stage_id` is required for implement / review (per-stage modes) and ignored
+    for review-plan (whole-plan mode).
+    """
     plugin_root = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", cwd))
 
     if mode == "implement":
         prefix_path = plugin_root / "prompts" / "codex-implementer.md"
     elif mode == "review":
         prefix_path = plugin_root / "prompts" / "codex-reviewer.md"
+    elif mode == "review-plan":
+        prefix_path = plugin_root / "prompts" / "codex-plan-reviewer.md"
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
     prefix = prefix_path.read_text() if prefix_path.exists() else ""
 
-    parts = [prefix, "", f"run-id: {run_id}", f"stage-id: {stage_id}", f"cwd: {cwd}"]
+    parts = [prefix, "", f"run-id: {run_id}", f"cwd: {cwd}"]
+    if mode != "review-plan":
+        parts.insert(3, f"stage-id: {stage_id}")
 
-    plan_path = cwd / ".ai" / "runs" / run_id / "plan.md"
+    run_dir = cwd / ".ai" / "runs" / run_id
+
+    if mode == "review-plan":
+        spec_path = run_dir / "spec.md"
+        plan_path = run_dir / "plan.md"
+        if not spec_path.exists():
+            raise FileNotFoundError(f"spec.md not found: {spec_path}")
+        if not plan_path.exists():
+            raise FileNotFoundError(f"plan.md not found: {plan_path}")
+        parts.extend(["", "spec.md:", "---", spec_path.read_text(), "---"])
+        parts.extend(["", "plan.md:", "---", plan_path.read_text(), "---"])
+        return "\n".join(parts)
+
+    plan_path = run_dir / "plan.md"
     if plan_path.exists():
         plan_text = plan_path.read_text()
         parts.extend(["", "stage block:", "---", _extract_stage_block(plan_text, stage_id), "---"])
@@ -167,7 +192,7 @@ def run(
     *,
     mode: str,
     run_id: str,
-    stage_id: str,
+    stage_id: Optional[str],
     cwd: Path,
     diff_file: Optional[Path],
     retry_context_file: Optional[Path],
@@ -179,7 +204,13 @@ def run(
     Targets codex-companion 1.0.2's CLI: prompt is delivered via `--prompt-file`
     (positional + `--prompt` are no longer accepted), `status` / `result` need
     `--json`, and `task` needs `--write` so codex can edit files in implement mode.
+
+    `stage_id` is required for implement / review and ignored for review-plan
+    (which targets the whole plan, no stage scope).
     """
+    if mode != "review-plan" and not stage_id:
+        raise ValueError(f"stage_id is required for mode={mode}")
+
     companion = _locate_companion()
     prompt = _build_prompt(
         mode,
@@ -192,14 +223,17 @@ def run(
         stack,
     )
 
-    # Persist the prompt to disk inside the stage dir so codex-companion can
-    # read it via --prompt-file. Kept as evidence (gitignored).
-    stage_dir = cwd / ".ai" / "runs" / run_id / "stages" / stage_id
-    stage_dir.mkdir(parents=True, exist_ok=True)
-    prompt_path = stage_dir / f"codex-{mode}-prompt.txt"
+    # Persist the prompt to disk so codex-companion can read it via --prompt-file.
+    # Per-stage modes go into the stage dir; plan review goes into the run dir.
+    if mode == "review-plan":
+        evidence_dir = cwd / ".ai" / "runs" / run_id
+    else:
+        evidence_dir = cwd / ".ai" / "runs" / run_id / "stages" / stage_id
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = evidence_dir / f"codex-{mode}-prompt.txt"
     prompt_path.write_text(prompt)
 
-    # Launch background task. `--write` only for implement (review is read-only).
+    # Launch background task. `--write` only for implement (reviews are read-only).
     task_args = ["task", "--background", "--json"]
     if mode == "implement":
         task_args.append("--write")
@@ -269,6 +303,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_rev.add_argument("--test-results-file", required=True)
     p_rev.add_argument("--stack", required=True, choices=["python", "typescript", "ios", "general"])
 
+    p_plan = sub.add_parser("review-plan")
+    p_plan.add_argument("--run-id", required=True)
+
     args = parser.parse_args(argv)
 
     cwd = Path.cwd()
@@ -281,7 +318,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         out = run(
             mode=args.mode,
             run_id=args.run_id,
-            stage_id=args.stage_id,
+            stage_id=getattr(args, "stage_id", None),
             cwd=cwd,
             diff_file=diff_file,
             retry_context_file=retry_context_file,
