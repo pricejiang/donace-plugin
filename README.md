@@ -1,109 +1,68 @@
-# Donace
+# donace
 
-Generator-Evaluator agent harness for Claude Code. Sprint-based development workflow with cross-model review (Claude + Codex) and knowledge persistence.
+Plan / execute / review pipeline that orchestrates Claude Code and Codex on a per-stage basis.
 
-## Agents
+## What it does
 
-| Agent | Model | Role |
-|---|---|---|
-| **team-lead** | opus | Execution coordinator — dispatched by `/donace:execute` to run validated plans (run_job → verify → review → document → run_complete) |
-| **planner** | opus | Writes `.ai/runs/<id>/plan.md` for complex tasks — dispatched by `/donace:plan` via `write_plan` |
-| **implementer** | sonnet | Writes production code following the plan |
-| **test-engineer** | sonnet | Writes and runs unit tests |
-| **typescript-reviewer** | opus | Deep TypeScript/React code review |
-| **ios-reviewer** | opus | Deep iOS/Swift code review |
-| **qa** | opus | End-to-end product QA via Playwright — standalone, long-running |
-| **runtime-verifier** | opus | Black-box verification — runs the app and curls APIs to verify each stage's Success Criteria |
-| **documenter** | sonnet | Updates README / CHANGELOG / `.ai/cards/` after implementation |
-| **ui-designer** | opus | On-demand UI/UX design specs |
+- `/donace:chat` — brainstorm with the main LLM, write `spec.md`.
+- `/donace:plan <run-id>` — planner subagent reads `spec.md`, emits `plan.md` with stages tagged `implementer: claude|codex`.
+- `/donace:execute <run-id>` — for each stage: dispatch implementer (background), run listed `tests:`, dispatch reviewer (the opposite model), commit on PASS. P0 findings or test failures retry the stage up to 2 times; rate-limit hits drive the stage to `interrupted` and resume cleanly.
 
-## Usage
+The main LLM in your Claude Code session orchestrates everything — there is no team-lead subagent. Workers run in the background so you can chat / clarify / interrupt at any time.
 
-Three user-invokable skills cover the workflow:
+## Install
 
-```
-/donace:plan <task>     →  interactive Q&A, writes .ai/runs/<id>/plan.md,
-                           runs codex plan review, hands off
-(user reviews plan.md)
-/donace:execute <id>    →  dispatches team-lead to run run_job → verify →
-                           review → document → run_complete
-
-/donace:chat            →  ad-hoc mode. Direct Edit + Agent-dispatch
-                           subagents for small tasks. Never touches the
-                           orchestrator (no runs, no dashboard, no auto
-                           commits). Escalates to /donace:plan when
-                           complexity grows.
-```
-
-The `plan → execute` pair is for tracked, verified work. `chat` is the escape hatch for quick fixes and focused subagent passes where the orchestrator ceremony would outweigh the task.
-
-### 1. Plan
-
-```
-/donace:plan add rate limiting to the notification API
-```
-
-The plan skill:
-- Scans for resumable runs (resume if mid-plan)
-- Clarifies vague briefs with up to 3 targeted questions
-- Calls `run_start` + `write_plan` + `plan` to produce a codex-reviewed plan
-- Hands off with the run-id — does **not** execute
-
-Codex plan review runs in the background (up to 600s client-side). If codex is
-still working when the wait caps, the plan job ends as `PENDING` with a
-`job_id` persisted in `plan.json`. Team-lead runs `plan_status` before
-dispatching stages to finalize the review. If codex flags major issues
-(`REVIEW`), the skill loops back with a revision brief.
-
-### 2. Review
-
-Open `.ai/runs/<run-id>/plan.md` in your editor. Sanity-check the stages, dependencies, success criteria.
-
-### 3. Execute
-
-```
-/donace:execute <run-id>
-```
-
-Or omit the run-id — the execute skill auto-picks the newest PASS run. It dispatches `team-lead`, which runs the full pipeline and returns a 3-line summary.
-
-### Revising a plan
-
-Re-invoke `/donace:plan` on the same run-id (the skill detects the existing run and offers resume). `write_plan` treats the new task brief as a revision directive against the existing `plan.md`.
-
-## Install as Plugin
+This is a Claude Code plugin. To run from the local checkout, pass `--plugin-dir` to `claude`:
 
 ```bash
-/plugin marketplace add pricejiang/donace-plugin
-/plugin install donace@pricejiang-donace-plugin
+claude --plugin-dir /path/to/donace
 ```
 
-Once installed, use the skills with the `donace:` namespace: `/donace:plan`, `/donace:execute`, `/donace:chat`. Team-lead and the other agents are invoked internally by the skills — you do not normally launch them directly.
+Skills `/donace:chat`, `/donace:plan`, and `/donace:execute` become available, plus the `planner` / `implementer` / `reviewer` agents.
 
-## Install via Symlink (for contributors)
+To verify the manifest is valid before launching:
 
 ```bash
-git clone https://github.com/pricejiang/donace-plugin.git
-ln -sf $(pwd)/donace-plugin/agents/*.md ~/.claude/agents/
-ln -sf $(pwd)/donace-plugin/skills/plan ~/.claude/skills/donace-plan
-ln -sf $(pwd)/donace-plugin/skills/execute ~/.claude/skills/donace-execute
-ln -sf $(pwd)/donace-plugin/skills/chat ~/.claude/skills/donace-chat
+claude plugin validate /path/to/donace
 ```
 
-## Key Design Decisions
+If you previously had a `~/.claude/agents` symlink pointing at this repo's `agents/` (the old install method), remove it before loading the plugin — otherwise agents get registered twice.
 
-- **Generator-Evaluator pattern** — inspired by [Anthropic's harness design blog](https://www.anthropic.com/engineering/harness-design-long-running-apps)
-- **Cross-model review** — Codex reviews Claude's code every sprint via `/codex:review`
-- **Claude reviewer at ship time** — deep stack-specific review runs once at the end, not every sprint (saves tokens)
-- **Knowledge persistence** — `.ai/cards/` for reusable insights, `.ai/sessions/` for session logs
-- **Ralph Loop compatible** — resumption check skips re-planning on restart
+Codex stages additionally require the `openai-codex` plugin to be installed (donace shells out to its `codex-companion.mjs`).
 
-## Contributing
+## Quick tour
 
-See [`CLAUDE.md`](CLAUDE.md) for project conventions (commands, status
-semantics, hook guardrails, test patterns). Recent behavioral changes
-are logged in [`CHANGELOG.md`](CHANGELOG.md).
+```bash
+# Create a fresh run
+/donace:chat
+# ... brainstorm with the main LLM, it writes spec.md ...
+
+# Plan it
+/donace:plan run-a1b2c3d4
+
+# Edit plan.md if needed (especially `implementer:` tags)
+
+# Run it
+/donace:execute run-a1b2c3d4
+
+# At any time, glance at the pipeline
+python3 sdk/cli.py stage_status run-a1b2c3d4
+```
+
+## Layout
+
+- `skills/{chat,plan,execute}/SKILL.md` — main LLM instructions per skill
+- `agents/{planner,implementer,reviewer}.md` — subagent definitions
+- `references/review-checklist-{python,typescript,ios,general}.md` — stack-specific reviewer hints
+- `prompts/codex-{implementer,reviewer}.md` — codex prompt prefixes
+- `sdk/codex_call.py` — wrapper around codex-companion.mjs (`task --background --json` + status + result)
+- `sdk/cli.py` — `donace run_start | list_runs | parse_plan | stage_status | mark_completed`
+- `.ai/runs/<run-id>/` — run state (gitignored)
+
+## Design
+
+See [docs/specs/2026-05-02-donace-simplify-design.md](docs/specs/2026-05-02-donace-simplify-design.md) for the full spec, including the reviewer severity contract, stop-state semantics, and bootstrap order.
 
 ## License
 
-MIT
+MIT (see LICENSE).

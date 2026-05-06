@@ -1,156 +1,99 @@
 # Donace — Project Contract
 
-Generator-Evaluator agent harness for Claude Code. This file is the stable
-contract for anyone (Claude or human) working on the codebase — commands,
-layout, invariants. Dynamic knowledge lives in `.ai/` (gitignored) and in
-recent commit history.
+Plan / execute / review pipeline orchestrating Claude Code and Codex with per-stage worker selection. Main LLM in the user's Claude Code session is the orchestrator; three subagents (planner, implementer, reviewer) do focused work.
+
+This file is the stable contract for anyone working on donace. Dynamic knowledge lives in `.ai/runs/<id>/` (gitignored, local-only) and in recent commit history.
 
 ## Layout
 
 ```
-sdk/                 Python orchestrator (CLI + dispatch + commands)
-  orchestrator.py      argparse CLI entry point
-  commands.py          cmd_* subcommand bodies
-  agent_dispatch.py    AgentDispatcher, hooks, codex integration
-  job_runner.py        per-stage execute pipeline (implement → verify → fix)
-  events.py            EventBus, Stage, JobResult, event dataclasses
-  run_validator.py     post-run validation (hook_deny_volume, token_anomaly, etc.)
-  dashboard.py         live WebSocket dashboard + HTML
-  tests/               stdlib unittest suite
-agents/              agent frontmatter + system prompts
-  team-lead.md         execution coordinator
-  planner.md           plan writer
-  implementer.md       code writer
-  test-engineer.md     test writer/runner
-  {ts,ios}-reviewer.md deep reviewers
-  runtime-verifier.md  black-box verifier
-  documenter.md        doc updater
-skills/              user-invokable Claude Code skills
-  plan/ execute/ chat/
+skills/
+  chat/SKILL.md       /donace:chat — brainstorm spec.md with the user (inline; main LLM)
+  plan/SKILL.md       /donace:plan <id> — dispatch planner subagent → plan.md
+  execute/SKILL.md    /donace:execute <id> — 15-step loop, stages run serially in background
+agents/
+  planner.md          spec.md → plan.md (Read/Grep/Glob/Bash/Write)
+  implementer.md      one stage at a time (Read/Grep/Glob/Bash/Write/Edit)
+  reviewer.md         diff + test-results → [P0]/[P1]/[P2] markdown (Read/Grep/Glob/Bash; no Write)
+  qa.md, ui-designer.md   standalone ad-hoc tools (not part of the pipeline)
+references/         review-checklist-{python,typescript,ios,general}.md (injected into reviewer payload)
+prompts/            codex-{implementer,reviewer}.md (used by codex_call.py)
+sdk/
+  codex_call.py       wraps codex-companion.mjs: task → status → result
+  cli.py              donace run_start | list_runs | parse_plan | stage_status | mark_completed
+  tests/              stdlib unittest
 ```
 
 ## Commands
 
-**Run tests** (stdlib unittest — no pytest, no new deps):
+**Run tests** (stdlib unittest — no pytest):
+
 ```bash
 python3 -m unittest discover -s sdk/tests
 ```
 
-**Invoke the orchestrator** (always absolute path — `python3 -m sdk.orchestrator`
-requires `cwd=plugin-root` which doesn't match team-lead's cwd):
-```bash
-python3 "${CLAUDE_PLUGIN_ROOT}/sdk/orchestrator.py" <subcommand> [args]
-```
+**Use the CLI directly** (also invoked from skill bodies):
 
-Available subcommands: `run_start`, `run_complete`, `list_runs`, `mark`,
-`write_plan`, `plan`, `plan_status`, `run_job`, `verify`, `review`,
-`document`, `health`.
+```bash
+python3 sdk/cli.py run_start
+python3 sdk/cli.py list_runs
+python3 sdk/cli.py parse_plan --run-id <id>
+python3 sdk/cli.py stage_status <id>
+python3 sdk/cli.py mark_completed --run-id <id>
+```
 
 ## Status conventions
 
-**Plan job status** (`jobs_completed["plan"]`):
-- `PASS` — codex_review terminal, no major issues → execute can dispatch stages
-- `REVIEW` — `codex_review.has_major_issues: true` → user must re-run `/donace:plan`
-- `PENDING` — `codex_review.status in {queued, running}` → team-lead runs `plan_status` to poll
-- `ERROR` — something broke; read job result JSON
+**Per-stage `status.json`**:
 
-The gate lives in `_classify_run_state` via `not plan_review_in_progress`.
-A stale on-disk `PASS` plan job is held back if `plan.json.codex_review.status`
-flips to `queued`/`running` (e.g. after a revision kicks off a new review).
+- `running` — a worker or orchestrator step is in flight.
+- `passed` — committed; skipped on resume.
+- `interrupted` — recoverable stop; partial work preserved. Reasons: `rate_limited`, `user_interrupted`, session ended mid-stage. **Resume does NOT consume a retry.**
+- `blocked` — hard stop; needs user intervention. Reasons: `tests failed` (after retry budget exhausted), `P0 unresolved`, `resume baseline mismatch`.
 
-**run_job status**:
-- `PASS` — stage succeeded; per-stage commit created (files in scope only)
-- `BLOCKED` — stage failed; counts against 3-strike `repeated_stage_failure`
-- `INTERRUPTED` — external pause (rate-limit, user cancel). Does NOT count
-  against retry budgets. `interrupted_at` tells you which phase: implement / verify / fix_loop
+If a previous session dies and leaves a stale `running` status behind, the next `/donace:execute` invocation should rewrite it to `interrupted: session_ended` before resuming. `blocked` is not auto-resumed; the user decides whether to keep or discard partial work first.
 
-**Run state** (`_classify_run_state`):
-`empty` | `not_started` | `in_progress` | `incomplete` | `completed`
+**Per-run `meta.json` `status`** (one of): `spec`, `planned`, `running`, `interrupted`, `completed`, `blocked`.
 
-## Codex integration
+**P0 retry budget**: 3 total tries per stage (initial + 2 retries). Worker errors, test failures, and reviewer P0 findings all consume from the same budget. Rate-limits do NOT.
 
-Codex plugin lives at `~/.claude/plugins/cache/openai-codex/codex/<version>/`.
-donace calls `scripts/codex-companion.mjs`:
+## Worker dispatch
 
-| Donace call | Codex subcommand | Mode | Rate-limit aware |
+| Implementer | Reviewer | Implementer dispatch | Reviewer dispatch |
 |---|---|---|---|
-| `run_codex_review` (per stage) | `review` | foreground, 180s cap, via Haiku wrapper | yes |
-| `run_codex_plan_review` | `task --background --json` | direct subprocess, 600s cap, poll-then-fetch | no (bypasses wrapper) |
-| `fetch_codex_plan_review_result` | `status <job-id>` then `result <job-id>` | direct subprocess | no |
-| `_codex_task_resume_candidate_thread_id` | `task-resume-candidate` | direct subprocess | no |
+| `claude` | `codex` | `Agent(subagent_type=implementer, run_in_background=true)` | `Bash("python3 sdk/codex_call.py review --diff-file ... --test-results-file ... --stack ...", run_in_background=true)` |
+| `codex` | `claude` | `Bash("python3 sdk/codex_call.py implement ...", run_in_background=true)` | `Agent(subagent_type=reviewer, run_in_background=true)` |
 
-**Single test seam**: monkey-patch `AgentDispatcher._run_codex_json_subcommand`
-to return canned per-subcommand payloads. Do not spawn real `node` subprocesses
-in tests.
+## codex_call.py exit codes
 
-Plan-review thread reuse: `run_codex_plan_review(..., resume_thread_id=X)`
-only passes `--resume-last` when `task-resume-candidate` confirms X is still
-codex's latest task for the repo — otherwise falls back to fresh to avoid
-resuming an unrelated thread.
+- `0` — success; stdout JSON `{status, summary, raw_output}`.
+- `1` — retry-eligible error (timeout, plugin missing, worker_failed, parse_fail). Stdout JSON `{status: "error", error_class, message}`. Consumes a retry.
+- `2` — `rate_limited`. Drives stage to `interrupted`. Does NOT consume a retry.
 
-## Hook guardrails
+## Worktree contract
 
-`AgentDispatcher` installs SDK hooks on every agent dispatch:
-- Path boundary (Write/Edit confined to cwd)
-- `file_scope` restriction (stage-specific writes only) — scope is
-  normalized at construction via `_normalize_file_scope` (strips
-  markdown backticks, whitespace, trailing `/`)
-- Bash write detection (redirects, sed -i, tee, cp/mv) — `_blank_quoted_regions`
-  neutralizes content inside `"..."` / `'...'` before `_REDIR_RE` runs, so
-  JS / Perl / HTML embedded in `node -e "..."` doesn't register as writes
-- Quoted redirect targets are re-extracted from the original command so
-  `cmd > "apps/x.ts"` still scope-checks
-- Command blocklist (`rm -rf /`, `DROP TABLE`, force-push, etc.)
-- Mass mutators banned under `file_scope` (prettier --write, black, etc.)
+`/donace:execute` requires a clean worktree on fresh start (`git status --porcelain` empty). On resume of an `interrupted` stage, dirty worktree is allowed because that's the partial work; the orchestrator verifies HEAD still matches the saved `pre_stage_sha`. Mismatch → `blocked: resume baseline mismatch`.
 
-**If a valid-looking operation is getting denied**: check
-`run_validator.py::hook_deny_volume` output first — the normalization
-code is where false positives have historically lived.
+The shared worktree is reserved while a run is active. User makes unrelated edits at their own risk; `git add -A` at PASS time will pick them up.
 
-## When to touch what
-
-| Change | Files |
-|---|---|
-| New orchestrator subcommand | `cmd_*` in `commands.py` + argparse/dispatch in `orchestrator.py` |
-| Change agent behavior / tools | `agents/<name>.md` frontmatter + system prompt |
-| Add a codex-companion call | Use `_run_codex_json_subcommand` seam for testability |
-| Change plan job status logic | `_plan_status_from_codex_review` AND `_classify_run_state` AND team-lead.md decision tables |
-| New event type | `events.py` + register + consume in `dashboard.py`/`run_validator.py` |
-
-## Testing
-
-- Pattern: stdlib `unittest`. One module per feature area.
-- Async tests use a `_run(coro)` helper that creates a fresh event loop
-  per call (`asyncio.new_event_loop()` + `finally: loop.close()`). Do
-  not rely on the default loop.
-- Mock codex-companion via `dispatcher._run_codex_json_subcommand = fake`
-  where `fake(companion_script, subcommand, args, **_kw) -> dict | None`.
-- Mock agent dispatch via `dispatcher.query = fake_async_fn`.
-- Don't introduce pytest / new test deps. `requirements.txt` stays
-  minimal.
+When retrying a failed stage, persist the failure surface to `.ai/runs/<id>/stages/<sid>/retry-context.md` and pass it back into the next implementer attempt. On explicit discard of partial work, reset to `pre_stage_sha`, clean untracked files, and remove the stage's old evidence artifacts before restarting.
 
 ## Invariants worth preserving
 
-- **Plan review findings are a gate, not advisory**. `REVIEW` and `PENDING`
-  both block stage dispatch. A late `needs-attention` verdict arriving via
-  `plan_status` must still block execute — see the `plan_review_in_progress`
-  bypass check in `_classify_run_state`.
-- **Stages run serially**. Per-stage commit + codex review share git
-  state; parallel `run_job` calls can contaminate review scope or cause
-  `auto_commit` to skip because HEAD moved mid-dispatch.
-- **Rate-limits are infra, not plan errors**. `RateLimitError` →
-  `INTERRUPTED` at every call site. The run can resume; don't count it
-  against retry budgets.
-- **`.ai/runs/<id>/plan.md` is read-only during execute**. Team-lead
-  never rewrites the plan. If the plan is broken, abort and redirect
-  the user to `/donace:plan <run-id>`.
-- **Hook false positives waste more tokens than they save**. Scope
-  checks are load-bearing; if they reject in-scope operations, implementer
-  burns tokens retrying. When in doubt, err toward letting a write through
-  and catching the real damage at commit-scope level.
+- **Plan-time worker selection is the planner's job.** Plan files have `implementer: claude|codex`; the orchestrator does NOT auto-route. Reviewer is implicit (opposite model).
+- **Orchestrator runs `tests:` itself, not the implementer or reviewer.** Test results are evidence written to `test-results.md` and passed in the reviewer payload. Reviewer must NOT re-run tests.
+- **Reviewer is text-only.** It returns markdown findings; main LLM persists the document and parses [P0] count for retry decisions.
+- **The diff is the source of truth.** Implementer's text reply is failure-surface context only. `git diff <pre_stage_sha>` (persisted to `diff.patch`) is what gets reviewed and committed.
+- **No NEEDS_CONTEXT escalation protocol.** Implementer is self-directed; only fails on a true hard stop.
+
+## Non-goals (v0)
+
+Parallel stages via worktrees (v1), unattended overnight runs / detach (v2), `/donace:chat` continuity (v1), web dashboard (v2), `--from-stage`/`--watch`/`--json` flags on `stage_status` (v1+).
+
+## Spec source of truth
+
+[docs/specs/2026-05-02-donace-simplify-design.md](docs/specs/2026-05-02-donace-simplify-design.md)
 
 ## Non-contracts
 
-`.ai/sessions/`, `.ai/cards/`, and `.ai/runs/` are gitignored. Session
-notes, knowledge cards, and run artifacts are local-only — do not expect
-them on other machines or checkouts. Commit history is the shared record.
+`.ai/runs/<id>/` is gitignored. Run artifacts (spec.md, plan.md, stages/) are local-only.

@@ -1,7 +1,7 @@
 ---
 name: ui-designer
 description: Design UI/UX for features — produce design systems, screen layouts, component specs, and visual direction. Standalone agent, invoked on demand when design work is needed before or during implementation
-tools: ["Read", "Write", "Edit", "Grep", "Glob", "Bash", "mcp__stitch__apply_design_system", "mcp__stitch__create_design_system", "mcp__stitch__create_project", "mcp__stitch__edit_screens", "mcp__stitch__generate_screen_from_text", "mcp__stitch__generate_variants", "mcp__stitch__get_project", "mcp__stitch__get_screen", "mcp__stitch__list_design_systems", "mcp__stitch__list_projects", "mcp__stitch__list_screens", "mcp__stitch__update_design_system"]
+tools: ["Read", "Write", "Edit", "Grep", "Glob", "Bash"]
 model: opus
 ---
 

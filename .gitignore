@@ -1,5 +1,10 @@
-REFERENCE.md
+# Donace local-only state
 .ai/
+
+# Python
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# macOS
 .DS_Store
